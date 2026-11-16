@@ -364,7 +364,16 @@ Qwen3.6-27B weights** — see open work.
       generic-routed checksums byte-identical, bench-ab-repro);
       m=6 21.6 -> 21.3 ms short-ctx, 23.8 -> 23.5 long -- a modest win,
       the m>=2 step is kernel-bound (see the 2026-11-16d status entry
-      for the honest breakdown); TEMPURA_NO_M2P_GRAPH=1 bisects
+      for the honest breakdown); TEMPURA_NO_M2P_GRAPH=1 bisects;
+      2026-11-16e: the per-request RoPE chain REPLACED by ONE
+      batched per-row rope launch per tensor (cutile_rope_rows_batch:
+      strided source read, per-row gathered cos/sin rows, direct
+      contiguous q_z/k_z writes, probe-gated bit-exact vs the
+      per-request table rope) + the per-row-offset scatter append, in
+      BOTH the generic and m>=2 graph paths on SHARED per-m buffers
+      (op-for-op identical); m=6 21.4 -> 18.9 short / 23.9 -> 21.2 long
+      = 317/283 tok/s; m=1 unchanged; TEMPURA_NO_BATCH_ROPE=1 bisects;
+      see the 2026-11-16e status entry
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),

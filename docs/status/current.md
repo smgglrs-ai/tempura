@@ -5,6 +5,99 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-16e (BATCHED RoPE for the serving decode path -- the
+per-request rope chain is GONE: one cutile_rope_rows_batch launch per
+tensor per layer replaces m x 2 rope launches + 3m extraction slices +
+2m copy-outs + m appends + m q_batch concat copies, in BOTH the generic
+no-graph path AND the m>=2 ragged graph body (shared per-m buffers,
+op-for-op identical); m=6 step 21.4 -> 18.9 ms short-ctx / 23.9 -> 21.2
+ms long-ctx = 280 -> 317 / 251 -> 283 tok/s (+13%); m=1 UNCHANGED; all
+gates green, ppl EXACTLY at baseline): (1) THE KERNEL --
+`cutile_rope_rows_batch` (kernels/src/cutile_rope.rs, cuTile DSL): grid
+2*m*n_heads programs, the cutile_rope_interleaved layout with the
+(seq,head) pair drawn from a batch row.  Each program reads its row's
+Q/K elements DIRECTLY from the strided projection output (row r at
+tile r*SRC_TILES, SRC_TILES = q_pad|kv_pad / half -- no extraction
+copies), rotates with the per-row GATHERED cos/sin table rows
+([m*half] buffers refreshed per step by d2d_gather_row reading a
+device [m] positions array -- the graph-stable convention), and stores
+its tile at pid in the contiguous interleaved output.  The math is the
+SAME tile expressions (`x0*cos - x1*sin` / `x0*sin + x1*cos`) the
+per-request cutile_rope_from_table path uses, on the SAME table rows
+-- bit-identical per element by construction, and probe-gated (new
+bench-decode-ops section "batched rope rows": m=4, DISTINCT per-row
+positions, adversarial stride row_dim+half with NaN garbage in the pad
+tails, vs the per-request table rope as ground truth: 0 mismatched
+elements on both the Q (32-head) and K (8-head GQA) shapes; also
+exercises the reclaimed-z second call).  Host wrapper
+`CutileRoPE::forward_rows_batch` uses the try_unwrap reclaim pattern
+(stable buffer address per m -- CUDA-graph capturable).  Power-of-two
+halves only; the route gates on tile_geometry(head_dim).is_none() and
+stride % half == 0 (Llama/Qwen head_dim 128 fine).  (2) THE WIRING --
+a per-m RopeBatchState (ng.rope_batch: positions array, write-offset
+array, cos/sin row buffers, reclaimed q_z [m*q_dim] / k_z [m*kv_dim]
+rope outputs, v_batch [m*kv_dim] extraction staging, [m] u64 scatter
+src-ptr arrays, host staging) SHARED by both routes so the captured
+graph body and the generic path run the same kernels on the same
+buffers.  Per step: one H2D refresh of positions (f32-bitcast) /
+per-row write offsets (each session's kv_len) / scatter src ptrs, plus
+2m gather launches (host-launched on the generic route, captured
+IN-graph on the ragged route -- replays re-gather at execution time).
+Per layer: 2 rope launches (Q -> q_z which IS the attention Q input,
+K -> k_z), m V D2D rows into v_batch, and the KV append through the
+per-row-offset scatter twins (kv_scatter_write_rows{,_f16,_e4m3} --
+the same cast bit-math as the per-request append's cast + D2D,
+probe-gated; replaces the m append_device_gpu_only calls).  The K-side
+scatter fusion (rope storing straight into the pool at
+base + row_offset*kv_dim) was NOT forced: keeping the scatter
+separate keeps the cast bit-math provably the twins' verbatim and the
+code clean.  The m=1 graph route keeps its own path (numbers must not
+regress -- they don't).  TEMPURA_NO_BATCH_ROPE=1 bisects back to the
+per-request chain.  RaggedGraphState shed its rope fields (the body
+now uses the shared ng.rope_batch state).  (3) ROUTE GATE (computed
+per step, model-constant except positions): m >= 2, batch attention
+twins present for the uniform pool dtype, all-device KV, positions in
+table range, pow2 half, strides divisible -- anything else keeps the
+old chain, and the m>=2 graph route additionally requires it so the
+captured body never diverges from the generic path.  (4) NUMBERS
+(fishtank, RTX 5090, Llama-3.1-8B Q4_K_M, f16 pool, bench-nograph
+graph-routed, before = same tree with TEMPURA_NO_BATCH_ROPE=1):
+short ctx (48 steps): m=1 5.2 -> 5.2 (UNCHANGED), m=2 9.7 -> 8.6,
+m=3 12.2 -> 10.7, m=4 14.8 -> 13.0, m=5 18.1 -> 15.7, m=6 21.4 -> 18.9
+ms = 280 -> 317 tok/s.  Long ctx (400 steps, kv ~440): m=1 7.6 -> 7.6,
+m=2 11.9 -> 10.9, m=3 14.3 -> 12.9, m=4 17.0 -> 15.2, m=5 20.1 ->
+18.1, m=6 23.9 -> 21.2 ms = 251 -> 283 tok/s.  ~2.5-2.7 ms/step at
+m=6 -- the single biggest kernel-side win since the Q4K batch GEMV.
+(5) THE UPDATED BREAKDOWN (TEMPURA_ENGINE_DEBUG_TICKS, 6-client f16
+serving load): the step is now ~100% forward (prep < 1 us, greedy
+sample+emit ~9 us, forward ~21 ms at m=6 long-ctx) and forward is
+kernel-bound on the batch GEMV weight traffic (~3 GB Q4K + ~1.65 GB
+Q6K + 431 MB lm_head per step) + the oxide batch attention -- the
+rope/copy chain is no longer a visible cost.  The structural next
+levers are GEMV/attention-side: fusing RMSNorm into the batch GEMVs,
+a QKV-fused batch GEMV (one weight sweep for q+k+v), or attention
+kernel improvements -- not launch overhead and not the rope.  (6)
+GATES ALL GREEN on the final tree: new bench-decode-ops "batched rope
+rows" PASS (bit-exact, both shapes + z-reclaim); bench-decode-ops
+full suite PASS (97 PASS lines, incl. scatter-rows twins);
+bench-probe-q4k-batch + bench-probe-q6k-batch PASS; bench-ab-repro
+solo/repeat/interleave/composition checksums IDENTICAL under BOTH
+TEMPURA_NO_M2P_GRAPH=1 and graph routing, and the full checksum
+vector byte-identical between the two (graph-vs-generic); 6-client
+kv-swap A/B PASS on f16 AND e4m3 (byte-identical per client, 4 swap
+cycles in run B, [m2p_graph] captured m=2..6 on BOTH dtypes in every
+serving log); pooled ppl 8 chunks f16 8.6838 / e4m3 8.628168 --
+EXACTLY the pre-change baselines, 0 NaN; nonstream-route-smoke PASS;
+kv-restart-var PASS; local cargo test green (919).  VALIDATION-PROCESS
+NOTE: the first probe run's "z reclaim FAIL" was a PROBE bug (the
+first output Arc was held alive across the second call, blocking
+try_unwrap by design); the wrapper was right.  FOLLOW-UPS (open): the
+V extraction is still m D2D copies per layer (small; a strided-copy
+kernel or folding V into the rope launch would remove m launches per
+layer); the batched rope is pow2-half-only (Phi-3.5 head_dim 96 keeps
+the per-request chain and skips the m2p graph route); the m=1 route's
+long-ctx step (7.6 ms) remains kpar-attention-bound.**
+
 **STATUS 2026-11-16d (position-synced RAGGED batch CUDA graphs for m>=2
 serving decode -- the composition-invariance blocker solved by making
 every per-step value device-read; m=2..6 step 21.6 -> 21.3 ms short-ctx /
@@ -87,6 +180,8 @@ next structural lever is a batched RoPE (today m x 2 rope launches + m
 q_rot + m k_rot D->D copy-outs per layer inside the graph) and/or
 fusing the row-slice/copy chain; the graph replay itself is not the
 bottleneck.**
+      [RESOLVED 2026-11-16e: the batched RoPE landed -- see the newer
+      status entry above; m=6 21.4 -> 18.9 short / 23.9 -> 21.2 long.]
 
 **STATUS 2026-11-16c (m=1 serving decode routed through the single-seq
 CUDA graph -- the composition-invariance blocker solved with a
