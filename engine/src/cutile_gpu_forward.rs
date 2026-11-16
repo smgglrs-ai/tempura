@@ -403,6 +403,17 @@ struct NoGraphBatchScratch {
     /// GPU greedy-argmax packed outputs [2 * m] u32, keyed m (one packed
     /// (key<<32)|idx u64 per row; re-zeroed by cuMemsetD32Async per step).
     argmax_out: std::collections::HashMap<usize, Arc<Tensor<u32>>>,
+    /// Q4K batch kpar8 Q8_1 scratch, keyed (k, rows): x_qs [rows * k / 4] u32
+    /// + x_ds [rows * k_blocks * 8] u32 for the sm_120 batch kpar8 GEMM
+    /// (rows = min(m, 16) -- the kernel's smem row capacity). Keyed with the
+    /// chunk rows, NOT m, so an m=17 batch's second chunk reuses the 16-row
+    /// entry. Written fully by the quantize kernel before the GEMM reads it.
+    q4k_batch_qs: std::collections::HashMap<(usize, usize), Arc<Tensor<u32>>>,
+    q4k_batch_ds: std::collections::HashMap<(usize, usize), Arc<Tensor<u32>>>,
+    /// Q4K batch compact activation rows [m * k] f32, keyed (slot, k, m) --
+    /// the row-strided GEMM input repacked to contiguous rows when
+    /// row_stride != k. Fully overwritten by D->D row copies in stream order.
+    q4k_batch_act: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
 }
 
 /// Transformer with all projection weights pre-uploaded to the GPU.
@@ -5121,6 +5132,154 @@ impl CutileGpuModel {
         // the equal-position CUDA-graph paths, where the captured
         // composition is fixed per graph.  TEMPURA_NO_SM120_Q4K_BATCH=1
         // is now a no-op for this path, kept for compatibility.
+
+        // sm_120 batch Q4K kernel history: the original sm120_batch PTX is
+        // M=2-harcoded and was removed from this path 2026-11-15 (231f6df --
+        // m-dependent numerics broke the 6-client A/B). The stream-K and
+        // MMA batch kernels were then evaluated here 2026-11-16 and REJECTED:
+        // bench-probe-q4k-batch showed both misparse the Q4K sub-block
+        // nibble/scale layout (12-31% rel error vs the validated per-row
+        // kpar8 GEMV on random data; NaN/determinism checks cannot catch
+        // this -- the mxf4-gemv lesson). They are now disabled at the
+        // has_* level. TEMPURA_NO_SM120_Q4K_BATCH / TEMPURA_NO_MMA_BATCH /
+        // TEMPURA_NO_STREAMK_BATCH are no-ops for this path, kept for
+        // compatibility.
+
+        // Q4K batch kpar8: reads the weight matrix ONCE for all m rows (the
+        // per-row fallback below re-reads the full weight matrix per request
+        // -- at m=6 that was ~29 GB/step of weight traffic and ~25 ms of the
+        // 31 ms step). The kernel replicates the per-row kpar8 warp
+        // structure verbatim with an m-loop, so every output row is
+        // BIT-IDENTICAL to running the per-row GEMV on that row alone
+        // (bench-probe-q4k-batch: bit-exact on random data at m in
+        // {1,2,4,6} across all projection shapes): composition-invariant at
+        // any m, and m-uniform by construction (every m >= 2 dispatches it
+        // for every Q4K weight; batches larger than the kernel's 16-row smem
+        // capacity chunk over row windows with identical per-row math).
+        // m == 1 keeps the direct per-row kpar GEMV: VERIFIED bit-identical
+        // to the batch kernel at m=1, so this m-dependent DISPATCH introduces
+        // no m-dependent NUMERICS (the one case constraint 1 allows -- and
+        // the per-row launch is ~7 us faster at m=1: no batch smem/local
+        // overhead).
+        //
+        // Guards: uses_raw_gguf (the kernel parses the native 36-u32 GGUF
+        // block layout). TEMPURA_NO_SM120_KPAR_BATCH=1 bisects back to the
+        // per-row GEMVs.
+        let use_q4k_kpar_batch = is_q4k
+            && m >= 2
+            && std::env::var("TEMPURA_NO_SM120_KPAR_BATCH").as_deref() != Ok("1")
+            && self
+                .oxide_q4k_gemv
+                .as_ref()
+                .map(|o| o.uses_raw_gguf && o.has_sm120_kpar_batch())
+                .unwrap_or(false);
+        if use_q4k_kpar_batch {
+            let dw = self.device_weights_q4k.get(weight_name).unwrap();
+            let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+            // Compact row-major [m, k] activation: the Q8_1 quantize kernel
+            // reads a flat [m * k] tensor. When row_stride == k the caller's
+            // tensor is already compact (h_pad == h geometry); pad tails in
+            // `a` (row_stride > k) are repacked via D->D row copies.
+            let act: Arc<Tensor<f32>> = if a.size() == m * k {
+                a.clone()
+            } else {
+                let compact = {
+                    let mut pool = self.nograph.borrow_mut();
+                    pool.q4k_batch_act
+                        .entry((slot, k, m))
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<f32>(&[m * k])
+                                    .sync_on(stream)
+                                    .expect("gemm_any_d2d_batch: q4k batch act alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact.device_pointer().cu_deviceptr() + (r * k * 4) as u64,
+                            a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
+                            k,
+                            stream,
+                        )
+                        .expect("gemm_any_d2d_batch: q4k batch act compact D->D");
+                    }
+                }
+                compact
+            };
+            // Output [m, n]: same cached buffer the per-row path uses. Safe
+            // to reuse -- the kernel fully overwrites rows [0, m) x [0, n)
+            // (one block per output neuron, direct st.global writes).
+            let out: Arc<Tensor<f32>> = {
+                let mut pool = self.nograph.borrow_mut();
+                match pool.gemm_out.get(&(slot, n, m)) {
+                    Some(buf) => buf.clone(),
+                    None => {
+                        let buf = Arc::new(
+                            api::zeros::<f32>(&[m * n])
+                                .sync_on(stream)
+                                .expect("gemm_any_d2d_batch: output alloc"),
+                        );
+                        pool.gemm_out.insert((slot, n, m), buf.clone());
+                        buf
+                    }
+                }
+            };
+            let oxide = self.oxide_q4k_gemv.as_ref().unwrap();
+            // Q8_1 scratch for the chunk's rows (kernel capacity 16; the
+            // quantize kernel writes exactly rows * k elements).
+            let chunk_rows_max = m.min(16);
+            let (x_qs, x_ds) = {
+                let mut pool = self.nograph.borrow_mut();
+                let qs = pool
+                    .q4k_batch_qs
+                    .entry((k, chunk_rows_max))
+                    .or_insert_with(|| {
+                        Arc::new(
+                            api::zeros::<u32>(&[chunk_rows_max * k / 4])
+                                .sync_on(stream)
+                                .expect("gemm_any_d2d_batch: q4k batch qs alloc"),
+                        )
+                    })
+                    .clone();
+                let ds = pool
+                    .q4k_batch_ds
+                    .entry((k, chunk_rows_max))
+                    .or_insert_with(|| {
+                        Arc::new(
+                            api::zeros::<u32>(&[chunk_rows_max * k.div_ceil(32)])
+                                .sync_on(stream)
+                                .expect("gemm_any_d2d_batch: q4k batch ds alloc"),
+                        )
+                    })
+                    .clone();
+                (qs, ds)
+            };
+            let mut row_start = 0;
+            while row_start < m {
+                let rows = (m - row_start).min(16);
+                oxide
+                    .forward_sm120_kpar_batch_d2d_rows(
+                        &act,
+                        row_start,
+                        &dw.tensor,
+                        &out,
+                        row_start,
+                        rows,
+                        n,
+                        dw.k_blocks,
+                        &x_qs,
+                        &x_ds,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("gemm_any_d2d_batch: Q4K kpar8 batch GEMM {weight_name}: {e}")
+                    });
+                row_start += rows;
+            }
+            return out;
+        }
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         // Output buffer cached by (slot, n, m) and the activation row by
