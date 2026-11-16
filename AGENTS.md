@@ -345,7 +345,14 @@ Qwen3.6-27B weights** — see open work.
       top-k-heap CPU sampler for sampled sessions (sample+emit 10.4 ms
       -> 0.87 ms at m=6/temp=0.8: O(n log k) selection instead of the
       full-vocab sort; GPU-side top-k kernel measured NOT worth building
-      -- see the 2026-11-16 status entry)
+      -- see the 2026-11-16 status entry); 2026-11-16c: m=1 ticks route
+      through the single-seq CUDA graph on f16/e4m3 pools (bit-identity-
+      pinned capture: kpar attention twins + per-row GEMVs + dtype
+      kv_scatter_write twins + table RoPE -- the same kernels the
+      generic path dispatches at m=1, so solo and batched decode are
+      bit-identical; single-client 10.4 -> 5.2 ms/step short-ctx,
+      9.0 -> 7.6 ms at 400-step ctx; TEMPURA_NO_M1_GRAPH=1 bisects; see
+      the 2026-11-16c status entry)
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),

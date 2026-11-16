@@ -5,6 +5,68 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-16c (m=1 serving decode routed through the single-seq
+CUDA graph -- the composition-invariance blocker solved with a
+bit-identity-pinned capture; single-client decode 10.4 -> 5.2 ms/step
+short-ctx (96 -> 191 tok/s), 9.0 -> 7.6 ms at 400-step contexts; m>=2
+UNCHANGED; all gates green): (1) THE BLOCKER, SOLVED -- the engine never
+routed m=1 ticks to the single-seq graph path because a session decoded
+ALONE had to produce BIT-IDENTICAL logits to the same session inside a
+batch.  The route (forward_batch_decode_greedy's m=1 arm ->
+forward_decode_with_graph_pooled) captures a graph whose composition is
+PINNED to the generic path's per-op kernels via a new
+DecodeInnerMode::PooledM1 in forward_decode_inner: (a) attention = the
+per-request KPRA twins on run base pointers dispatched by pool dtype
+(NEVER splitk -- different reduce order; the m>=2 oxide batch kernel is
+itself bit-identical to kpar, dae173b); (b) projections =
+gemm_any_d2d_slot per-row GEMVs (the same function the m=1 arm of
+gemm_any_d2d_batch dispatches; the multistream KV fork uses the same
+kernels with separate scratch); (c) fused gate+up SiLU is Wrapper-only
+(separate GEMVs + silu_mul in PooledM1); (d) KV append = NEW
+kv_scatter_write_f16/_e4m3 dtype twins (same in-kernel cast bit-math as
+the generic append's cutile_cast kernels -- the f16 twin is cvt.rn.f16.
+f32, the e4m3 twin is a scalar PTX port of the shared
+e4m3::f32_to_e4m3_bits; probe-gated in bench-decode-ops against cast
+kernel + CPU references on adversarial RNE-tie/saturation/NaN data);
+(e) RoPE = the graph-stable table gather (the generic path's seq_len==1
+fast path reads the SAME precomputed table -- forward_device_scratch
+falls into from_table at pos < table_max_pos, which the route gates
+on).  Graphs are cached per RUN (key: layer-0 K base ptr + dtype tag),
+validated against every layer's run base pointers each call (realloc/
+swap re-captures), NOT keyed on capacity_gen (all per-step scalars are
+device-read; extend-in-place growth replays).  Bisect:
+TEMPURA_NO_M1_GRAPH=1.  (2) NUMBERS (fishtank, RTX 5090,
+Llama-3.1-8B Q4_K_M, f16 pool, bench-nograph, before = same tree with
+TEMPURA_NO_M1_GRAPH=1): 48-step ctx m=1 10.4 -> 5.2 ms = 95.9 -> 191.0
+tok/s (2.0x); 400-step ctx (kv -> ~440) m=1 9.0 -> 7.6 ms = 111.0 ->
+131.0; m=2..6 UNCHANGED at both context lengths (m=6 long 23.9 ->
+23.8, short 21.6 -> 21.9 -- noise).  Short-ctx m=1 lands at the
+wrapper graph's ~4.6 ms step; the long-ctx residual (7.6 vs the
+wrapper's splitk-equipped 4.6) is the kpar-vs-splitk attention
+difference + unfused gate/up SiLU -- the PRICE of bit-identity
+(splitk's different reduce order and the fused kernel are
+composition-forbidden).  (3) GATES ALL GREEN on the final tree, graph
+capture evidenced by [m1_graph] lines in every serving log: 6-client
+kv-swap A/B PASS on f16 AND e4m3 (6/6 byte-identical each, 4 swaps in
+run B, multiple per-run graph captures); bench-ab-repro
+solo/repeat/interleave/m=2/m=3 checksums all IDENTICAL (solo is m=1
+throughout -- the graph-vs-batch bit-identity gate); pooled ppl 8
+chunks f16 8.6838 / e4m3 8.6282 -- EXACTLY the pre-change baselines,
+0 NaN (the ppl path decodes at m=1 through the new route, doubly
+proving bit-identity); nonstream-route-smoke PASS; kv-restart-var
+PASS; probe-q4k-batch + probe-q6k-batch PASS; bench-decode-ops
+scatter twins PASS; local cargo test green (919).  VALIDATION-PROCESS
+NOTE: the first A/B + ab-repro runs (16:43-17:01 remote) predated the
+final engine edit and ran without the working route -- all gates were
+RE-RUN on the md5-verified final tree; only runs with [m1_graph]
+capture evidence count.  FOLLOW-UPS (open): the long-ctx m=1 step
+(7.6 ms) is kpar-attention-bound -- a bit-identical splitk variant
+(same reduce order, more blocks) or a graph-capturable position-
+synced BATCH graph (m>=2 through graphs at all) is the structural
+next lever; the pooled-graph cache clears wholesale at >32 entries
+(re-capture is cheap but a smarter eviction is trivial if it ever
+shows up in a profile).**
+
 **STATUS 2026-11-16b (the Q6K projections join the bit-identical batch
 party + the sampled-session sampler defused; engine step 26.8 -> 23.6 ms
 at m=6 = 224 -> 254 tok/s aggregate (short-ctx 24.6 -> 21.6); sample+emit
