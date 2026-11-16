@@ -732,12 +732,15 @@ fn main() {
             })
             .collect();
         let row_offs: Vec<i32> = vec![7, 0, 15, 3];
-        let src_ptrs: Vec<u64> = (0..m)
-            .map(|r| {
-                upload(row_data[r].clone(), &stream)
-                    .device_pointer()
-                    .cu_deviceptr()
-            })
+        // Keep the source tensors ALIVE for the whole probe: their Arcs
+        // would otherwise drop immediately and cuda-oxide's deferred-free
+        // (1ms retirement poll) can recycle the memory under the kernels.
+        let src_devs: Vec<Arc<Tensor<f32>>> = (0..m)
+            .map(|r| upload(row_data[r].clone(), &stream))
+            .collect();
+        let src_ptrs: Vec<u64> = src_devs
+            .iter()
+            .map(|t| t.device_pointer().cu_deviceptr())
             .collect();
         // Device arrays: src ptrs, cache bases (all rows share the pool
         // base -- the kernel adds off * kv_dim), per-row offsets.
