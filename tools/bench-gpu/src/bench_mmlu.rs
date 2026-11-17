@@ -20,6 +20,11 @@
 //   TEMPURA_MMLU_MIN_AGREE  GPU-vs-CPU choice-agreement gate (default 0.85)
 //   TEMPURA_NO_LLAMA=1       skip the llama.cpp reference run
 //   LLAMA_PPL                llama_logitprobe binary path
+//   TEMPURA_PREFILL_PRECISION=exact  run the GPU side with exact-class
+//                           prefill GEMMs (no MXFP4 E2M1 activation quant;
+//                           closes the single-prefill logit band: 2026-11-17,
+//                           mxfp4 GPU 48.8%/agreement 58.0% -> exact GPU
+//                           62.8%/agreement 96.8%, at 355 vs 7790 tok/s pp128)
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

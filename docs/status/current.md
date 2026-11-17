@@ -5,6 +5,75 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-17c (the MMLU precision gap CLOSED: TEMPURA_PREFILL_PRECISION
+=exact quality mode landed -- the MXFP4 prefill opt-out the 2026-11-13
+measurement called for; MMLU GPU 48.8% -> 62.8%, GPU/CPU agreement 58.0% ->
+96.8% PASS; the old TEMPURA_NO_MXFP4 capture-panic is CONFIRMED GONE;
+default stays MXFP4 at 7790 tok/s pp128 -- the exact path costs 355, a
+documented 20.6x opt-in trade; all default-path gates green, ppl EXACTLY at
+baseline): (1) THE RE-MEASURED BASELINE on current main (fishtank, RTX
+5090, Llama-3.1-8B-Instruct Q4_K_M, 250 questions, 0-shot, bench-mmlu):
+tempura CPU 61.6%, llama.cpp 62.4% (agreement 94.8%), tempura GPU 48.8%
+(agreement vs CPU 58.0%) -- the 2026-11-13 gap (51.2/58.4) PERSISTS
+through all the serving-path rewrites (slightly worse GPU; the f16/e4m3
+pools, no-graph exact decode, and batched RoPE did not touch the prefill
+projections, as expected). NOTE: the CPU reference itself flips ~2/250
+choices between runs (61.6% vs 62.4% across two runs of the same CPU code
+path -- near-tie choices under threaded CPU reduction order; llama
+agreement 94.8% both times), so single-run CPU accuracy carries a ~±0.8pt
+band. (2) THE OLD BLOCKER IS GONE: TEMPURA_NO_MXFP4=1 no longer panics --
+the follow-up (6) capture panic required the prefill CUDA graph, which has
+been off by default since the cuda-oxide v0.5.0 retirement-thread fix
+(TEMPURA_PREFILL_GRAPH=1 opts back in). The switch now runs cleanly -- on
+the 9 tok/s host-dequant prefill fallback (per-call weight download +
+dequant + re-upload), unusable as a quality mode. (3) THE MODE --
+TEMPURA_PREFILL_PRECISION=exact (engine/src/cutile_gpu_forward.rs):
+gemm_mxfp4_prefill_ep returns None at the top (every dispatch site,
+including the fused-epilogue call sites, falls back), and Q4K prefill
+projections route through the NEW gemm_q4k_prefill_batch -- the
+bit-identical-per-row q4k_gemv_sm120_kpar8_batch serving kernel
+(probe-gated), chunked over 16-row windows, reusing the nograph Q8_1
+scratch pool -- instead of the per-call host-dequant f32 GEMM. Q6K keeps
+the exact sm120 batch GEMV; layout-incompatible activations (h_pad != h
+models) keep the host-dequant fallback. Default (unset/"mxfp4") is
+numerics-UNCHANGED: the only default-path delta is an env-var read.
+MEASURED (bench-mmlu, exact mode): tempura GPU 62.8%, CPU 62.4%, llama
+62.4%; GPU/CPU agreement 96.8%, GPU/llama 95.6% -- PASS at the 85% gate
+(was 58.0% FAIL). The GPU phase is 89 s for 250 questions (vs 21 s mxfp4).
+(4) THE TRADE-OFF (bench-real-model, pp128): default 7790 tok/s prefill /
+TTFT P50 16.4 ms; exact 355 tok/s / TTFT P50 360 ms; decode UNCHANGED
+(218/217 tok/s -- decode never touches the prefill GEMMs). 20.6x vs
+llama.cpp's 7335 pp128 -- FAR outside the ~2x default-flip bar, so exact
+stays an OPT-IN for quality-sensitive workloads (eval harnesses, log-prob
+scoring); serving keeps MXFP4 prefill. The higher-precision-tiling stretch
+goal (wider block scales / FP8 activations) was NOT needed: the opt-out
+fully closes the measured gap. (5) GATES ALL GREEN on the final tree
+(default path; commit 855ae90 + docs): probe-q4k-batch PASS;
+probe-q6k-batch PASS; bench-decode-ops 97 PASS / 0 FAIL; bench-ab-repro
+solo/repeat/interleave/m=2/m=3 checksums IDENTICAL; 6-client kv-swap A/B
+PASS on f16 AND e4m3; nonstream-route-smoke PASS; kv-restart-var PASS;
+pooled ppl 8 chunks f16 8.6838 / e4m3 8.6282 -- EXACTLY the pre-change
+baselines, 0 NaN (the default path is numerics-neutral by construction,
+doubly confirmed); sanitizer-gate PASS; local cargo test green (919).
+Exact-mode pooled f16 ppl (documentation, opt-in path): 8.0889 vs
+llama.cpp 8.0192 = ratio 0.9980, 0 NaN -- the MXFP4 prefill band was
+nearly the ENTIRE pooled-ppl gap to llama.cpp (default f16 8.6838,
+ratio 1.0714; e4m3 8.6282, ratio 1.0646): exact-mode GPU ppl is
+essentially at llama.cpp parity.
+FOLLOW-UPS (open): (a) if exact-mode prefill throughput ever matters, the
+mma batch kernel (probe-gated 1e-5, sum-order-only divergence) is an
+exact-class tensor-core route for large-m prefill -- the 355 tok/s kpar8
+route re-reads the weight matrix once per 16-row chunk; (b) the CPU
+eval-reference run-to-run flip band (±0.8pt on 250 questions) is worth a
+determinism pass if MMLU ever becomes a release gate; (c) h_pad != h
+models (Qwen) get the host-dequant exact fallback, not the kpar8 batch
+route (compact-activation guard) -- fine for correctness, slow if anyone
+runs exact-mode evals on them; (d) the exact-mode ppl parity (0.9980 vs
+llama.cpp) re-opens the case for a MID-precision prefill (FP8
+activations or wider MXFP4 block scales) that keeps most of the quality
+gain at a serving-usable speed -- the all-or-nothing choice is 355 vs
+7790 tok/s.**
+
 **STATUS 2026-11-17b (the kpar8 OOB-read debt PAID: compute-sanitizer
 root-caused and fixed THREE pre-existing out-of-bounds sites in the default
 serving path, all numerics-neutral -- probes bit-exact, ppl EXACTLY at
@@ -1096,7 +1165,10 @@ reinvent protocols -- the author's kv-mesh knows the plugin model),
 NVMe capacity tier.  (2) MMLU GPU gap: MXFP4 prefill precision opt-out
 for quality-sensitive workloads, or higher-precision tiling (the
 rel-0.10 logit band -> ~40% choice-flip on 4-way near-ties is
-quantified; CPU matches llama at 94.8% agreement).  (3) p24-overlap
+quantified; CPU matches llama at 94.8% agreement)
+ [RESOLVED 2026-11-17c: TEMPURA_PREFILL_PRECISION=exact landed,
+ MMLU GPU 48.8 -> 62.8%, agreement 96.8% -- see the newer status
+ entry].  (3) p24-overlap
 scheduling (CPU prepares step N+1 while GPU runs N -- the step loop is
 synchronous).  (4) the small broken edges: cutile_decode_attn (corr
 0.66, dead code), oxide PTX attention softcap >4k ctx (Gemma-2), batch
@@ -1677,7 +1749,14 @@ within noise of a0a4dc78a).**
               (TEMPURA_GRAPH_PREFILL=1) is still broken and off;
               (6) allocation/download during CUDA-graph capture panics
               the TEMPURA_NO_MXFP4 / TEMPURA_NO_GPU_PREFILL prefill
-              paths (found via MMLU, cutile_gpu_forward.rs:~4837);
+              paths (found via MMLU, cutile_gpu_forward.rs:~4837)
+              [RESOLVED 2026-11-17c: the prefill graph has been off by
+              default since the cuda-oxide v0.5.0 retirement-thread fix
+              (TEMPURA_PREFILL_GRAPH=1 opts in) -- TEMPURA_NO_MXFP4=1
+              now runs without panic (on the slow host-dequant
+              fallback), and the quality mode is
+              TEMPURA_PREFILL_PRECISION=exact; see the newer status
+              entry];
               (7) batch-decode CUDA graphs (m>=2) have no QKV bias
               support -- bias models (Qwen2/Phi) compute wrong batch
               logits until the capture sites apply the same
@@ -1722,6 +1801,12 @@ within noise of a0a4dc78a).**
           NOTE: the GPU-side bisect switches are broken for this
           workload (TEMPURA_NO_MXFP4=1 / TEMPURA_NO_GPU_PREFILL=1 panic
           during CUDA graph capture -- see follow-up (6)). Open work.
+          [RESOLVED 2026-11-17c: TEMPURA_PREFILL_PRECISION=exact landed;
+          re-baselined on 2026-11-17 main the mxfp4 GPU is 48.8%
+          (agreement 58.0%), exact-mode GPU 62.8% (agreement 96.8%,
+          PASS) at 355 tok/s pp128 vs 7790 default; the capture-panic
+          is gone with the default-off prefill graph -- see the newer
+          status entry above.]
       (c) [x] **Self-consistency generation** (GSM8K-style):
           bench-selfconsistency (tools/bench-gpu/src/bench_selfconsistency.rs,
           2026-11-04; REFERENCE RUN 2026-11-06 on fishtank). K samples per

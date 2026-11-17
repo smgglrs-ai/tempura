@@ -467,6 +467,17 @@ Qwen3.6-27B weights** — see open work.
       gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
       + pooled prefill norms/adds/SiLU + Q6K down_proj via MXFP4 (nsys-
       driven), TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
+- [x] Prefill precision quality mode (2026-11-17): TEMPURA_PREFILL_PRECISION
+      =exact opts prefill projections out of the MXFP4 tensor-core GEMM
+      (E2M1 activation quant + Q6K->MXFP4 double-quantization concentrated
+      a rel~0.1 logit band on single-prefill workloads: MMLU GPU 48.8% vs
+      CPU 61.6%, agreement 58.0%). Exact routes Q4K through the
+      bit-identical-per-row kpar8 batch GEMM + Q6K sm120 batch GEMV:
+      MMLU GPU 62.8%, agreement 96.8%, PASS -- at 355 tok/s pp128 (vs 7790
+      MXFP4, llama.cpp 7335), TTFT P50 360 ms. Opt-in only (20.6x prefill
+      cost); default stays MXFP4. The old TEMPURA_NO_MXFP4=1 prefill
+      capture-panic is GONE (prefill graph off by default since cuda-oxide
+      v0.5.0; that switch now runs, on the 9 tok/s host-dequant path).
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
