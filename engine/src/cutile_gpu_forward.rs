@@ -336,6 +336,16 @@ const SLOT_DOWN: usize = 6;
 const SLOT_LOGITS: usize = 7;
 const NUM_SLOTS: usize = 8;
 
+/// TEMPURA_PREFILL_PRECISION=exact: quality mode for single-prefill
+/// workloads (MMLU-style log-prob evaluation). Skips the MXFP4 prefill
+/// GEMM so every prefill projection runs an exact-class kernel (Q6K sm120
+/// batch GEMV, bit-identical-per-row Q4K kpar8 batch GEMM, or the
+/// host-dequant f32 GEMM). Default (unset / "mxfp4") keeps the MXFP4
+/// tensor-core fast path.
+fn prefill_precision_exact() -> bool {
+    std::env::var("TEMPURA_PREFILL_PRECISION").as_deref() == Ok("exact")
+}
+
 /// Per-request row buffers for the no-graph ragged batch decode path.
 struct NoGraphRowBufs {
     /// [q_pad] Q slice (tail beyond q_dim stays zero, as with the fresh
@@ -5666,6 +5676,18 @@ impl CutileGpuModel {
         slot: usize,
         ep: PrefillEpilogue<'_>,
     ) -> Option<Arc<Tensor<f32>>> {
+        // TEMPURA_PREFILL_PRECISION=exact opts the prefill projections out
+        // of the MXFP4 tensor-core GEMM. The E2M1 activation quantization
+        // (+ the Q6K->MXFP4 double-quantized down_proj) concentrates a
+        // rel~0.1 logit band on single-prefill workloads: MMLU GPU 51.2%
+        // vs CPU 61.6% (2026-11-13) while ppl diluted the same error
+        // across exact-decode positions. Every dispatch site falls back to
+        // the exact paths (Q6K sm120 batch GEMV preserves Q6K precision;
+        // Q4K routes through the bit-identical kpar8 batch GEMM, then
+        // host-dequant f32 GEMM).
+        if prefill_precision_exact() {
+            return None;
+        }
         let mxfp4 = self.mxfp4_gemm.as_ref()?;
         let dw = self.device_weights_mxfp4_tiled.get(weight_name)?;
         let k = dw.k;
@@ -6015,6 +6037,103 @@ impl CutileGpuModel {
         Some(out)
     }
 
+    /// Prefill (m > 1) Q4K GEMM via the bit-identical-per-row kpar8 batch
+    /// kernel (`q4k_gemv_sm120_kpar8_batch`), chunked over 16-row windows.
+    /// Quality route for TEMPURA_PREFILL_PRECISION=exact: no MXFP4 E2M1
+    /// activation quantization, no double-quantization -- each output row is
+    /// bitwise-equal to the per-row kpar8 GEMV the decode path uses
+    /// (bench-probe-q4k-batch gate). Returns None when the weight is not
+    /// Q4K, the kernel is unavailable, or the activation is not a compact
+    /// `[m, k]` layout (the caller falls back to host-dequant f32 GEMM).
+    fn gemm_q4k_prefill_batch(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Option<Arc<Tensor<f32>>> {
+        if m < 2 {
+            return None;
+        }
+        let oxide = self.oxide_q4k_gemv.as_ref()?;
+        if !(oxide.uses_raw_gguf && oxide.has_sm120_kpar_batch()) {
+            return None;
+        }
+        let dw = self.device_weights_q4k.get(weight_name)?;
+        let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+        if a.size() != m * k {
+            return None;
+        }
+        let n = dw.n;
+        let stream = self.matmul.stream();
+        let out = {
+            let mut pool = self.prefill_scratch.borrow_mut();
+            if pool[slot].as_ref().is_none_or(|t| t.size() < m * n) {
+                pool[slot] = Some(Arc::new(
+                    api::zeros::<f32>(&[m * n])
+                        .sync_on(stream)
+                        .expect("q4k prefill output buffer alloc"),
+                ));
+            }
+            pool[slot].as_ref().unwrap().clone()
+        };
+        // Q8_1 scratch for one 16-row chunk (the quantize step inside
+        // forward_sm120_kpar_batch_d2d_rows writes exactly rows * k elements;
+        // k is a multiple of 256 so per-32-element blocks never cross rows).
+        let chunk_rows_max = m.min(16);
+        let (x_qs, x_ds) = {
+            let mut pool = self.nograph.borrow_mut();
+            let qs = pool
+                .q4k_batch_qs
+                .entry((k, chunk_rows_max))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[chunk_rows_max * k / 4])
+                            .sync_on(stream)
+                            .expect("gemm_q4k_prefill_batch: qs alloc"),
+                    )
+                })
+                .clone();
+            let ds = pool
+                .q4k_batch_ds
+                .entry((k, chunk_rows_max))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[chunk_rows_max * k.div_ceil(32)])
+                            .sync_on(stream)
+                            .expect("gemm_q4k_prefill_batch: ds alloc"),
+                    )
+                })
+                .clone();
+            (qs, ds)
+        };
+        let mut row = 0usize;
+        while row < m {
+            let rows = (m - row).min(16);
+            oxide
+                .forward_sm120_kpar_batch_d2d_rows(
+                    a,
+                    row,
+                    &dw.tensor,
+                    &out,
+                    row,
+                    rows,
+                    n,
+                    dw.k_blocks,
+                    &x_qs,
+                    &x_ds,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "q4k prefill batch {weight_name} rows {row}..{}: {e}",
+                        row + rows
+                    )
+                });
+            row += rows;
+        }
+        Some(out)
+    }
+
     /// Prepare an m>1 activation for the host-dequant f32 fallback GEMM.
     ///
     /// The fallback GEMM runs at `k_pad` (next-pow2) columns with zero padding.
@@ -6175,6 +6294,15 @@ impl CutileGpuModel {
             }
             if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
                 return out;
+            }
+            // TEMPURA_PREFILL_PRECISION=exact: Q4K projections keep the
+            // bit-identical kpar8 batch GEMM instead of falling to the
+            // per-call host-dequant f32 GEMM (which re-downloads and
+            // re-uploads the weight matrix every call).
+            if prefill_precision_exact() {
+                if let Some(out) = self.gemm_q4k_prefill_batch(a, weight_name, m, slot) {
+                    return out;
+                }
             }
         }
         if m > 1 || f32_decode {
