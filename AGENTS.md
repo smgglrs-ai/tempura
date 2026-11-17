@@ -335,8 +335,15 @@ Qwen3.6-27B weights** — see open work.
       m-loop batch kernels -- weights read once per batch, per-row
       numerics bit-exact vs the per-row GEMVs, bench-probe-q4k-batch /
       bench-probe-q6k-batch are the regression gates; the earlier
-      stream-K/MMA batch kernels are DISABLED -- numerically wrong, see
-      the 2026-11-16 status entry) --
+      stream-K/MMA batch kernels were DISABLED 2026-11-16 (numerically
+      wrong -- see the 2026-11-16 status entry), then FIXED 2026-11-17
+      (true m16n8k32 fragment mapping + Q4K nibble/dequant conventions,
+      probe-gated at 1e-5, measured 3e-8 sum-order noise; re-enabled for
+      the equal-position graph paths and evaluable on the no-graph path
+      via TEMPURA_Q4K_BATCH_KERNEL=mma|streamk -- uniform across all m,
+      composition-invariant + ppl-clean, but m=1 pays 47-88% so the
+      DEFAULT stays the bit-identical kpar8 batch; see the 2026-11-17
+      status entry for the measured trade-off) --
       sync-free scratch pool + kpar attention + the oxide BATCH
       decode-attention kernel (one launch per layer, grid (n_heads, m),
       bit-identical to per-request kpar) + GPU greedy argmax for
@@ -426,11 +433,20 @@ Qwen3.6-27B weights** — see open work.
       bench-probe-q4k-batch showed BOTH the stream-K and mma_batch
       kernels misparse the Q4K sub-block nibble/scale layout (12-31% rel
       error vs the per-row kpar8 reference on random data) -- those
-      numbers were internally consistent garbage; both kernels are
-      disabled at the has_* level pending a fix. The CORRECT general-M
-      batch kernel is q4k_gemv_sm120_kpar8_batch (bit-identical per row
-      to the per-row kpar8 GEMV); the no-graph serving path uses it since
-      2026-11-16)
+      numbers were internally consistent garbage; both kernels were
+      disabled at the has_* level. FIXED 2026-11-17: the misparse was
+      threefold (invented m16n8k32 fragment mapping -- the real one is
+      tid=lane&3/gid=lane>>2 with D = mxf4 acc_coords; byte group mw%4
+      with hi-select mw>=4 -> mw>>1 with odd-mw hi-select; nibble-8 with
+      sc/32 -> raw nibble, raw 6-bit scales), both kernels now pass the
+      probe at 2.8e-9..7.5e-8 (sum-order noise) and the mma variant
+      measured m=6 19.2->14.3 ms short / 21.2->16.4 ms long on the
+      no-graph path -- but uniform routing (composition invariance)
+      costs m=1 47-88%, so the DEFAULT stays q4k_gemv_sm120_kpar8_batch
+      (bit-identical per row to the per-row kpar8 GEMV; the no-graph
+      serving path uses it since 2026-11-16; the fixed tensor-core
+      kernels are selectable via TEMPURA_Q4K_BATCH_KERNEL and serve the
+      equal-position graph paths)
 - [x] CUDA graphs for single + batch decode (M=2..16+, dynamic
       max_batch_graph from VRAM), KV scatter-write (offset read on device —
       no per-step graph updates)

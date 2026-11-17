@@ -5,6 +5,93 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-17 (the retracted Q4K tensor-core batch kernels are
+FIXED -- all three root causes found, probe-gated at 1e-5, measured
+3e-8 sum-order noise; the serving-path routing EVALUATED end to end:
+uniform mma is composition-invariant and ppl-clean and wins +30-34% at
+m=4-6 but costs 47-88% at m=1, so the DEFAULT stays the bit-identical
+kpar8 batch -- the selector TEMPURA_Q4K_BATCH_KERNEL=mma|streamk lands
+as the documented opt-in; all gates green, ppl EXACTLY at baseline on
+the default path): (1) THE FIX -- q4k_mma_batch_sm120 and
+q4k_streamk_batch_sm120 (kernels/src/*_ptx.rs) had THREE stacked bugs,
+found by iterating bench-probe-q4k-batch (now a HARD gate: every batch
+kernel must match the per-row kpar8 reference at <= 1e-5 max rel err
+on random native-GGUF blocks; launch-failure of any kernel is also a
+FAIL -- a silently-unloaded kernel is how the original slipped): (a)
+FRAGMENT MAPPING -- both kernels decomposed threads as row=lane%16 /
+khalf=lane/16 (A), neuron=lane%8 / kgroup=lane/8 (B), row=lane%16 /
+colgroup=lane/16 (D); NONE of that matches the real m16n8k32 layout.
+The docstring claimed nvcc confirmation -- it was not (the mxf4-gemv
+fragment lesson, again: uniform data and NaN checks cannot catch it).
+Rewrote the compute core to the TRUE layout (tid=lane&3,
+gid=lane>>2): A a0..a3 = rows {gid,gid+8} x k-halves {tid*4, 16+tid*4};
+B b0/b1 = col gid, same k-halves; D d_j = (gid + 8*(j>>1),
+2*tid + (j&1)) -- the mxf4 acc_coords mapping. The per-row min term is
+now a 2-step XOR butterfly over the 4-lane group with per-row d8
+scales. (b) Q4K NIBBLE LAYOUT -- byte group mw%4 with hi-select mw>=4
+is wrong; sub-blocks 2j/2j+1 share qs[32j..32j+31] (lo/hi nibbles) --
+byte group mw>>1, hi-select on ODD mw. (c) DEQUANT -- the kernels
+applied nibble-8 and sc/32; the kpar8 convention is the RAW nibble
+0..15 and RAW 6-bit sc/mv. Additionally: q4k_mma_batch_sm120 was
+converted from 4 warps (%4 stripe) to the streamk-proven 8-warp
+geometry (%8 stripe, 8-partial reduction, block 256) -- with 4 warps
+it failed DETERMINISTICALLY on odd D columns only (probe dump: every
+col 2k+1 wrong, every col 2k right) while byte-identical per-thread
+code passed in streamk; the mw-skip divergence pattern of the %4
+stripe is the identified difference (microarchitectural mechanism not
+fully root-caused -- documented, not hand-waved). A bar.sync at
+MW_DONE now protects the per-kb sync header reload. PROBE RESULT:
+both kernels PASS at 2.8e-9..7.5e-8 max rel err across m in
+{1,2,4,6} x shapes (64,1),(64,2),(4096,16),(1024,16),(14336,16),
+(4096,56) -- pure f32 sum-order noise (mma.sync int8 products are
+exact). has_mma_batch/has_streamk_batch re-enabled (uses_raw_gguf-
+gated): the equal-position f32 batch graph paths can dispatch them
+again (composition is fixed per capture -- the q6k two-phase
+precedent). (2) THE ROUTING EVALUATION -- TEMPURA_Q4K_BATCH_KERNEL
+selects the no-graph batch kernel (unset = kpar8, today's path).
+m>=2: gemm_any_d2d_batch dispatches by selector. m=1:
+gemm_any_d2d_slot's Q4K arm routes through the batch kernel too (the
+kernels are row-independent -> m=1 numerics == m>=2 numerics), with
+the (k,1)/(slot,n,1) scratch PRE-WARMED in preallocate_scratch
+(allocation during the m=1 graph capture is error 900); the KV-stream
+fork is skipped under the selector (its K/V submissions are per-row
+kpar on stream_kv -- before that skip, ab-repro showed m=1 vs m>=2
+diverging at step 1 by 2.1e-2 logits; after it, solo/m=2/m=3
+checksums are IDENTICAL). MEASURED (fishtank, RTX 5090,
+Llama-3.1-8B Q4_K_M, f16 pool, bench-nograph, before = same tree
+default): short ctx m=1 5.2->9.8, m=2 8.7->10.6, m=3 10.8->11.2,
+m=4 13.1->12.0, m=5 15.9->13.1, m=6 19.2->14.3 ms (313->419 tok/s,
++34%); long ctx m=1 7.6->11.2, m=2 11.0->12.8, m=3 12.9->13.4,
+m=4 15.2->14.3, m=5 17.9->15.2, m=6 21.2->16.4 ms (283->367, +30%).
+stream-K at serving m: 23-27 ms/step -- REJECTED (SM_COUNT-persistent
+grid + sequential per-block n8 tiles target large batches). PPL under
+uniform mma: pooled 8 chunks f16 8.6765 vs 8.6838 baseline (ratio
+0.9992, 0 NaN) -- PASSES the <= 1.005 gate. VERDICT: default stays
+kpar8. Composition invariance forbids m-thresholded dispatch (m=1
+solo must stay bit-identical to the same session batched), so
+switching means ALL m -- and uniform mma costs 191->102 tok/s at
+m=1 short-ctx to buy +8-34% at m=4-6. Not taken; the selector is the
+documented opt-in for m>=4-pinned profiles. (3) GATES ALL GREEN on
+the final tree (default path -- selector off; the ppl numbers are
+EXACTLY the pre-change baselines, confirming zero default-path
+numerics change): probe-q4k-batch PASS (all three kernels);
+probe-q6k-batch PASS; bench-decode-ops 97 PASS lines / 0 FAIL;
+bench-ab-repro solo/repeat/interleave/m=2/m=3 checksums IDENTICAL;
+pooled ppl 8 chunks f16 8.6838 / e4m3 8.6282 (baselines exact, 0
+NaN); nonstream-route-smoke PASS; kv-restart-var PASS; 6-client
+kv-swap A/B PASS on f16 AND e4m3 (6/6 byte-identical each, 4 swap
+cycles in run B); local cargo test green (919). FOLLOW-UPS (open):
+(a) compute-sanitizer on the probe flagged PRE-EXISTING 2-byte OOB
+reads in q4k_gemv_sm120_dp4a_kpar8_dual_block (the per-row reference
+kernel, threads reading past a buffer edge -- deterministic and
+bit-consistent with the batch twin, but OOB is OOB; root-cause and
+fix); (b) the mma kernel's small-m cost is the m16-tile floor (it
+computes 16 rows of A regardless) -- a small-m-specialized
+tensor-core variant that is numerics-compatible across m (same sum
+order, fewer wasted tiles) could flip the routing verdict; (c) the
+stream-K kernel needs a grid/tile rework before it is useful at
+serving m (or re-target it at prefill M>=32, its design point).**
+
 **STATUS 2026-11-16e (BATCHED RoPE for the serving decode path -- the
 per-request rope chain is GONE: one cutile_rope_rows_batch launch per
 tensor per layer replaces m x 2 rope launches + 3m extraction slices +
@@ -394,7 +481,11 @@ wire the kpar8 batch kernel into the graph path. The 2026-11-12
 streamk graph-path batch numbers (M=1..16) and all pre-2026-11-12
 mma_batch graph numbers were computed with these wrong kernels and are
 RETRACTED as quality-unverified (they were NaN-free + deterministic --
-internally consistent garbage). (4) GRAPH-PATH PPL RE-MEASURED CLEANLY
+internally consistent garbage).
+      [RESOLVED 2026-11-17: both kernels FIXED (three stacked bugs --
+      fragment mapping, nibble layout, dequant convention) and
+      probe-gated at 1e-5; has_* re-enabled; routing evaluated, default
+      stays kpar8 -- see the newer status entry above.] (4) GRAPH-PATH PPL RE-MEASURED CLEANLY
 (the unexplained "7.5 vs 5.4" note from 2026-11-14): pooled f32 pool +
 TEMPURA_PPL_M2=1 (m=2 equal-position dummy member -> MXFP4 batch graph)
 8 chunks = 11.3059 vs the f32 no-graph baseline 8.6799 = ratio 1.3025 --

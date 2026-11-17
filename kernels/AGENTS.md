@@ -161,16 +161,26 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from upstream and set `CUDA_OXIDE_BACKEND`.
 
-WARNING (2026-11-16): the hand-written q4k_mma_batch / q4k_streamk_batch /
-q4k_batch_sm120 PTX kernels are numerically WRONG (misparse the Q4K
-sub-block nibble/scale layout -- 12-31% rel error vs the per-row kpar8
-GEMV on random data; found by bench-probe-q4k-batch, which cross-checks
-every batch kernel against the per-row reference on random native-GGUF
-blocks). They are disabled at the has_* level. Do not re-enable any
-batch kernel without running that probe first. The correct general-M
-Q4K batch kernel is `q4k_gemv_sm120_kpar8_batch` in
-kernels/src/q4k_gemv_v4_ptx.rs (the kpar8 warp structure with an m-loop;
-bit-identical per row to the per-row GEMV).
+FIXED (2026-11-17): the hand-written q4k_mma_batch / q4k_streamk_batch PTX
+kernels were numerically WRONG from their introduction until 2026-11-16
+(misparse the Q4K sub-block nibble/scale layout AND used an invented
+mma.sync fragment mapping -- 12-31% rel error vs the per-row kpar8 GEMV
+on random data; found by bench-probe-q4k-batch). Both are now FIXED and
+probe-gated at <= 1e-5 max rel error (measured 2.8e-9..7.5e-8, pure f32
+sum-order noise): true m16n8k32 fragment layout (tid=lane&3, gid=lane>>2;
+D = the mxf4 acc_coords mapping), byte group mw>>1 with hi-select on odd
+mw, raw nibble / raw 6-bit scales, and the mma kernel uses the streamk
+8-warp geometry. They are NOT bit-identical to the per-row kpar8 GEMV:
+dispatch them only where the batch composition is fixed per capture (the
+equal-position graph paths) or uniformly across ALL m (the
+TEMPURA_Q4K_BATCH_KERNEL selector routes every m through them; verified
+composition-invariant + ppl-clean, but costs 47-88% at m=1 -- see the
+2026-11-17 status entry; default stays kpar8). The correct bit-identical
+general-M Q4K batch kernel for the no-graph path remains
+`q4k_gemv_sm120_kpar8_batch` in kernels/src/q4k_gemv_v4_ptx.rs.
+Do not re-enable any new batch kernel without running that probe first.
+(The OLD `q4k_batch_sm120` two-phase kernel remains DISABLED: its PTX is
+M=2-hardcoded and was never rewritten -- has_sm120_batch() stays false.)
 
 WARNING (2026-11-16, Q6K): the two-phase `q6k_gemv_sm120_batch` (the
 equal-position graph-path kernel) is NOT bit-identical to the per-row
