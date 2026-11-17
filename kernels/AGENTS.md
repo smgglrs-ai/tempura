@@ -193,3 +193,25 @@ The correct general-M Q6K batch kernel for the no-graph path is
 `q6k_gemv_sm120_kpar8_db_batch` in kernels/src/q6k_gemv_v4_ptx.rs (the
 kpar8_db warp structure with an m-loop; bit-identical per row to the
 per-row db GEMV, probe-gated).
+
+FIXED (2026-11-17): `q4k_gemv_sm120_dp4a_kpar8_dual_block` (kernels/src/
+q4k_gemv_v4_ptx.rs) read past the Q8_1 activation scratch on ragged
+k-block tails (e.g. down_proj kb=56) since its introduction: the B-side
+clamp selected A's FULL q8_blk_lo (already containing the mw*2 offset)
+and added mw*2 again, indexing blkA*8+mw*4 -- up to 6 slots past
+act_ds/act_qs at the last block. The loaded values were discarded by
+the predicated accumulate (all numerics gates passed while the reads
+were live); under compute-sanitizer the read faulted (error 719). The
+q6k db kernels are immune (they branch-skip block B instead of
+clamping). REGRESSION GATE: `bash scripts/sanitizer-gate.sh` (this
+host, repo root) -- memcheck over both probes + bench-decode-ops,
+racecheck/initcheck on the probes. Its one allowlist: racecheck's
+hazards on the q6k kpar8_db/db_batch release/acquire smem handoff
+(red.release.cta counter + ld.acquire.cta poll -- racecheck cannot
+model scoped-atomics ordering; the pattern is the 2026-10-29 FIX for
+the real cross-warp race and is determinism-gated). If you edit those
+kernels, re-audit the hazard offsets against the new SASS rather than
+extending the list. Any new PTX kernel or oxide host scratch-reuse
+path should land with this gate green -- and check scratch reuse sites
+against the ACTUAL n/k of every caller, not just the engine's
+(oxide_q4k_gemv_host.rs now enforces out-scratch >= n at every reuse).

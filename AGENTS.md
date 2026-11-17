@@ -567,6 +567,13 @@ Benchmarks: `tools/bench` (HTTP throughput, llama.cpp-bench-style pp/tg),
 bench-attn, bench-kernels, bench-speculative), `tools/compare` (A/B two
 servers), `engine/benches` (custom `harness = false` timing benches, not
 criterion). Results in `bench-*.json` at root.
+Sanitizer gate (GPU host): `bash scripts/sanitizer-gate.sh` (on fishtank,
+repo root) runs compute-sanitizer memcheck over bench-probe-q4k-batch,
+bench-probe-q6k-batch and bench-decode-ops, plus racecheck/initcheck on
+the probes -- the OOB-read regression gate for the serving-path GEMV
+kernels (2026-11-17: the kpar8 dual_block OOB reads passed every
+numerics gate for weeks). Run it when touching any hand-written PTX
+kernel or oxide host wrapper.
 
 Two-machine workflow: the RTX 5090 lives on `fishtank.home.local`
 (passwordless SSH); development happens on the laptop. `scripts/gpu-remote.sh`

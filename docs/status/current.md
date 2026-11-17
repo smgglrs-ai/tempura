@@ -5,6 +5,69 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-17b (the kpar8 OOB-read debt PAID: compute-sanitizer
+root-caused and fixed THREE pre-existing out-of-bounds sites in the default
+serving path, all numerics-neutral -- probes bit-exact, ppl EXACTLY at
+baseline; a permanent sanitizer gate now locks it; all gates green): (1)
+THE HUNT -- compute-sanitizer memcheck on bench-probe-q4k-batch reproduced
+the follow-up from the tensor-core session: 2-byte OOB reads in
+q4k_gemv_sm120_dp4a_kpar8_dual_block, warp 7 only, 1/17 bytes past the
+1792-byte act_ds scratch (k=14336, 448 u32 slots). SASS walk (ptxas +
+cuobjdump on the embedded PTX) pinned the instruction: the B-side
+ragged-tail clamp. The PTX clamped invalid blkB's activation index to
+A's FULL q8_blk_lo (%r26 = blkA*8 + mw*2) and then added mw*2 AGAIN ->
+B indexed blkA*8 + mw*4; at the last k-block (blkA=55, k_blocks=56) that
+is slots 448/452 of 448 -- past the end. The same wrong index fed the
+B-side act_qs loads (up to ~1.1 KB past, invisible to memcheck only
+because they landed inside a larger mempool allocation). The loaded
+values are discarded by the @%p10-predicated accumulate -- which is why
+every output gate (bit-identity, ppl) passed for weeks while the reads
+were live: the exact "benign OOB is NOT benign" hazard (under memcheck
+the read faulted with error 719 -- the allocation-boundary class). FIX:
+clamp to blkA*8 and add mw*2 once (kernels/src/q4k_gemv_v4_ptx.rs).
+q6k is structurally immune: kpar8_db/db_batch BRANCH-SKIP block B past
+k_blocks (no clamped loads) -- probe-q6k-batch was memcheck-clean from
+the start. (2) TWO MORE SITES the first fault had been masking --
+memcheck on bench-decode-ops (previously unreachable: the probe died at
+the dual_block 719 before the later sections): (a) an OOB WRITE --
+q4k_fused_silu_sm120_dp4a writing out[] past a 16 KB tensor: the host
+scratch reuse in forward_sm120_fused_silu_d2d (and its oxide twin, plus
+the three q8_out_scratch GEMV paths) never checked that the pre-allocated
+out scratch fits n; bench-decode-ops pre-allocates for q_proj sizes then
+calls the fused path with n=intermediate=14336. The ENGINE sizes
+correctly today (max_n=inter) -- the fix (oxide_q4k_gemv_host.rs) makes
+the invariant enforced at every reuse site instead of assumed. (b) a
+harness bug: the q6k determinism-churn loop fed a 7777-element junk
+activation to forward_kpar_d2d with kb=56 (reads kb*256=14336) --
+sized to kb*256. (3) THE GATE -- scripts/sanitizer-gate.sh (fishtank,
+repo root): memcheck on bench-probe-q4k-batch + bench-probe-q6k-batch +
+bench-decode-ops, racecheck + initcheck on the probes (SAN_GATE_FAST=1
+skips those); FAILS on any sanitizer error OR app-level FAIL. One
+documented allowlist: racecheck reports the q6k kpar8_db/db_batch
+cross-warp reduction handoff (st.shared partials -> red.release.cta
+counter -> ld.acquire.cta poll -> thread-0 reads) as Write/Read hazards
+-- racecheck cannot model scoped-atomics ordering; that pattern IS the
+2026-10-29 fix for the real race and is determinism-gated (0/8 stress
+runs). Hazards in any other kernel fail the gate. (4) GATES ALL GREEN
+on the final tree (5702d9f): sanitizer-gate PASS (memcheck 0 errors on
+all three bins, racecheck 0 hazards q4k / handoff-only q6k, initcheck 0
+errors); probe-q4k-batch PASS; probe-q6k-batch PASS; bench-decode-ops
+97 PASS / 0 FAIL (also under memcheck); bench-ab-repro
+solo/repeat/interleave/m=2/m=3 checksums IDENTICAL; 6-client kv-swap
+A/B PASS on f16 (6/6 byte-identical, 5 swaps) AND e4m3 (6/6, 4 swaps),
+m1/m2p graph captures evidenced for both dtypes; pooled ppl 8 chunks
+f16 8.6838 / e4m3 8.6282 -- EXACTLY the pre-change baselines, 0 NaN
+(both doubly proving numerics-neutrality of the dual_block fix); local
+cargo test green (919). NOTE: the e4m3 ppl's CPU reference phase takes
+~30 min (2040 positions through the CPU model) -- the first e4m3
+attempt was killed as "hung" at 29 min, it was not (GPU part: 16.7 s);
+let it run. FOLLOW-UPS (open): the racecheck allowlist is
+kernel+offset-specific (q6k_gemv_sm120_kpar8_db+0x17a0,
+db_batch+0x36c0) -- if those kernels are edited, re-audit the hazards
+against the new SASS, do not blindly extend the list; sanitizer-gate
+does not yet cover the oxide-decode-attn crates' self-tests or
+bench-nograph (candidates for the next extension).**
+
 **STATUS 2026-11-17 (the retracted Q4K tensor-core batch kernels are
 FIXED -- all three root causes found, probe-gated at 1e-5, measured
 3e-8 sum-order noise; the serving-path routing EVALUATED end to end:
@@ -85,7 +148,12 @@ cycles in run B); local cargo test green (919). FOLLOW-UPS (open):
 reads in q4k_gemv_sm120_dp4a_kpar8_dual_block (the per-row reference
 kernel, threads reading past a buffer edge -- deterministic and
 bit-consistent with the batch twin, but OOB is OOB; root-cause and
-fix); (b) the mma kernel's small-m cost is the m16-tile floor (it
+fix);
+      [RESOLVED 2026-11-17b: root-caused (B-side ragged-tail clamp
+      double-added mw*2), fixed numerics-neutral, plus two more masked
+      sites (fused-silu out-scratch reuse, bench churn buffer) and a
+      permanent sanitizer gate -- see the newer status entry above.]
+      (b) the mma kernel's small-m cost is the m16-tile floor (it
 computes 16 rows of A regardless) -- a small-m-specialized
 tensor-core variant that is numerics-compatible across m (same sum
 order, fewer wasted tiles) could flip the routing verdict; (c) the
