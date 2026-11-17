@@ -4195,6 +4195,44 @@ impl CutileGpuModel {
                     .expect("oxide Q6K: pre_allocate_kpar_output_scratch failed");
             }
         }
+
+        // TEMPURA_Q4K_BATCH_KERNEL=mma|streamk: pre-warm the m=1 batch-kernel
+        // scratch (Q8_1 quantize + output buffers) BEFORE any CUDA graph
+        // capture -- the m=1 graph route captures gemm_any_d2d_slot, and
+        // device allocation on a capturing stream is CUDA error 900. The
+        // output entries are keyed (slot, n, 1); we don't know the
+        // slot->weight mapping here, so insert every Q4K weight's n under
+        // every slot (a few MB of over-allocation, evaluation switch only).
+        let sel = std::env::var("TEMPURA_Q4K_BATCH_KERNEL").unwrap_or_default();
+        if sel == "mma" || sel == "streamk" {
+            let mut pool = self.nograph.borrow_mut();
+            for dw in self.device_weights_q4k.values() {
+                let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+                pool.q4k_batch_qs.entry((k, 1)).or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[k / 4])
+                            .sync_on(stream)
+                            .expect("preallocate_scratch: q4k m1 batch qs"),
+                    )
+                });
+                pool.q4k_batch_ds.entry((k, 1)).or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[k.div_ceil(32)])
+                            .sync_on(stream)
+                            .expect("preallocate_scratch: q4k m1 batch ds"),
+                    )
+                });
+                for slot in SLOT_Q..=SLOT_LOGITS {
+                    pool.gemm_out.entry((slot, dw.n, 1)).or_insert_with(|| {
+                        Arc::new(
+                            api::zeros::<f32>(&[dw.n])
+                                .sync_on(stream)
+                                .expect("preallocate_scratch: q4k m1 batch out"),
+                        )
+                    });
+                }
+            }
+        }
     }
 
     /// Non-blocking variant of `gemm_d2d_slot`.
@@ -4989,12 +5027,23 @@ impl CutileGpuModel {
         // separate scratch; Q6K: the same select_kpar_fn) -- deterministic
         // kernels, so only the stream differs, not the output bits.
         if seq_len == 1 && std::env::var("TEMPURA_NO_MULTISTREAM").as_deref() != Ok("1") {
+            // TEMPURA_Q4K_BATCH_KERNEL=mma|streamk: skip the KV-stream fork.
+            // The fork's K/V submissions (dispatch_kv_on_stream) use the
+            // per-row kpar kernels on stream_kv; routing m=1 through the
+            // tensor-core batch kernels instead requires ALL m=1 projections
+            // (Q included) to go through gemm_any_d2d_slot's m=1 batch arm on
+            // stream_main -- uniform numerics with the m>=2 batch path (the
+            // composition-invariance contract). The fork is a latency
+            // optimization only; re-introducing it under this selector needs
+            // a stream-parameterized batch wrapper.
+            let sel = std::env::var("TEMPURA_Q4K_BATCH_KERNEL").unwrap_or_default();
+            let batch_routed = sel == "mma" || sel == "streamk";
             let has_q4k_kv = self.oxide_q4k_gemv.is_some()
                 && (self.device_weights_q4k.contains_key(k_name)
                     || self.device_weights_q6k.contains_key(k_name)
                     || self.device_weights_q2.contains_key(k_name));
 
-            if has_q4k_kv {
+            if has_q4k_kv && !batch_routed {
                 return self.dispatch_qkv_oxide_multistream(normed, q_name, k_name, v_name);
             }
         }
@@ -5380,22 +5429,36 @@ impl CutileGpuModel {
             let mut row_start = 0;
             while row_start < m {
                 let rows = (m - row_start).min(16);
-                oxide
-                    .forward_sm120_kpar_batch_d2d_rows(
-                        &act,
-                        row_start,
-                        &dw.tensor,
-                        &out,
-                        row_start,
-                        rows,
-                        n,
-                        dw.k_blocks,
-                        &x_qs,
-                        &x_ds,
+                // TEMPURA_Q4K_BATCH_KERNEL selects the batch kernel for the
+                // no-graph path (measurement/routing switch, 2026-11-17):
+                //   unset/"kpar" -> kpar8 batch (bit-identical per row; default)
+                //   "mma"        -> mma.sync tensor-core kernel (sum-order-only
+                //                   divergence, probe-gated at 1e-5)
+                //   "streamk"    -> stream-K persistent kernel (same gate)
+                // The mma/streamk variants are NOT bit-identical to the m=1
+                // per-row kpar GEMV: routing them here without ALSO routing
+                // m=1 breaks batch-composition invariance (the 6-client A/B
+                // byte-identity gate). Measurement-only until that decision.
+                let sel = std::env::var("TEMPURA_Q4K_BATCH_KERNEL").unwrap_or_default();
+                let res = if sel == "mma" {
+                    oxide.forward_mma_batch_d2d_rows(
+                        &act, row_start, &dw.tensor, &out, row_start, rows, n, dw.k_blocks,
+                        &x_qs, &x_ds,
                     )
-                    .unwrap_or_else(|e| {
-                        panic!("gemm_any_d2d_batch: Q4K kpar8 batch GEMM {weight_name}: {e}")
-                    });
+                } else if sel == "streamk" {
+                    oxide.forward_streamk_batch_d2d_rows(
+                        &act, row_start, &dw.tensor, &out, row_start, rows, n, dw.k_blocks,
+                        &x_qs, &x_ds,
+                    )
+                } else {
+                    oxide.forward_sm120_kpar_batch_d2d_rows(
+                        &act, row_start, &dw.tensor, &out, row_start, rows, n, dw.k_blocks,
+                        &x_qs, &x_ds,
+                    )
+                };
+                res.unwrap_or_else(|e| {
+                    panic!("gemm_any_d2d_batch: Q4K batch GEMM {weight_name}: {e}")
+                });
                 row_start += rows;
             }
             return out;
@@ -6015,6 +6078,81 @@ impl CutileGpuModel {
         // runs through the exact f32 host-dequant GEMM (prefill-style) instead.
         let f32_decode = m == 1 && std::env::var("TEMPURA_DECODE_F32_GEMV").as_deref() == Ok("1");
         if m == 1 && !f32_decode && self.device_weights_q4k.contains_key(weight_name) {
+            // TEMPURA_Q4K_BATCH_KERNEL=mma|streamk at m=1 (evaluation switch,
+            // 2026-11-17): the tensor-core batch kernels are row-independent,
+            // so m=1 through them is numerically IDENTICAL to m>=2 through
+            // them -- the uniform-numerics requirement for any future
+            // routing decision (all m or none; mixing with the kpar8 path
+            // would break batch-composition invariance). Default (unset)
+            // keeps the exact per-row kpar GEMV.
+            let sel = std::env::var("TEMPURA_Q4K_BATCH_KERNEL").unwrap_or_default();
+            let oxide_route = self.oxide_q4k_gemv.as_ref().filter(|o| o.uses_raw_gguf).filter(
+                |o| {
+                    if sel == "mma" {
+                        o.has_mma_batch()
+                    } else if sel == "streamk" {
+                        o.has_streamk_batch()
+                    } else {
+                        false
+                    }
+                },
+            );
+            if let Some(oxide) = oxide_route {
+                let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+                let stream = self.matmul.stream();
+                let (x_qs, x_ds, out) = {
+                    let mut pool = self.nograph.borrow_mut();
+                    let qs = pool
+                        .q4k_batch_qs
+                        .entry((k, 1))
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<u32>(&[k / 4])
+                                    .sync_on(stream)
+                                    .expect("gemm_any_d2d_slot: q4k m1 batch qs alloc"),
+                            )
+                        })
+                        .clone();
+                    let ds = pool
+                        .q4k_batch_ds
+                        .entry((k, 1))
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<u32>(&[k.div_ceil(32)])
+                                    .sync_on(stream)
+                                    .expect("gemm_any_d2d_slot: q4k m1 batch ds alloc"),
+                            )
+                        })
+                        .clone();
+                    let o = match pool.gemm_out.get(&(slot, dw.n, 1)) {
+                        Some(buf) => buf.clone(),
+                        None => {
+                            let buf = Arc::new(
+                                api::zeros::<f32>(&[dw.n])
+                                    .sync_on(stream)
+                                    .expect("gemm_any_d2d_slot: q4k m1 batch out alloc"),
+                            );
+                            pool.gemm_out.insert((slot, dw.n, 1), buf.clone());
+                            buf
+                        }
+                    };
+                    (qs, ds, o)
+                };
+                let res = if sel == "mma" {
+                    oxide.forward_mma_batch_d2d_rows(
+                        a, 0, &dw.tensor, &out, 0, 1, dw.n, dw.k_blocks, &x_qs, &x_ds,
+                    )
+                } else {
+                    oxide.forward_streamk_batch_d2d_rows(
+                        a, 0, &dw.tensor, &out, 0, 1, dw.n, dw.k_blocks, &x_qs, &x_ds,
+                    )
+                };
+                res.unwrap_or_else(|e| {
+                    panic!("gemm_any_d2d_slot: Q4K m1 batch GEMM {weight_name}: {e}")
+                });
+                return out;
+            }
             return self.gemm_q4k_d2d_slot(a, weight_name, slot);
         }
         if m == 1 && self.device_weights_q6k.contains_key(weight_name) {
