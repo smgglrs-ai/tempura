@@ -387,8 +387,11 @@ DONE:
 // ...), so results are bitwise-equal by construction.
 //
 // When blkB >= k_blocks (ragged tail, e.g. down_proj k_blocks=56), baseB and
-// B's activation indices clamp to block A's (safe addresses -- Blackwell
+// B's activation block index clamp to block A's (safe addresses -- Blackwell
 // traps on OOB even under predication) and B's accumulate is predicated off.
+// B's q8 index clamps to blkA*8 (NOT A's full q8_blk_lo, which already has
+// the mw*2 offset folded in -- double-adding it read past the Q8_1 scratch
+// on the tail; fixed 2026-11-17 after a compute-sanitizer memcheck report).
 .visible .entry q4k_gemv_sm120_dp4a_kpar8_dual_block(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
@@ -625,9 +628,15 @@ KLOOP2:
     cvt.rn.f32.u32 %f5, %r22;
     cvt.rn.f32.u32 %f6, %r23;
 
-    // -- B activations: q8_blk_lo = blkB * 8 + mw * 2 (clamped to A when invalid)
-    mul.lo.u32 %r68, %r60, 8;
-    selp.u32 %r68, %r68, %r26, %p10;
+    // -- B activations: q8_blk_lo = blkB * 8 + mw * 2 (clamped to blkA*8 when
+    // invalid -- NOT to A's full q8_blk_lo (%r26), which already contains
+    // mw*2: the old clamp double-added mw*2 and indexed up to 6 slots past
+    // the act_ds/act_qs scratch on the ragged tail (compute-sanitizer,
+    // 2026-11-17; the loaded values are discarded by the @%p10-predicated
+    // accumulate, so outputs were unaffected).
+    mul.lo.u32 %r68, %r12, 8;
+    mul.lo.u32 %r69, %r60, 8;
+    selp.u32 %r68, %r69, %r68, %p10;
     mul.lo.u32 %r27, %r6, 2;
     add.u32    %r68, %r68, %r27;
 

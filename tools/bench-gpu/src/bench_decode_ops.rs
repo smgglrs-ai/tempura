@@ -2897,8 +2897,11 @@ fn main() {
                 let mut nondet = 0usize;
                 for it in 1..=8u32 {
                     // History churn: fresh allocation + an intervening
-                    // kernel launch on the same stream.
-                    let junk = upload(prng_data(7777, it), &stream);
+                    // kernel launch on the same stream. The junk activation
+                    // must be full-length (kb*256): the GEMV reads all of x
+                    // regardless of n -- a short buffer made the churn launch
+                    // read past the tensor (compute-sanitizer, 2026-11-17).
+                    let junk = upload(prng_data(kb * 256, it), &stream);
                     let _ = o6.forward_kpar_d2d(&junk, &packed, 64, kb);
                     let r = o6
                         .forward_kpar_d2d(&x_dev, &packed, n, kb)

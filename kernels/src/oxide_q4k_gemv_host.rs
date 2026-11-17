@@ -2207,7 +2207,12 @@ impl OxideQ4kGemv {
 
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
             .map(|t| t.size() >= k / 4)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // out scratch must fit n too (undersized reuse = OOB kernel write;
+            // compute-sanitizer 2026-11-17)
+            && self.q8_out_scratch.borrow().as_ref()
+                .map(|t| t.size() >= n)
+                .unwrap_or(false);
 
         let x_qs_arc: Arc<Tensor<u32>>;
         let x_ds_arc: Arc<Tensor<u32>>;
@@ -2337,7 +2342,12 @@ impl OxideQ4kGemv {
         let k_q8_blocks = k.div_ceil(32);
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
             .map(|t| t.size() >= k / 4)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // out scratch must fit n too (undersized reuse = OOB kernel write;
+            // compute-sanitizer 2026-11-17)
+            && self.q8_out_scratch.borrow().as_ref()
+                .map(|t| t.size() >= n)
+                .unwrap_or(false);
 
         let x_qs_arc: Arc<Tensor<u32>>;
         let x_ds_arc: Arc<Tensor<u32>>;
@@ -2492,7 +2502,12 @@ impl OxideQ4kGemv {
         // allocation only when pre_allocate_q8_scratch has not been called yet.
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
             .map(|t| t.size() >= k / 4)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // out scratch must fit n too (undersized reuse = OOB kernel write;
+            // compute-sanitizer 2026-11-17)
+            && self.q8_out_scratch.borrow().as_ref()
+                .map(|t| t.size() >= n)
+                .unwrap_or(false);
 
         let x_qs_arc: Arc<Tensor<u32>>;
         let x_ds_arc: Arc<Tensor<u32>>;
@@ -2646,9 +2661,16 @@ impl OxideQ4kGemv {
         let k_q8_blocks = k.div_ceil(32);
 
         // Reuse pre-allocated Q8_1 scratch (required during CUDA graph capture).
+        // The out scratch must ALSO fit n: reusing an undersized fused_silu
+        // scratch made the kernel write past the tensor (compute-sanitizer,
+        // 2026-11-17 -- the engine sizes it to max_n, but nothing enforced
+        // that at the reuse site).
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
             .map(|t| t.size() >= k / 4)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && self.fused_silu_scratch.borrow().as_ref()
+                .map(|t| t.size() >= n)
+                .unwrap_or(false);
 
         let x_qs_arc: Arc<Tensor<u32>>;
         let x_ds_arc: Arc<Tensor<u32>>;
@@ -2762,9 +2784,16 @@ impl OxideQ4kGemv {
         let k_q8_blocks = k.div_ceil(32);
 
         // Reuse pre-allocated scratch tensors (required during CUDA graph capture).
+        // The out scratch must ALSO fit n: reusing an undersized fused_silu
+        // scratch made the kernel write past the tensor (compute-sanitizer,
+        // 2026-11-17 -- the engine sizes it to max_n, but nothing enforced
+        // that at the reuse site).
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
             .map(|t| t.size() >= k / 4)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && self.fused_silu_scratch.borrow().as_ref()
+                .map(|t| t.size() >= n)
+                .unwrap_or(false);
 
         let x_qs_arc: Arc<Tensor<u32>>;
         let x_ds_arc: Arc<Tensor<u32>>;
