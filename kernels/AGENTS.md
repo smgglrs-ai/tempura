@@ -182,6 +182,26 @@ Do not re-enable any new batch kernel without running that probe first.
 (The OLD `q4k_batch_sm120` two-phase kernel remains DISABLED: its PTX is
 M=2-hardcoded and was never rewritten -- has_sm120_batch() stays false.)
 
+NEW (2026-11-17d): two LARGE-m tensor-core batch kernels for the
+TEMPURA_PREFILL_PRECISION=exact prefill route -- `q4k_mma128_batch_sm120`
+(kernels/src/q4k_mma128_batch_sm120_ptx.rs; m <= 128 = 8 statically-unrolled
+m16 tiles, register accumulators, weights read ONCE per launch; per-row
+numerics BITWISE-equal to q4k_mma_batch_sm120 by construction -- same
+fragment mapping, warp stripe, and f32 accumulation order; probe arm in
+bench-probe-q4k-batch checks both) and `q6k_mma128_batch_sm120`
+(kernels/src/q6k_mma128_batch_sm120_ptx.rs; same skeleton, Q6K parsing with
+a 2-mma k16 split for the per-16-element scales -- each mma zeroes one B
+k16 half so each D is one sub-block's exact s32 sum, scaled by its own
+(d*sc) in f32; Q8_1 ACTIVATIONS = llama.cpp's Q6_K x Q8_K class, NOT the
+f32-activation class of the q6k sm120 batch GEMV -- never mix them on a
+path that compares against f32-act baselines). Debug lessons baked into
+the q6k probe: (a) a naive rel-to-result gate against the CPU f64
+reference FALSE-POSITIVES on cancellative sums (f32 rounding is ~1e-7 x
+sum|terms| but can exceed 1e-5 rel-to-result) -- the gate is
+|got - ref| <= 1e-5 * sum|terms| + 1e-6; (b) the reference's h/qq/l decode
+must derive from the WITHIN-BLOCK element (elem & 255), not the global
+element index.
+
 WARNING (2026-11-16, Q6K): the two-phase `q6k_gemv_sm120_batch` (the
 equal-position graph-path kernel) is NOT bit-identical to the per-row
 kpar8/kpar8_db GEMVs (max rel err 6e-5..2.4e-4 on random data -- its

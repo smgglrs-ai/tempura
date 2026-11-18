@@ -154,7 +154,7 @@ fn main() {
         }
         let packed = upload(&packed_host, &stream);
 
-        for &m in &[1usize, 2, 4, 6] {
+        for &m in &[1usize, 2, 4, 6, 16, 64, 128] {
             // Random activations [m * k].
             let mut x_host = vec![0f32; m * k];
             for v in x_host.iter_mut() {
@@ -199,11 +199,16 @@ fn main() {
                 let out = Arc::new(
                     api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
                 );
-                oxide
-                    .forward_sm120_kpar_batch_d2d_rows(
-                        &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
-                    )
-                    .expect("kpar8 batch launch");
+                let mut row = 0usize;
+                while row < m {
+                    let rows = (m - row).min(16);
+                    oxide
+                        .forward_sm120_kpar_batch_d2d_rows(
+                            &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                        )
+                        .expect("kpar8 batch launch");
+                    row += rows;
+                }
                 let got = out.to_host_vec().sync_on(&stream).expect("out download");
                 let mut exact = true;
                 for r in 0..m {
@@ -231,16 +236,28 @@ fn main() {
                 let out = Arc::new(
                     api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
                 );
-                let res = if is_mma {
-                    oxide.forward_mma_batch_d2d_rows(
-                        &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
-                    )
-                } else {
-                    oxide.forward_streamk_batch_d2d_rows(
-                        &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
-                    )
-                };
-                if let Err(e) = res {
+                // Both kernels cap at 16 rows per launch: larger m runs as
+                // chunked row windows (the engine's prefill chunking).
+                let mut launch_err = None;
+                let mut row = 0usize;
+                while row < m {
+                    let rows = (m - row).min(16);
+                    let res = if is_mma {
+                        oxide.forward_mma_batch_d2d_rows(
+                            &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                        )
+                    } else {
+                        oxide.forward_streamk_batch_d2d_rows(
+                            &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                        )
+                    };
+                    if let Err(e) = res {
+                        launch_err = Some(e);
+                        break;
+                    }
+                    row += rows;
+                }
+                if let Some(e) = launch_err {
                     // Not loaded is a hard failure too: the probe must cover
                     // every kernel the PTX ships (a silently-unloaded kernel
                     // is exactly how the 2026-11-16 retraction slipped).
@@ -272,6 +289,77 @@ fn main() {
                     "  {label} m={m} {kernel}: {} (max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 1e-5)",
                     if bad_rows == 0 { "OK" } else { "MISMATCH" }
                 );
+            }
+
+            // 3) mma128_batch: the LARGE-m tensor-core kernel (m <= 128 in
+            //    ONE launch, weights once). Gates:
+            //    a) <= 1e-5 rel vs the per-row kpar reference (same class
+            //       as mma_batch: sum-order-only divergence);
+            //    b) BITWISE-equal to the chunked mma_batch output (same
+            //       fragment mapping + accumulation order by construction).
+            if oxide.has_mma128_batch() {
+                let out = Arc::new(
+                    api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
+                );
+                let res = oxide.forward_mma128_batch_d2d_rows(
+                    &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
+                );
+                match res {
+                    Err(e) => {
+                        any_fail = true;
+                        println!("  {label} m={m} mma128: FAIL (launch error: {e})");
+                    }
+                    Ok(()) => {
+                        let got = out.to_host_vec().sync_on(&stream).expect("out download");
+                        let mut max_rel = 0f64;
+                        let mut bad_rows = 0;
+                        for r in 0..m {
+                            let mut row_max = 0f64;
+                            for c in 0..n {
+                                let a = got[r * n + c];
+                                let b = ref_rows[r][c];
+                                let denom = b.abs().max(1.0);
+                                let rel = ((a - b).abs() / denom) as f64;
+                                row_max = row_max.max(rel);
+                            }
+                            if row_max > 1e-5 {
+                                bad_rows += 1;
+                            }
+                            max_rel = max_rel.max(row_max);
+                        }
+                        let rel_ok = bad_rows == 0;
+                        if !rel_ok {
+                            any_fail = true;
+                        }
+                        // (b) bitwise vs chunked mma_batch
+                        let out16 = Arc::new(
+                            api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
+                        );
+                        let mut row = 0usize;
+                        while row < m {
+                            let rows = (m - row).min(16);
+                            oxide
+                                .forward_mma_batch_d2d_rows(
+                                    &x, row, &packed, &out16, row, rows, n, k_blocks, &x_qs, &x_ds,
+                                )
+                                .expect("mma16 chunk launch");
+                            row += rows;
+                        }
+                        let got16 = out16.to_host_vec().sync_on(&stream).expect("out download");
+                        let bitwise = got == got16;
+                        if !bitwise {
+                            any_fail = true;
+                        }
+                        println!(
+                            "  {label} m={m} mma128: {} (max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 1e-5; vs chunked mma16: {})",
+                            if rel_ok { "OK" } else { "MISMATCH" },
+                            if bitwise { "bit-identical" } else { "BITWISE MISMATCH" }
+                        );
+                    }
+                }
+            } else {
+                any_fail = true;
+                println!("  {label} m={m} mma128: FAIL (kernel not loaded)");
             }
         }
     }

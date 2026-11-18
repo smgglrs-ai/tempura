@@ -72,6 +72,10 @@ pub struct OxideQ6kGemv {
     /// db GEMV; the no-graph serving batch path).
     cu_sm120_db_batch_module: Option<CUmodule>,
     cu_function_sm120_db_batch: Option<CUfunction>,
+    /// q6k_mma128_batch_sm120: LARGE-m INT8 tensor-core batch (m <= 128,
+    /// weights once, Q8_1 activations).
+    cu_mma128_module: Option<CUmodule>,
+    cu_mma128_batch: Option<CUfunction>,
     /// Pre-allocated kpar output scratch -- avoids allocation during CUDA graph capture.
     /// Set via `pre_allocate_kpar_output_scratch(max_n)` before first graph capture.
     kpar_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
@@ -93,6 +97,9 @@ impl Drop for OxideQ6kGemv {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
         }
         if let Some(m) = self.cu_sm120_db_batch_module.take() {
+            let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+        }
+        if let Some(m) = self.cu_mma128_module.take() {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
         }
     }
@@ -437,6 +444,48 @@ impl OxideQ6kGemv {
                 (None, None)
             };
 
+        // -- Try sm_120 LARGE-m MMA batch PTX (q6k_mma128_batch_sm120) --------
+        // INT8 tensor cores, m <= 128 rows per launch, weights once, Q8_1
+        // activations (llama.cpp Q6_K x Q8_K class -- NOT the f32-activation
+        // class of the kernels above; used only by the exact-prefill route).
+        let (cu_mma128_module, cu_mma128_batch) = if !sm120_force_off && sm120_cc_ok {
+            let ptx_cstr =
+                CString::new(crate::q6k_mma128_batch_sm120_ptx::PTX).unwrap_or_default();
+            let mut m = std::mem::MaybeUninit::uninit();
+            let rc = unsafe {
+                cuda_core::sys::cuModuleLoadData(m.as_mut_ptr(), ptx_cstr.as_ptr() as *const _)
+            };
+            if rc == CUDA_SUCCESS {
+                let m = unsafe { m.assume_init() };
+                let entry_cstr =
+                    CString::new(crate::q6k_mma128_batch_sm120_ptx::ENTRY).unwrap_or_default();
+                let mut f = std::mem::MaybeUninit::uninit();
+                let rc2 = unsafe {
+                    cuda_core::sys::cuModuleGetFunction(f.as_mut_ptr(), m, entry_cstr.as_ptr())
+                };
+                if rc2 == CUDA_SUCCESS {
+                    eprintln!(
+                        "oxide-gemv-q6k: loaded sm_120 MMA128 batch PTX ({} bytes) -- INT8 tensor cores, m<=128, weights once, Q8_1 activations",
+                        crate::q6k_mma128_batch_sm120_ptx::PTX.len(),
+                    );
+                    (Some(m), Some(unsafe { f.assume_init() }))
+                } else {
+                    eprintln!(
+                        "oxide-gemv-q6k: cuModuleGetFunction(mma128_batch) failed (rc={rc2})"
+                    );
+                    let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+                    (None, None)
+                }
+            } else {
+                eprintln!(
+                    "oxide-gemv-q6k: cuModuleLoadData(mma128_batch PTX) failed (rc={rc})"
+                );
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         // Return Some only when at least one kernel is available.
         let any_loaded = !cu_function.is_null()
             || cu_function_kpar.is_some()
@@ -450,6 +499,9 @@ impl OxideQ6kGemv {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
             if let Some(m) = cu_sm120_db_batch_module {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+            if let Some(m) = cu_mma128_module {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
             eprintln!("oxide-gemv-q6k: no Q6K kernel variant available; falling back to cuTile");
@@ -482,6 +534,8 @@ impl OxideQ6kGemv {
             cu_function_sm120_batch,
             cu_sm120_db_batch_module,
             cu_function_sm120_db_batch,
+            cu_mma128_module,
+            cu_mma128_batch,
             kpar_out_scratch: RefCell::new(None),
             stream,
         })
@@ -507,6 +561,15 @@ impl OxideQ6kGemv {
     /// GEMV) was loaded.
     pub fn has_sm120_db_batch(&self) -> bool {
         self.cu_function_sm120_db_batch.is_some()
+    }
+
+    /// Returns `true` when the sm_120 LARGE-m MMA batch kernel
+    /// (q6k_mma128_batch_sm120) was loaded. NOTE: this kernel takes Q8_1-
+    /// quantized activations (llama.cpp's Q6_K x Q8_K class), NOT raw f32
+    /// like the other batch kernels -- see
+    /// [`Self::forward_mma128_batch_d2d_rows`].
+    pub fn has_mma128_batch(&self) -> bool {
+        self.cu_mma128_batch.is_some()
     }
 
     /// sm_120 M-row batch db GEMV (native GGUF Q6K) with row-window offsets:
@@ -673,6 +736,103 @@ impl OxideQ6kGemv {
             )
         }
         .map_err(|e| KernelError::InvalidConfig(format!("q6k_gemv_sm120_batch: {e}")))?;
+        Ok(())
+    }
+
+    /// LARGE-m MMA batch GEMM (m in 1..=128): the m16n8k32 tensor-core path
+    /// with the weight matrix read ONCE per launch (8 statically-unrolled
+    /// m16 tiles, register accumulators). Q8_1-ACTIVATION class (llama.cpp
+    /// Q6_K x Q8_K) -- NOT raw f32 like [`Self::forward_sm120_batch_rows`];
+    /// the caller quantizes via the q4k host's `quantize_q8_1_window` (the
+    /// quantize kernel lives in the q4k PTX module).
+    ///
+    /// Per-row numerics are independent of the row window (rows predicated
+    /// on the tile guard), so chunking a batch of M > 128 rows into
+    /// ceil(M/128) launches is batch-composition-invariant.
+    ///
+    /// `x` is flat [m_total * k] f32 row-major (window at `x_row`, used
+    /// ONLY for bounds validation -- the math reads `x_qs`/`x_ds`);
+    /// `packed` is the packed Q6K [n * k_blocks * 53 u32]; `x_qs`/`x_ds`
+    /// are Q8_1 scratch for the window's m rows (m * k / 4 and m * k / 32
+    /// u32); `out` is [m_total * n] f32 (rows at `out_row`).
+    pub fn forward_mma128_batch_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 128 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k forward_mma128_batch_d2d_rows: m must be in 1..=128 (8 m16 tiles); got {m}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mma128: x slice [{x_row}, {}+{m}) x {k} exceeds tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mma128: out slice [{out_row}, {}+{m}) x {n} exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+        if x_qs.size() < m * k / 4 || x_ds.size() < m * k.div_ceil(32) {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mma128: Q8_1 scratch too small (qs {} < {}, ds {} < {})",
+                x_qs.size(),
+                m * k / 4,
+                x_ds.size(),
+                m * k.div_ceil(32)
+            )));
+        }
+        let mma_fn = match self.cu_mma128_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q6k mma128_batch not loaded".into())),
+        };
+        let cu_stream = self.stream.cu_stream();
+        let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+        let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+        let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+        let n_u32: u32 = n as u32;
+        let kb_u32: u32 = k_blocks as u32;
+        let m_u32: u32 = m as u32;
+        let mut params: [*mut c_void; 7] = [
+            &wt_ptr as *const _ as *mut c_void,
+            &qs_ptr as *const _ as *mut c_void,
+            &ds_ptr as *const _ as *mut c_void,
+            &ou_ptr as *const _ as *mut c_void,
+            &n_u32  as *const _ as *mut c_void,
+            &kb_u32 as *const _ as *mut c_void,
+            &m_u32  as *const _ as *mut c_void,
+        ];
+        let grid_x = n_u32.div_ceil(8);
+        unsafe {
+            launch_kernel(
+                mma_fn,
+                (grid_x, 1, 1),
+                (256, 1, 1),  // 8 warps, static smem in PTX
+                0,
+                cu_stream,
+                &mut params,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("q6k mma128_batch gemm rows: {e}")))?;
         Ok(())
     }
 

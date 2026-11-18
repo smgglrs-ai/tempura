@@ -41,10 +41,12 @@ pub mod q4k_gemv_v4_ptx;
 pub mod q4k_fused_silu_v4_ptx;
 pub mod q4k_batch_sm120_ptx;
 pub mod q4k_mma_batch_sm120_ptx;
+pub mod q4k_mma128_batch_sm120_ptx;
 pub mod q4k_streamk_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
 pub mod greedy_argmax;
 pub mod q6k_gemv_v4_ptx;
+pub mod q6k_mma128_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
 pub mod q6k_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
