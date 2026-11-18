@@ -16,3 +16,4 @@ target-nofma/
 # Claude Code worktrees
 .claude/worktrees/
 verus-verified/target/
+opencode.jsonc
