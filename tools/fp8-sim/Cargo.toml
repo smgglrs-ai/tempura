@@ -1,0 +1,13 @@
+[package]
+name = "tempura-fp8-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1"
+tempura-engine = { path = "../../engine" }
+tempura-kernels = { path = "../../kernels" }
+
+[lints]
+workspace = true

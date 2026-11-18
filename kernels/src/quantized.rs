@@ -1269,7 +1269,7 @@ pub use crate::{
     Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
 
-fn f16_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x3ff) as u32;

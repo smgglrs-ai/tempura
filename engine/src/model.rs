@@ -1414,7 +1414,7 @@ where
         let head_dim = cfg.head_dim;
         let seq_len = token_ids.len();
 
-        let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+        let q4k = tempura_kernels::fp8_sim::matmulq_dispatch();
         use tempura_kernels::quantized::{
             MatMulQ, PreQuantizedActivations, Q2_0_BLOCK_BYTES, Q2_0_BLOCK_SIZE,
         };
@@ -8056,7 +8056,7 @@ where
                 let preq = PreQuantizedActivations::i2s_only(unsafe {
                     std::slice::from_raw_parts(hp as *const f32, h)
                 });
-                let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+                let q4k = tempura_kernels::fp8_sim::matmulq_dispatch();
                 use tempura_kernels::quantized::MatMulQ;
                 q4k.forward_i2s_preq(
                     &preq.i2s_q8,
@@ -9635,7 +9635,7 @@ where
             );
         } else if let Some(w) = qweights.get_i2s("lm_head.weight") {
             let preq = tempura_kernels::quantized::PreQuantizedActivations::i2s_only(last_hidden);
-            let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+            let q4k = tempura_kernels::fp8_sim::matmulq_dispatch();
             use tempura_kernels::quantized::MatMulQ;
             q4k.forward_i2s_preq(
                 &preq.i2s_q8,
