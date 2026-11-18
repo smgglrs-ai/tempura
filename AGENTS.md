@@ -478,6 +478,22 @@ Qwen3.6-27B weights** — see open work.
       cost); default stays MXFP4. The old TEMPURA_NO_MXFP4=1 prefill
       capture-panic is GONE (prefill graph off by default since cuda-oxide
       v0.5.0; that switch now runs, on the 9 tok/s host-dequant path).
+      ACCELERATED (2026-11-17d): both exact-mode sides route through NEW
+      LARGE-m INT8 tensor-core kernels -- q4k_mma128_batch_sm120 (per-row
+      numerics bitwise-equal to q4k_mma_batch_sm120) and
+      q6k_mma128_batch_sm120 (Q8_1 activations = llama.cpp's Q6_K x Q8_K
+      class; 2-mma k16 split for Q6K's per-16-element scales) -- up to 128
+      rows per launch with the weight matrix read ONCE per launch (the
+      16-row chunking re-read weights m/16 times, which dominated the cost).
+      Exact mode: 2508 tok/s pp128, TTFT P50 51 ms (7.1x the 355 tok/s
+      kpar8 route; 2.9x from llama.cpp's 7335); decode unchanged. Kernel
+      choice under exact: TEMPURA_Q4K_PREFILL_KERNEL=kpar8|mma|streamk
+      (default mma128 for m>16), TEMPURA_Q6K_PREFILL_KERNEL=sm120 (default
+      mma128). Probe-gated: bench-probe-q4k-batch (mma128 arm: <= 1e-5 vs
+      kpar per-row AND bitwise vs chunked mma16), bench-probe-q6k-batch
+      (mma128 arm: random-data CPU f64 reference from the same quantized
+      activations, cancellation-aware gate 1e-5 * sum|terms| -- a naive
+      rel-to-result gate false-positives on cancellative sums).
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s

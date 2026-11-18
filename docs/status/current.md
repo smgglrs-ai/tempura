@@ -5,6 +5,95 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-17d (exact-mode prefill ACCELERATED 7.1x: two NEW LARGE-m
+INT8 tensor-core kernels -- q4k_mma128_batch_sm120 + q6k_mma128_batch_sm120
+-- route both TEMPURA_PREFILL_PRECISION=exact prefill sides with the weight
+matrix read ONCE per 128-row launch; exact mode 355 -> 2508 tok/s pp128
+(TTFT 360 -> 51 ms, 2.9x from llama.cpp's 7335), MMLU 62.8% / GPU-CPU
+agreement 98.0% (PASS, was 96.8% -- the Q6K-side Q8_1 activation class
+change is quality-NEUTRAL), exact ppl 8.0869 (old exact baseline 8.0889,
+0.02% = noise; default-path ppl EXACTLY at baselines); all gates green):
+(1) THE MEASUREMENT LADDER (fishtank, RTX 5090, Llama-3.1-8B-Instruct
+Q4_K_M, probe-prefill-tc + bench-real-model pp128, exact mode): the
+2026-11-17c exact route cost 355 tok/s because BOTH sides re-read the
+weight matrix once per 16-row chunk at prefill m (Q4K kpar8 batch ~90-128
+GB/s effective; Q6K sm120 batch ~95-106 GB/s). nsys on the chunked-mma
+route (876 tok/s): Q4K mma 68.5 ms/step + Q6K sm120_batch 71.8 ms/step +
+~4 ms misc. The FIXED tensor-core kernels (2026-11-16f) at m=16 measured
+3.9-4.5x kpar8 (350-446 GB/s) -- routing exact prefill through chunked
+mma gave 876 tok/s. The structural fix: the m16n8k32 tile is the only
+16-row constraint -- an IN-KERNEL m-tile loop reads weights once for all
+128 rows. (2) THE KERNELS (kernels/src/q4k_mma128_batch_sm120_ptx.rs,
+q6k_mma128_batch_sm120_ptx.rs): 8 STATICALLY-UNROLLED m16 tile bodies
+with REGISTER accumulators (f100-f131), per-(kb,mw) weight/header loads
+hoisted out of the tile loop, per-tile smem reduction reusing the
+q4k_mma_batch_sm120 warp geometry (grid ceil(n/8), block 256, stripe
+(kb*8+gw)%8, TRUE fragment mapping). The Q4K variant's per-row numerics
+are BITWISE-EQUAL to q4k_mma_batch_sm120 by construction (same
+accumulation order) -- probe-verified. The Q6K variant handles Q6K's
+PER-16-ELEMENT scales with a 2-MMA K16 SPLIT: B zeroed on one k16 half
+per mma, so each D is ONE sub-block's exact s32 sum, scaled by its own
+(d*sc) in f32 (no min term; weight byte = raw6-32 as exact s8). Q6K
+mma128 takes Q8_1 ACTIVATIONS (llama.cpp's Q6_K x Q8_K class) -- NOT the
+f32-activation class of the q6k sm120 batch GEMV; the quantize goes
+through the q4k oxide module's quantize_q8_1_window (now public; the
+quantize kernel lives in the q4k PTX). ptxas: 64 regs, 0 spills, 33152 B
+static smem. DEBUGGING NOTES (both kernels probe-gated; the q6k one took
+three fixes found by a one-hot-activation B-fragment dump): the B weight
+u32 base forgot the x53 block stride (every thread read neuron 0 at
+kb=0); and the CPU f64 probe reference had TWO bugs of its own -- h/qq/l
+decoded from the GLOBAL element index instead of the within-block index
+(reads past the block for kb>=1), and a naive rel-to-result gate that
+false-positives on cancellative sums (f32 rounding is ~1e-7 x
+sum|terms| but can exceed 1e-5 rel-to-result) -- the q6k probe's mma128
+arm now gates |got-ref| <= 1e-5*sum|terms| + 1e-6 (measured headroom:
+max err/gate ~5e-3; layout bugs misplace whole sub-blocks, >= 1e-3 x
+abssum). (3) THE NUMBERS: exact mode 2508 tok/s pp128 / TTFT P50 51 ms
+(ladder: 355 kpar8 -> 876 chunked mma -> 1086 q4k-mma128 -> 2508 both
+sides; llama.cpp 7335 = 2.9x gap, was 20.6x); decode UNCHANGED (217
+tok/s); logits NaN-free, det=OK. MMLU (250q, exact mode): GPU 62.8%,
+CPU 61.6%, llama 62.4%; GPU/CPU agreement 98.0% PASS (gate 85%), GPU/llama
+95.6% -- the Q6K Q8_1-activation class change did not move accuracy
+(62.8% both before and after) and IMPROVED agreement. PPL (pooled 8
+chunks): default f16 8.6838 / e4m3 8.6282 -- EXACTLY the pre-change
+baselines (the default path is numerics-neutral: the only default-path
+delta is env-var reads); exact f16 8.0869 vs the 2026-11-17c exact
+baseline 8.0889 (ratio 0.998 vs llama.cpp 8.0192) -- the class change is
+within noise, no re-baseline needed. (4) THE DEFAULT-FLIP DECISION:
+exact at 2508 tok/s is still 3.1x below the MXFP4 default's 7790 -- the
+~2x default-flip bar is NOT met, so the default stays MXFP4 (the
+all-or-nothing choice is now 2508 vs 7790, and the 2026-11-17c follow-up
+(d) -- a mid-precision prefill keeping most of the quality at serving
+speed -- remains the interesting direction). Kernel selection under
+exact mode: TEMPURA_Q4K_PREFILL_KERNEL=kpar8|mma|streamk (default mma,
+which uses mma128 for m>16 when loaded), TEMPURA_Q6K_PREFILL_KERNEL=sm120
+(default mma128); both bisect switches restore the 2026-11-17c routes.
+(5) KERNEL-SHAPE NUMBERS (probe-prefill-tc, final tree): mma128 at
+m=128 -- q/o_proj 0.214 ms, k_proj 0.055 ms, gate/up 0.330 ms, down-shape
+0.395 ms -- vs the chunked mma's 0.597/0.135/0.597(x2)/0.713: ~1.8-2.5x
+per shape at m=128 and ~5.2x on gate/up (weights once vs 8x). Projected
+Q4K-projection stack: ~4241 tok/s pp128 (kpar8 547, chunked mma 2270).
+(6) GATES ALL GREEN on the final tree: probe-q4k-batch PASS (mma128 arm:
+<= 1e-5 vs kpar per-row AND bitwise vs chunked mma16, all shapes x m in
+{1,2,4,6,16,64,128}); probe-q6k-batch PASS (mma128 arm: 4 shapes x 7 m
+values, max err/gate ~5e-3); bench-ab-repro solo/repeat/interleave/
+composition checksums IDENTICAL; 6-client kv-swap A/B PASS on f16 AND
+e4m3 (byte-identical, eviction exercised); nonstream-route-smoke PASS;
+kv-restart-var PASS; sanitizer-gate PASS (memcheck/racecheck/initcheck
+clean on both probes incl. the mma128 arms, only the documented kpar8_db
+handoff allowlist); local cargo test green (919).**
+FOLLOW-UPS (open): (a) the mma128 kernels' remaining gap to llama.cpp is
+compute-side (the per-tile f32 scaling chains + Q4K rowsum butterflies
+run per (kb,gw,tile)); a quantize-side precomputed per-32-byte rowsum
+(stash in the x_ds high bits, ignored by existing kernels) would cut the
+Q4K min-term ALU; (b) the mid-precision prefill (2026-11-17c follow-up
+d) is now measured from both ends: 2508 exact vs 7790 MXFP4; (c) the
+mma128 kernels are candidates for the equal-position graph paths too
+(uniform routing would be needed -- see the 2026-11-17 entry's
+composition-invariance note); not measured here.
+
+## Latest session status
+
 **STATUS 2026-11-17c (the MMLU precision gap CLOSED: TEMPURA_PREFILL_PRECISION
 =exact quality mode landed -- the MXFP4 prefill opt-out the 2026-11-13
 measurement called for; MMLU GPU 48.8% -> 62.8%, GPU/CPU agreement 58.0% ->
