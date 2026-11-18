@@ -506,10 +506,13 @@ impl MatMulQ for Fp8SimMatMulQ {
 }
 
 // The e4m3 round-trip error is a per-operand property (half-ulp of a
-// 3-mantissa format = 2^-4 worst case, proptest-gated in crate::e4m3);
+// 3-mantissa format = 2^-4 worst case, proptest-gated in the tests below);
 // the dot-level bound is data-dependent (cancellative sums), so the
 // equivalence claim is carried by the runtime comparison: the
 // tools/fp8-sim MMLU/logit-band harness vs the unmodified CPU reference.
+// NOT in the kernel-verify registry table: that gate enforces <= 5% for
+// OPTIMIZED kernels; this is an intentional-approximation simulation
+// harness (slower than the reference, default-off), not an optimization.
 impl crate::VerifiedEquivalent<CpuMatMulQ4KOpt> for Fp8SimMatMulQ {
     fn max_relative_error() -> f64 {
         0.0625

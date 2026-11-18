@@ -3569,6 +3569,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempura-fp8-sim"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempura-engine",
+ "tempura-kernels",
+]
+
+[[package]]
 name = "tempura-integration"
 version = "0.1.0"
 dependencies = [

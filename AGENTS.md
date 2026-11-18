@@ -53,7 +53,11 @@ tools/ (workspace): trace-cli (TUI trace viewer), bench (HTTP throughput),
   bench-gpu (11 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
   bench-e2e, bench-attn, bench-kernels, bench-speculative, bench-quality,
   bench-decode-ops, bench-perplexity, bench-mmlu), compare (server-vs-server),
-  integration
+  integration, fp8-sim (CPU-side precision-class simulation harness: runs the
+  MMLU/logit-band comparison with e4m3 round-trips injected into the real
+  quantized forward — 2026-11-18 negative result recorded in docs/status:
+  e4m3 activations fail the MMLU gate at 90.8% agreement; use it to test any
+  future activation/weight precision class BEFORE building kernels)
 tools/ (standalone, cargo oxide): oxide-gemv (Q2_0), oxide-gemv-q4k,
   oxide-gemv-q6k, oxide-decode-attn, mxf4-gemv (cute-rs SM120a test)
 

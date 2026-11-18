@@ -5,6 +5,93 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-18 (mid-precision FP8 prefill: NEGATIVE RESULT, simulation-first
+per the stop rule — an e4m3-activation x e4m3-weight prefill GEMM class does NOT
+pass the MMLU agreement gate (90.8% vs the 95% gate; exact 96.8-98.0%, MXFP4
+58.0%), so NO GPU kernel work was done; the e4m3 ACTIVATION quantization is the
+dominant cost (act-only 89.6%); the CPU-side simulation harness landed as
+tools/fp8-sim + kernels/src/fp8_sim.rs, default-off and numerics-identical on
+the default path; all gates green): (1) THE HYPOTHESIS UNDER TEST (the
+2026-11-17c/d follow-up): the MXFP4 quality failure is the E2M1 activation
+quant (0-1 mantissa bits, rel~0.1 logit band) + the Q6K->MXFP4 weight
+double-quant; e4m3 activations (3 mantissa bits + own exponent) with
+Q4K/Q6K->e4m3 weights should shrink the band enough to pass MMLU at a speed
+approaching MXFP4 (Blackwell e4m3 x e4m3 mma), eliminating the 2508-vs-7790
+tok/s quality fork. (2) THE METHOD — quantify BEFORE kernel work: a CPU-side
+simulation INSIDE the real quantized forward (kernels/src/fp8_sim.rs): every
+Q4K/Q6K prefill projection rounds its activations and/or dequantized weights
+through a HARDWARE-FAITHFUL e4m3 round-trip (subnormals preserved — the
+KV-cache helpers flush them, a KV convention, NOT mma semantics) then computes
+the GEMM in f32 — the exact numerics class of an e4m3 x e4m3 mma with f32
+accumulation, modulo sum order. Activation through engine/model.rs's
+forward_quantized via a new MatMulQDispatch (default = pure delegation to
+CpuMatMulQ4KOpt; TEMPURA_FP8_SIM selects the sim; the x8 repacked prefill
+kernels decline in sim mode so projections fall back to the generic
+qmm_indexed route the sim covers; decode-class preq/fused paths stay real —
+fp8 targets prefill only). Mode bits: act / weight / wscale (per-tensor weight
+scale, absmax -> 224) / arowscale / ftz / noop (route-switch control).
+tools/fp8-sim (new workspace crate) runs the 250q MMLU harness twice on one
+model (reference pass = mode OFF, bit-identical to stock) and reports
+accuracy, choice agreement, and the logit band. TWO findings baked into the
+harness: (a) plain e4m3 weight quantization is CATASTROPHIC without a
+per-tensor scale — e4m3's min normal is 2^-6 = 0.0156 and real Q4K weight
+magnitudes straddle it, so unscaled small weights land in the subnormal range
+where e4m3 has 0-2 mantissa bits (the earlier "no block scales needed, the
+exponent suffices" reading is WRONG; a per-TENSOR scale is mandatory — still
+no block scales); (b) the CPU forward's x8-repacked route and the generic
+qmm route differ by a band of 0.021 (noop control, 100% agreement, 12q) — a
+pre-existing Q8Kx4-vs-Q8K quantization-class difference between the two
+shipping routes, small but nonzero; the noop control now exists to measure
+it. (3) THE NUMBERS (fishtank, Llama-3.1-8B-Instruct Q4_K_M, 250q MMLU,
+mode act+weight+wscale): reference 61.6%, sim 64.0% (flips are near-ties both
+ways — accuracy moves are noise), choice agreement 90.8% = 23/250 flips FAIL
+(gate 95%), logit band: max |delta| 1.42, mean 0.169, max rel to peak |logit|
+0.074 vs the MXFP4 GPU band 0.10-0.13 — only ~1.5x better, NOT the hoped
+8-16x. ATTRIBUTION (48q each): act-only (e4m3 acts, exact-dequant weights)
+agreement 89.6%, band 0.060 — the ACTIVATION quantization alone fails the
+gate and is essentially the whole combined band; weight-only+wscale (e4m3
+weights, exact acts) 95.8%, band 0.053 — borderline. (4) THE CONCLUSION: an
+fp8 mma path REQUIRES e4m3 activations (mixed-operand mma does not exist),
+and e4m3 activations alone fail the MMLU gate — the mid-precision FP8 prefill
+is DEAD as a quality-passing default. The quality cliff sits between 3
+mantissa bits (e4m3, fails at ~2% RMS per-element) and 7 (Q8_1, passes at
+98% agreement — the exact-mode class); no FP8 format has more than 3. A
+secondary (unmeasured, moot after the quality fail) speed premise was also
+doubtful: e4m3 weights are 1.78x the Q4K bytes (weight traffic DOUBLES vs
+the MXFP4 path's 4.58 bits/elem) and the m16n8k32 mma rate equals int8's —
+the fp8 path would have to win on parse-ALU alone. The simulation-first rule
+saved the kernel work. (5) WHAT LANDED anyway (the harness is the durable
+output): kernels/src/fp8_sim.rs (Fp8SimMatMulQ + MatMulQDispatch +
+hardware-faithful e4m3 encode/decode helpers + 6 unit tests incl. a
+random-data kernel-level gate vs CpuMatMulQ4KOpt with a
+cancellation-aware 0.07*sum|terms| bound and realistic Q4K block
+magnitudes); model.rs's three `let q4k = CpuMatMulQ4KOpt` bindings ->
+matmulq_dispatch(); tools/fp8-sim (MMLU agreement + logit-band harness);
+f16_to_f32 made pub(crate). Default-path delta = one atomic load + one-time
+env parse per forward (mode 0 delegates verbatim — numerics-identical by
+construction). Fp8SimMatMulQ carries a VerifiedEquivalent impl (bound 2^-4
+per operand, tier Tested, carried by the runtime comparison) but is
+deliberately NOT in the kernel-verify registry (that gate enforces <= 5%
+for OPTIMIZED kernels; this is an intentional-approximation simulation).
+OPERATIONAL NOTE: the harness caches converted weights as f32 (~32 GB for
+the 8B model) — NEVER run multiple fp8-sim instances concurrently (four
+parallel runs OOM'd on the 125 GB fishtank; run sequentially). (6) GATES ALL
+GREEN on the final tree: local cargo test (workspace, bench-gpu excluded —
+no CUDA toolkit on the laptop) 925 passed / 0 failed (919 + 6 new); GPU-side
+battery on fishtank (my changes are CPU-forward-only, but the standing gates
+ran): probe-q4k-batch PASS; probe-q6k-batch PASS; bench-ab-repro checksums
+IDENTICAL; 6-client kv-swap A/B PASS on f16 AND e4m3 (byte-identical,
+eviction exercised); nonstream-route-smoke PASS; kv-restart-var PASS; pooled
+ppl 8 chunks f16 8.6838 / e4m3 8.6282 — EXACTLY the standing baselines,
+0 NaN; sanitizer-gate PASS. (7) FOLLOW-UP RECORDED for any future
+mid-precision attempt: the remaining design space is (a) activation formats
+with >= ~5 mantissa bits (Q8_1-class — that IS the exact mode's mma128
+route, so "mid-precision" collapses into it), or (b) MXFP4-with-wider-scales
+on the WEIGHT side only with Q8_1 activations — but that pairing has no
+single-mma operand format either; the x8-vs-generic 0.021 route band (2b
+above) is a separate small pre-existing observation worth knowing when
+comparing CPU paths.**
+
 **STATUS 2026-11-17d (exact-mode prefill ACCELERATED 7.1x: two NEW LARGE-m
 INT8 tensor-core kernels -- q4k_mma128_batch_sm120 + q6k_mma128_batch_sm120
 -- route both TEMPURA_PREFILL_PRECISION=exact prefill sides with the weight
