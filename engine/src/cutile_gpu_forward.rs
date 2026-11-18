@@ -5974,6 +5974,104 @@ impl CutileGpuModel {
         }
     }
 
+    /// Prefill (m > 1) Q6_K GEMM for TEMPURA_PREFILL_PRECISION=exact: the
+    /// LARGE-m INT8 tensor-core kernel (`q6k_mma128_batch_sm120`), up to 128
+    /// rows per launch with the weight matrix read ONCE per launch (2026-
+    /// 11-17d: the 16-row sm120 batch chunks re-read the weights m/16 times
+    /// at ~95 GB/s and dominated the exact-mode prefill cost). Q8_1
+    /// activations -- llama.cpp's Q6_K x Q8_K class, the same activation
+    /// treatment the exact-mode Q4K side already uses; NOT bit-identical to
+    /// the f32-activation sm120 batch route (quality gated by bench-mmlu /
+    /// ppl; layout gated by bench-probe-q6k-batch's mma128 arm).
+    /// TEMPURA_Q6K_PREFILL_KERNEL=sm120 restores the f32-activation route.
+    /// Returns None when the kernel is unavailable or the activation is not
+    /// a compact `[m, k]` layout.
+    fn gemm_q6k_prefill_mma128(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Option<Arc<Tensor<f32>>> {
+        if m < 2 {
+            return None;
+        }
+        let oxide6 = self.oxide_q6k_gemv.as_ref()?;
+        if !oxide6.has_mma128_batch() {
+            return None;
+        }
+        // The Q8_1 quantize kernel lives in the q4k oxide module.
+        let oxide4 = self.oxide_q4k_gemv.as_ref()?;
+        let dw = self.device_weights_q6k.get(weight_name)?;
+        let k = dw.k_blocks * 256;
+        if a.size() != m * k {
+            return None;
+        }
+        let n = dw.n;
+        let stream = self.matmul.stream();
+        let out = {
+            let mut pool = self.prefill_scratch.borrow_mut();
+            if pool[slot].as_ref().is_none_or(|t| t.size() < m * n) {
+                pool[slot] = Some(Arc::new(
+                    api::zeros::<f32>(&[m * n])
+                        .sync_on(stream)
+                        .expect("q6k mma128 prefill output buffer alloc"),
+                ));
+            }
+            pool[slot].as_ref().unwrap().clone()
+        };
+        // Q8_1 scratch for one 128-row chunk (shared with the q4k route's
+        // pool -- same format, keyed (k, rows)).
+        let chunk_rows_max = m.min(128);
+        let (x_qs, x_ds) = {
+            let mut pool = self.nograph.borrow_mut();
+            let qs = pool
+                .q4k_batch_qs
+                .entry((k, chunk_rows_max))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[chunk_rows_max * k / 4])
+                            .sync_on(stream)
+                            .expect("gemm_q6k_prefill_mma128: qs alloc"),
+                    )
+                })
+                .clone();
+            let ds = pool
+                .q4k_batch_ds
+                .entry((k, chunk_rows_max))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[chunk_rows_max * k.div_ceil(32)])
+                            .sync_on(stream)
+                            .expect("gemm_q6k_prefill_mma128: ds alloc"),
+                    )
+                })
+                .clone();
+            (qs, ds)
+        };
+        let mut row = 0usize;
+        while row < m {
+            let rows = (m - row).min(128);
+            oxide4
+                .quantize_q8_1_window(a, row, &x_qs, &x_ds, rows, k)
+                .unwrap_or_else(|e| {
+                    panic!("q6k mma128 prefill quantize {weight_name} rows {row}..{}: {e}", row + rows)
+                });
+            oxide6
+                .forward_mma128_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "q6k mma128 prefill batch {weight_name} rows {row}..{}: {e}",
+                        row + rows
+                    )
+                });
+            row += rows;
+        }
+        Some(out)
+    }
+
     /// Prefill (m > 1) Q6_K GEMM via the sm120 M-row batch GEMV, chunked over
     /// rows: one launch per <= 16 rows, each reading the packed weights once
     /// into shared memory and writing its rows of the `[m, n]` output.
@@ -5986,6 +6084,16 @@ impl CutileGpuModel {
     ) -> Option<Arc<Tensor<f32>>> {
         if m < 2 {
             return None;
+        }
+        // TEMPURA_PREFILL_PRECISION=exact: the tensor-core mma128 route
+        // (weights once per launch; Q8_1 activations). TEMPURA_Q6K_PREFILL_
+        // KERNEL=sm120 bisects back to the f32-activation batch GEMV.
+        if prefill_precision_exact()
+            && std::env::var("TEMPURA_Q6K_PREFILL_KERNEL").as_deref() != Ok("sm120")
+        {
+            if let Some(out) = self.gemm_q6k_prefill_mma128(a, weight_name, m, slot) {
+                return Some(out);
+            }
         }
         let oxide = self.oxide_q6k_gemv.as_ref()?;
         if !oxide.has_sm120_batch() {
@@ -6037,14 +6145,33 @@ impl CutileGpuModel {
         Some(out)
     }
 
-    /// Prefill (m > 1) Q4K GEMM via the bit-identical-per-row kpar8 batch
-    /// kernel (`q4k_gemv_sm120_kpar8_batch`), chunked over 16-row windows.
-    /// Quality route for TEMPURA_PREFILL_PRECISION=exact: no MXFP4 E2M1
-    /// activation quantization, no double-quantization -- each output row is
-    /// bitwise-equal to the per-row kpar8 GEMV the decode path uses
-    /// (bench-probe-q4k-batch gate). Returns None when the weight is not
-    /// Q4K, the kernel is unavailable, or the activation is not a compact
-    /// `[m, k]` layout (the caller falls back to host-dequant f32 GEMM).
+    /// Prefill (m > 1) Q4K GEMM for TEMPURA_PREFILL_PRECISION=exact.
+    /// Quality route: no MXFP4 E2M1 activation quantization, no
+    /// double-quantization -- Q4K weights x Q8_1 activations, the same
+    /// numerical class as the decode kpar8 GEMV.
+    ///
+    /// Kernel selection (TEMPURA_Q4K_PREFILL_KERNEL=kpar8|mma|streamk,
+    /// default mma = the measured fastest reference-class variant,
+    /// 2026-11-17d probe-prefill-tc: mma ~3.9-4.5x kpar8_batch at prefill
+    /// shapes, 350-446 GB/s vs 70-128 GB/s effective weight read):
+    /// - mma (default): INT8 tensor cores. m <= 16 routes through
+    ///   `q4k_mma_batch_sm120`; m > 16 through `q4k_mma128_batch_sm120`
+    ///   (8 m16 tiles per launch, weight matrix read ONCE per launch --
+    ///   2026-11-17d: the 16-row chunking re-read weights m/16 times,
+    ///   which dominated the exact-mode prefill cost). Per-row numerics
+    ///   of BOTH are bitwise-equal to each other (same fragment mapping
+    ///   and accumulation order) and NOT bit-identical to the per-row
+    ///   kpar8 GEMV -- the only divergence is the f32 accumulation order
+    ///   (probe-gated <= 1e-5 rel, measured 2.8e-9..7.5e-8). Per-row
+    ///   numerics are independent of the row window (rows predicated on
+    ///   d_row < m), so chunking is batch-composition-invariant.
+    /// - kpar8: `q4k_gemv_sm120_kpar8_batch`, bit-identical per row to the
+    ///   decode GEMV (the original 2026-11-17c route, bisect switch).
+    /// - streamk: persistent-block variant (wins only at small n).
+    ///
+    /// Returns None when the weight is not Q4K, the kernel is unavailable,
+    /// or the activation is not a compact `[m, k]` layout (the caller falls
+    /// back to host-dequant f32 GEMM).
     fn gemm_q4k_prefill_batch(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -6056,7 +6183,28 @@ impl CutileGpuModel {
             return None;
         }
         let oxide = self.oxide_q4k_gemv.as_ref()?;
-        if !(oxide.uses_raw_gguf && oxide.has_sm120_kpar_batch()) {
+        if !oxide.uses_raw_gguf {
+            return None;
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum PrefillQ4kKernel {
+            Kpar8,
+            Mma16,
+            Mma128,
+            Streamk,
+        }
+        let sel = std::env::var("TEMPURA_Q4K_PREFILL_KERNEL").unwrap_or_default();
+        let mma128_ok = m > 16 && oxide.has_mma128_batch();
+        let variant = match sel.as_str() {
+            "kpar8" => PrefillQ4kKernel::Kpar8,
+            "streamk" if oxide.has_streamk_batch() => PrefillQ4kKernel::Streamk,
+            // default: the measured fastest reference-class variant
+            _ if mma128_ok => PrefillQ4kKernel::Mma128,
+            _ if oxide.has_mma_batch() => PrefillQ4kKernel::Mma16,
+            _ if oxide.has_sm120_kpar_batch() => PrefillQ4kKernel::Kpar8,
+            _ => return None,
+        };
+        if variant == PrefillQ4kKernel::Kpar8 && !oxide.has_sm120_kpar_batch() {
             return None;
         }
         let dw = self.device_weights_q4k.get(weight_name)?;
@@ -6077,10 +6225,16 @@ impl CutileGpuModel {
             }
             pool[slot].as_ref().unwrap().clone()
         };
-        // Q8_1 scratch for one 16-row chunk (the quantize step inside
-        // forward_sm120_kpar_batch_d2d_rows writes exactly rows * k elements;
-        // k is a multiple of 256 so per-32-element blocks never cross rows).
-        let chunk_rows_max = m.min(16);
+        // Q8_1 scratch for one chunk (the quantize step inside the batch
+        // wrappers writes exactly rows * k elements; k is a multiple of 256
+        // so per-32-element blocks never cross rows). The mma128 route
+        // chunks at 128 rows; the others at 16.
+        let chunk_rows = if variant == PrefillQ4kKernel::Mma128 {
+            128
+        } else {
+            16
+        };
+        let chunk_rows_max = m.min(chunk_rows);
         let (x_qs, x_ds) = {
             let mut pool = self.nograph.borrow_mut();
             let qs = pool
@@ -6109,26 +6263,27 @@ impl CutileGpuModel {
         };
         let mut row = 0usize;
         while row < m {
-            let rows = (m - row).min(16);
-            oxide
-                .forward_sm120_kpar_batch_d2d_rows(
-                    a,
-                    row,
-                    &dw.tensor,
-                    &out,
-                    row,
-                    rows,
-                    n,
-                    dw.k_blocks,
-                    &x_qs,
-                    &x_ds,
+            let rows = (m - row).min(chunk_rows);
+            let res = match variant {
+                PrefillQ4kKernel::Kpar8 => oxide.forward_sm120_kpar_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                ),
+                PrefillQ4kKernel::Mma16 => oxide.forward_mma_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                ),
+                PrefillQ4kKernel::Mma128 => oxide.forward_mma128_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                ),
+                PrefillQ4kKernel::Streamk => oxide.forward_streamk_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                ),
+            };
+            res.unwrap_or_else(|e| {
+                panic!(
+                    "q4k prefill batch {weight_name} rows {row}..{}: {e}",
+                    row + rows
                 )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "q4k prefill batch {weight_name} rows {row}..{}: {e}",
-                        row + rows
-                    )
-                });
+            });
             row += rows;
         }
         Some(out)
@@ -6296,8 +6451,10 @@ impl CutileGpuModel {
                 return out;
             }
             // TEMPURA_PREFILL_PRECISION=exact: Q4K projections keep the
-            // bit-identical kpar8 batch GEMM instead of falling to the
-            // per-call host-dequant f32 GEMM (which re-downloads and
+            // reference-class batch GEMM (default: the mma tensor-core
+            // kernel, sum-order-only divergence; TEMPURA_Q4K_PREFILL_KERNEL
+            // =kpar8 restores the bit-identical route) instead of falling to
+            // the per-call host-dequant f32 GEMM (which re-downloads and
             // re-uploads the weight matrix every call).
             if prefill_precision_exact() {
                 if let Some(out) = self.gemm_q4k_prefill_batch(a, weight_name, m, slot) {
