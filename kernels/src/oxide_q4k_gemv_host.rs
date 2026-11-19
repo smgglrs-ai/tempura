@@ -1577,6 +1577,12 @@ impl OxideQ4kGemv {
         self.uses_raw_gguf && self.cu_mmq_batch.is_some() && self.cu_mmq_reduce.is_some()
     }
 
+    /// SM count of the device this loader runs on (the grid-fill heuristic
+    /// input for the mmq k-split).
+    pub fn sm_count(&self) -> u32 {
+        self.sm_count
+    }
+
     /// Returns true when the sm_120 M-row batch kpar8 kernel is loaded.
     /// This is the CORRECT general-M batch kernel: per-row math is
     /// bit-identical to the per-row kpar8 GEMV (unlike mma_batch/streamk,

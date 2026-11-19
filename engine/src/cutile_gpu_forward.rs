@@ -6352,7 +6352,7 @@ impl CutileGpuModel {
                     // class change gated by the mmq probe's split arms).
                     // TEMPURA_Q4K_MMQ_SPLIT=0 bisects off (S=1 everywhere).
                     let slots = (n / 128) * m.div_ceil(32);
-                    let sm_count = self.matmul.sm_count();
+                    let sm_count = oxide.sm_count() as usize;
                     let want_split = oxide.has_mmq_split_batch()
                         && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
                             .map(|v| v != "0")
