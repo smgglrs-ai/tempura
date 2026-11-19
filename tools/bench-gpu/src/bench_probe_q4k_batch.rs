@@ -310,6 +310,7 @@ fn mmq_cpu_mirror_split(
                         acc = dv.mul_add(pos, acc);
                         acc = acc + min;
                     }
+                    }
                     *part = acc;
                 }
                 let mut acc = 0f32;
