@@ -343,41 +343,19 @@ MW_LOOP:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -449,41 +427,19 @@ TILE0_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -555,41 +511,19 @@ TILE1_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -661,41 +595,19 @@ TILE2_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -767,41 +679,19 @@ TILE3_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -873,41 +763,19 @@ TILE4_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -979,41 +847,19 @@ TILE5_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo
@@ -1085,41 +931,19 @@ TILE6_END:
     cvt.u64.u32 %rd24, %r152;  add.u64 %rd24, %rd24, %rd2;  add.u64 %rd24, %rd24, %rd25;
     mul.lo.u32 %r152, %r151, %r1;  shl.b32 %r152, %r152, 5;
     cvt.u64.u32 %rd26, %r152;  add.u64 %rd26, %rd26, %rd2;  add.u64 %rd26, %rd26, %rd25;
-    mov.b16 %h2, 0;
-    mov.b16 %h3, 0;
-    @%p21 ld.global.nc.b16 %h2, [%rd24];
-    @%p22 ld.global.nc.b16 %h3, [%rd26];
-    cvt.f32.f16 %f60, %h2;            // d8 row_lo
-    cvt.f32.f16 %f61, %h3;            // d8 row_hi
-
-    // Row sums (min term): bytesum(a0)+bytesum(a2) for row_lo, a1/a3 for row_hi.
-    mov.u32 %r157, 0;
-    shl.b32 %r158, %r153, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r153, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r153, 24;                               add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 24; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 16; shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shl.b32 %r158, %r155, 8;  shr.s32 %r158, %r158, 24; add.s32 %r157, %r157, %r158;
-    shr.s32 %r158, %r155, 24;                               add.s32 %r157, %r157, %r158;
-    mov.u32 %r159, 0;
-    shl.b32 %r158, %r154, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r154, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r154, 24;                               add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 24; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 16; shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shl.b32 %r158, %r156, 8;  shr.s32 %r158, %r158, 24; add.s32 %r159, %r159, %r158;
-    shr.s32 %r158, %r156, 24;                               add.s32 %r159, %r159, %r158;
-
-    shfl.sync.bfly.b32 %r160, %r157, 1, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r157, 2, 31, 0xFFFFFFFF;
-    add.s32 %r157, %r157, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 1, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
-    shfl.sync.bfly.b32 %r160, %r159, 2, 31, 0xFFFFFFFF;
-    add.s32 %r159, %r159, %r160;
+    // Q8_1 ds word: low f16 = d8, high s16 = the block's exact integer
+    // q8 rowsum (precomputed by quantize_q8_1; same integer the inline
+    // bytesum computed -> bit-identical numerics, ~40 fewer ops/tile).
+    mov.u32 %r165, 0;
+    mov.u32 %r166, 0;
+    @%p21 ld.global.nc.b32 %r165, [%rd24];
+    @%p22 ld.global.nc.b32 %r166, [%rd26];
+    mov.b32 {%h2, %h3}, %r165;        // h2 = d8 row_lo, h3 = rowsum row_lo (s16)
+    mov.b32 {%h4, %h5}, %r166;        // h4 = d8 row_hi, h5 = rowsum row_hi (s16)
+    cvt.f32.f16 %f60, %h2;
+    cvt.f32.f16 %f61, %h4;
+    cvt.s32.s16 %r157, %h3;
+    cvt.s32.s16 %r159, %h5;
 
     // Per-tile scale factors: pos/min = (d*sc | dmin*mv) * d8[row].
     mul.f32 %f62, %f70, %f60;   // pos row-lo col0 = (d*sc)[col0] * d8_lo

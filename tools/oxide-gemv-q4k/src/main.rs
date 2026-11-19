@@ -951,11 +951,25 @@ mod kernels {
                 unsafe { *out_qs.get_unchecked_mut(out_word_idx as usize) = packed_qi; }
             }
         }
-        // Lane 0 writes the f16 scale.
+        // Exact integer warp sum of the block's q8 values (|sum| <= 32*127
+        // < 2^12, fits s16). Stashed in the HIGH 16 bits of the ds word for
+        // the mma128 prefill kernel's Q4K min-term: the rowsum is then one
+        // b16 load instead of ~38 scalar ops + 4 shuffles per (row,
+        // sub-block, m16 tile). All other consumers read only the low f16
+        // and ignore the high bits. The stored integer equals the sum the
+        // mma kernels computed inline (same addends), so per-row numerics
+        // are unchanged.
+        let mut sumqi = qi as u32;
+        let mut delta = 16u32;
+        while delta >= 1 {
+            sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, delta));
+            delta /= 2;
+        }
+        // Lane 0 writes the f16 scale + the rowsum.
         if lane == 0 {
             unsafe {
                 *out_ds.get_unchecked_mut(q8_blk as usize) =
-                    f32_to_f16_bits(d) as u32;
+                    (f32_to_f16_bits(d) as u32) | ((sumqi & 0xFFFF) << 16);
             }
         }
     }

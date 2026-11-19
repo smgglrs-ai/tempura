@@ -498,6 +498,23 @@ Qwen3.6-27B weights** — see open work.
       (mma128 arm: random-data CPU f64 reference from the same quantized
       activations, cancellation-aware gate 1e-5 * sum|terms| -- a naive
       rel-to-result gate false-positives on cancellative sums).
+      2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
+      docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
+      the ds word's high bits (llama.cpp's Q8_1 ds layout; all other
+      consumers read only the low f16) and q4k_mma128 reads it for the
+      min term -- bit-identical numerics, ~40 fewer ops/tile; exact mode
+      2508 -> 2732 tok/s pp128 (llama.cpp 7335 = 2.7x). A WIDE-neuron
+      variant (q4k_mma128w, 64 neurons/block warp-owned, grid.y row
+      split; opt-in via TEMPURA_Q4K_PREFILL_KERNEL=wide; probe arm
+      mma128w gated <= 1e-5, sequential (kb,mw) accumulation so NOT
+      bitwise vs mma16) measured a WASH vs mma128 at every shape with
+      grid_y swept 1/2/4/8 -- the L2-activation-re-reading hypothesis is
+      refuted; the mma128 class is bound by the per-mma f32 scale chain
+      (~7 fp ops/output element vs llama.cpp mmq's ~4 with load-time
+      (d*sc)/(dmin*mv) pre-extraction) + A-fragment global loads (mmq:
+      smem staging + ldmatrix) + no fused GLU writeback. The
+      default-flip bar (>= ~6000 tok/s at reference quality) is NOT met:
+      exact stays opt-in, MXFP4 stays default (7771 tok/s, unchanged).
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s

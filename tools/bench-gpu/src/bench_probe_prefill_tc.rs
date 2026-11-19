@@ -91,6 +91,7 @@ enum Variant {
     Kpar8,
     Mma,
     Mma128,
+    Mma128w,
     Streamk,
 }
 
@@ -127,6 +128,7 @@ fn main() {
         (Variant::Kpar8, "kpar8_batch"),
         (Variant::Mma, "mma_batch"),
         (Variant::Mma128, "mma128_batch"),
+        (Variant::Mma128w, "mma128w_batch"),
         (Variant::Streamk, "streamk_batch"),
     ];
 
@@ -161,7 +163,7 @@ fn main() {
                 // Q8_1 scratch for one chunk (16 rows for the 16-row-cap
                 // kernels, 128 for mma128; same sizing as the engine's
                 // gemm_q4k_prefill_batch).
-                let scr_rows = if *variant == Variant::Mma128 { 128 } else { CHUNK };
+                let scr_rows = if matches!(*variant, Variant::Mma128 | Variant::Mma128w) { 128 } else { CHUNK };
                 let x_qs = Arc::new(
                     api::zeros::<u32>(&[scr_rows * k / 4])
                         .sync_on(&stream)
@@ -177,7 +179,7 @@ fn main() {
                     let mut row = 0usize;
                     // The mma128 variant chunks at 128 rows (weights once
                     // per launch); the others at the kernels' 16-row cap.
-                    let chunk = if *variant == Variant::Mma128 { 128 } else { CHUNK };
+                    let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w) { 128 } else { CHUNK };
                     while row < m_total {
                         let rows = (m_total - row).min(chunk);
                         let res = match variant {
@@ -188,6 +190,9 @@ fn main() {
                                 &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
                             ),
                             Variant::Mma128 => oxide.forward_mma128_batch_d2d_rows(
+                                &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                            ),
+                            Variant::Mma128w => oxide.forward_mma128w_batch_d2d_rows(
                                 &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
                             ),
                             Variant::Streamk => oxide.forward_streamk_batch_d2d_rows(
@@ -216,7 +221,7 @@ fn main() {
                 // Effective weight bandwidth: the chunk loop re-reads the
                 // full weight matrix ceil(m_total/16) times.
                 let weight_bytes = (n * k_blocks * 144) as f64;
-                let chunk = if *variant == Variant::Mma128 { 128 } else { CHUNK };
+                let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w) { 128 } else { CHUNK };
                 let re_reads = m_total.div_ceil(chunk) as f64;
                 let gbps = weight_bytes * re_reads / (ms / 1e3) / 1e9;
                 println!(

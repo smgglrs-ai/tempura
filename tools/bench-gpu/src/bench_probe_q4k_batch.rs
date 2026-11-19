@@ -361,6 +361,56 @@ fn main() {
                 any_fail = true;
                 println!("  {label} m={m} mma128: FAIL (kernel not loaded)");
             }
+
+            // 4) mma128w_batch: the WIDE-neuron mma128 (64 neurons/block,
+            //    warp-owned). Gate: <= 1e-5 rel vs the per-row kpar
+            //    reference (sum-order-only divergence -- sequential (kb,mw)
+            //    accumulation, NOT bitwise vs mma16; see kernel docs).
+            if n % 64 == 0 {
+                if oxide.has_mma128w_batch() {
+                    let out = Arc::new(
+                        api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
+                    );
+                    let res = oxide.forward_mma128w_batch_d2d_rows(
+                        &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
+                    );
+                    match res {
+                        Err(e) => {
+                            any_fail = true;
+                            println!("  {label} m={m} mma128w: FAIL (launch error: {e})");
+                        }
+                        Ok(()) => {
+                            let got = out.to_host_vec().sync_on(&stream).expect("out download");
+                            let mut max_rel = 0f64;
+                            let mut bad_rows = 0;
+                            for r in 0..m {
+                                let mut row_max = 0f64;
+                                for c in 0..n {
+                                    let a = got[r * n + c];
+                                    let b = ref_rows[r][c];
+                                    let denom = b.abs().max(1.0);
+                                    let rel = ((a - b).abs() / denom) as f64;
+                                    row_max = row_max.max(rel);
+                                }
+                                if row_max > 1e-5 {
+                                    bad_rows += 1;
+                                }
+                                max_rel = max_rel.max(row_max);
+                            }
+                            if bad_rows > 0 {
+                                any_fail = true;
+                            }
+                            println!(
+                                "  {label} m={m} mma128w: {} (max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 1e-5)",
+                                if bad_rows == 0 { "OK" } else { "MISMATCH" }
+                            );
+                        }
+                    }
+                } else {
+                    any_fail = true;
+                    println!("  {label} m={m} mma128w: FAIL (kernel not loaded)");
+                }
+            }
         }
     }
     println!(
