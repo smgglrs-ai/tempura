@@ -306,7 +306,7 @@ pub fn ptx() -> &'static str {
             for i in 0..4usize {
                 let acc = 40 + jt * 4 + i;
                 wb.push_str(&format!(
-                    "        add.u32 %r300, %r40, {tok};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {neur};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        setp.ne.u32 %p31, %r7, 1;\n        @%p31 bra WB_SPLIT_{jt}_{i};\n        add.u64 %rd30, %rd30, %rd3;\n        bra WB_STORE_{jt}_{i};\nWB_SPLIT_{jt}_{i}:\n        add.u64 %rd30, %rd30, %rd31;\n        add.u64 %rd30, %rd30, %rd4;\nWB_STORE_{jt}_{i}:\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
+                    "        add.u32 %r300, %r40, {tok};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {neur};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        setp.ne.u32 %p31, %r47, 1;\n        @%p31 bra WB_SPLIT_{jt}_{i};\n        add.u64 %rd30, %rd30, %rd3;\n        bra WB_STORE_{jt}_{i};\nWB_SPLIT_{jt}_{i}:\n        add.u64 %rd30, %rd30, %rd31;\n        add.u64 %rd30, %rd30, %rd4;\nWB_STORE_{jt}_{i}:\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
                     tok = jt * 8 + (i & 1),
                     neur = 8 * (i >> 1),
                     acc = acc,
@@ -363,7 +363,7 @@ pub fn ptx() -> &'static str {
     ld.param.u32 %r2,  [param_n];
     ld.param.u32 %r1,  [param_k_blocks];
     ld.param.u32 %r6,  [param_m];
-    ld.param.u32 %r7,  [param_splits];
+    ld.param.u32 %r47, [param_splits];
     ld.param.u64 %rd4, [param_partials];
 
     mov.u32 %r18, dyn_smem;
@@ -373,10 +373,10 @@ pub fn ptx() -> &'static str {
     // identical to the pre-split kernel.
     mov.u32 %r42, %ctaid.z;
     mul.lo.u32 %r44, %r42, %r1;
-    div.u32 %r45, %r44, %r7;              // kb_lo
+    div.u32 %r45, %r44, %r47;             // kb_lo
     add.u32 %r46, %r42, 1;
     mul.lo.u32 %r46, %r46, %r1;
-    div.u32 %r46, %r46, %r7;              // kb_hi
+    div.u32 %r46, %r46, %r47;             // kb_hi
     // partials tile offset (bytes): z * m * n * 4
     mul.lo.u32 %r43, %r6, %r2;            // m*n (u32: <= 128*14336)
     cvt.u64.u32 %rd31, %r42;
