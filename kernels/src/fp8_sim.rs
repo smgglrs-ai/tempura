@@ -23,6 +23,12 @@
 //! CpuMatMulQ4KOpt unless TEMPURA_FP8_SIM selects a simulation mode.
 //! tools/fp8-sim drives it over the MMLU sample and reports the
 //! choice-agreement / logit-band vs the unmodified CPU reference.
+//!
+//! 2026-11-19 extension (mmq-class study): the "q8act"/"mmq" modes simulate
+//! the Q8_1-activation int8-GEMM classes instead of e4m3 -- "q8act" is the
+//! exact-GPU prefill class (f32 scale chain, exact int rowsum), "mmq" adds
+//! llama.cpp's mmq f16 scale arithmetic ((d*sc)/(dmin*mv) half2 products +
+//! the Q8_1 f16 `sum` field). Go/no-go for the mmq-class kernel restructure.
 
 use crate::e4m3::f32_to_e4m3_bits;
 use crate::quantized::{f16_to_f32, q4k_dequant_block, CpuMatMulQ4KOpt};
@@ -111,6 +117,10 @@ pub const FP8_SIM_AROWSCALE: u8 = 8; // per-row scale on the activation side
 pub const FP8_SIM_FTZ: u8 = 16; // KV-style subnormal flush instead of hw semantics
 pub const FP8_SIM_NOOP: u8 = 32; // activate the Sim dispatch WITHOUT any quantization
 // (path-switch control: measures the generic-route vs x8-route divergence)
+pub const FP8_SIM_Q8ACT: u8 = 64; // Q8_1 activations + f32 scale chain (the exact-GPU
+// prefill class; control for the mmq simulation)
+pub const FP8_SIM_MMQF16: u8 = 128; // + llama.cpp-mmq f16 scale class: (d*sc)/(dmin*mv)
+// weight products and the per-group activation f32 sum rounded through f16
 
 static FP8_SIM_MODE: AtomicU8 = AtomicU8::new(u8::MAX); // MAX = not yet parsed
 
@@ -128,6 +138,8 @@ fn parse_env_mode() -> u8 {
             "arowscale" => mode |= FP8_SIM_AROWSCALE,
             "ftz" => mode |= FP8_SIM_FTZ,
             "noop" => mode |= FP8_SIM_NOOP,
+            "q8act" => mode |= FP8_SIM_Q8ACT,
+            "mmq" => mode |= FP8_SIM_Q8ACT | FP8_SIM_MMQF16,
             other => {
                 eprintln!("[fp8_sim] ignoring unknown TEMPURA_FP8_SIM part {other:?}");
             }
@@ -395,6 +407,12 @@ fn sim_gemm(
         });
     }
 
+    if mode & (FP8_SIM_Q8ACT | FP8_SIM_MMQF16) != 0 {
+        let f16_scales = mode & FP8_SIM_MMQF16 != 0;
+        sim_gemm_q8(a, b_quantized, output, m, n, k, q6k, f16_scales);
+        return Ok(());
+    }
+
     let weights = converted_weights(b_quantized, n, k, q6k, mode);
 
     let mut act_scratch: Vec<f32> = Vec::new();
@@ -415,6 +433,197 @@ fn sim_gemm(
 
     gemm_bt(a_used, &weights, output, m, n, k);
     Ok(())
+}
+
+// -- Q8_1-activation / mmq-f16-scale simulation (2026-11-19) -------------------
+//
+// The numerics class of llama.cpp's mmq (the 7335 tok/s reference) and of
+// tempura's TEMPURA_PREFILL_PRECISION=exact GPU route, computed on the CPU:
+// activations quantized to Q8_1 (per-32 d = amax/127 stored f16, q int8),
+// weights kept native-quantized, the dot product as an exact int32 C plus a
+// scale chain. Two classes:
+//  - f16_scales = false: the exact-GPU class -- all scale arithmetic in f32,
+//    the min-term rowsum is the exact integer sum of the q8 values (what
+//    q4k_mma128 computes today; control arm "q8act").
+//  - f16_scales = true: llama.cpp's mmq class -- per (neuron, 32-group) the
+//    weight products (d*sc) and (dmin*mv) are rounded through f16 (their
+//    load-time half2 pre-extraction, one __hmul2), and the activation-side
+//    min-term operand is the f32 sum of the RAW activations rounded to f16
+//    (their Q8_1 `sum` field, make_half2(d, sum)). The Q6_K side has NO f16
+//    scale rounding in mmq (x_df/y_df are f32) -- modeled identically here.
+//    Arm "mmq" = q8act + this.
+
+#[inline]
+fn f16rt(x: f32) -> f32 {
+    f16_to_f32(crate::ggml::helpers::f32_to_f16(x))
+}
+
+/// Quantize one 32-element activation group to Q8_1 (the GPU kernel's
+/// convention): d = amax/127 (f32, stored f16 downstream), q = round(a/d)
+/// clamped to +-127. Returns (d_f32, exact integer rowsum of q).
+#[inline]
+fn q8_quant_group(vals: &[f32], q: &mut [i8; 32]) -> (f32, i32) {
+    let mut amax = 0.0f32;
+    for &v in vals {
+        let a = v.abs();
+        if a > amax {
+            amax = a;
+        }
+    }
+    let d = if amax == 0.0 { 1.0f32 } else { amax / 127.0 };
+    let mut sum = 0i32;
+    for (t, &v) in vals.iter().enumerate() {
+        let r = (v / d).round();
+        let qi = if r > 127.0 {
+            127
+        } else if r < -127.0 {
+            -127
+        } else {
+            r as i32
+        };
+        q[t] = qi as i8;
+        sum += qi;
+    }
+    (d, sum)
+}
+
+/// Per-element Q6_K int values (q - 32) and scale-index map, mirroring
+/// q6k_dot_block's decode exactly.
+fn q6k_block_ints(block: &[u8]) -> ([i32; Q6K_BLOCK_SIZE], [u8; Q6K_BLOCK_SIZE]) {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let mut vals = [0i32; Q6K_BLOCK_SIZE];
+    let mut scidx = [0u8; Q6K_BLOCK_SIZE];
+    for half in 0..2usize {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+        for l in 0..32usize {
+            let is = l / 16;
+            let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32
+                - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32
+                - 32;
+            vals[y_off + l] = q1;
+            vals[y_off + l + 32] = q2;
+            vals[y_off + l + 64] = q3;
+            vals[y_off + l + 96] = q4;
+            for s in 0..4usize {
+                let sc = (half * 8 + is + 2 * s) as u8;
+                scidx[y_off + l + 32 * s] = sc;
+            }
+        }
+    }
+    (vals, scidx)
+}
+
+/// Q4_K per-32-group nibbles + scales, mirroring q4k_dequant_block's decode:
+/// group g (0..8): j = g/2, hi = g%2, elements e = j*64 + hi*32 + t (t<32),
+/// nibble = (qs[j*32 + t] >> (4*hi)) & 0xF, scale sc[g], min m[g].
+fn q4k_group(block: &[u8], g: usize) -> (f32, f32, f32, f32, [u8; 32]) {
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let (sc, m) = crate::quantized::q4k_unpack_scales(&block[4..16]);
+    let qs = &block[16..144];
+    let j = g / 2;
+    let hi = g % 2;
+    let mut nib = [0u8; 32];
+    for t in 0..32 {
+        nib[t] = (qs[j * 32 + t] >> (4 * hi)) & 0xF;
+    }
+    (d, sc[g], dmin, m[g], nib)
+}
+
+fn sim_gemm_q8(
+    a: &[f32],
+    b_quantized: &[u8],
+    output: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    q6k: bool,
+    f16_scales: bool,
+) {
+    let (block_bytes, block_size) = if q6k {
+        (Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE)
+    } else {
+        (Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE)
+    };
+    let bpr = k / block_size;
+    let b_ptr = b_quantized.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    crate::inference_pool::par_run(n, |j0, j1| {
+        let mut q8 = [0i8; 32];
+        for j in j0..j1 {
+            for i in 0..m {
+                let arow = &a[i * k..];
+                let mut acc = 0.0f32;
+                for kb in 0..bpr {
+                    let block = unsafe {
+                        std::slice::from_raw_parts(
+                            b_ptr.add((j * bpr + kb) * block_bytes),
+                            block_bytes,
+                        )
+                    };
+                    let ablk = &arow[kb * block_size..][..block_size];
+                    if q6k {
+                        // Q6_K: 16 sub-blocks of 16 elements, per-sub-block
+                        // i8 scale, d f16; all scale arithmetic f32 in BOTH
+                        // classes (llama.cpp's mmq Q6_K path keeps f32).
+                        let (q_int, scidx) = q6k_block_ints(block);
+                        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                        for g in 0..8 {
+                            let (da, _sumq) = q8_quant_group(&ablk[g * 32..][..32], &mut q8);
+                            let d8 = f16rt(da);
+                            for s in 0..2 {
+                                let e0 = g * 32 + s * 16;
+                                let mut c = 0i64;
+                                for t in 0..16 {
+                                    c += q8[s * 16 + t] as i64 * q_int[e0 + t] as i64;
+                                }
+                                let sc = block[192 + scidx[e0] as usize] as i8 as f32;
+                                acc += c as f32 * sc * d * d8;
+                            }
+                        }
+                    } else {
+                        for g in 0..8 {
+                            let (d, sc, dmin, mv, nib) = q4k_group(block, g);
+                            let vals = &ablk[g * 32..][..32];
+                            let (da, sumq) = q8_quant_group(vals, &mut q8);
+                            let d8 = f16rt(da);
+                            let mut c = 0i64;
+                            for t in 0..32 {
+                                c += q8[t] as i64 * nib[t] as i64;
+                            }
+                            if f16_scales {
+                                // llama.cpp mmq class: (d*sc) and (dmin*mv)
+                                // rounded to f16 at load; the min-term
+                                // activation operand is the f32 sum of the
+                                // RAW activations rounded to f16 (the Q8_1
+                                // `sum` field).
+                                let dma = f16rt(d * sc);
+                                let dmy = f16rt(-(dmin * mv));
+                                let mut suma = 0.0f32;
+                                for &v in vals {
+                                    suma += v;
+                                }
+                                acc += dma * d8 * c as f32;
+                                acc += dmy * f16rt(suma);
+                            } else {
+                                // exact-GPU class: f32 scales, exact int
+                                // rowsum read from the ds word.
+                                acc += (d * sc) * d8 * c as f32;
+                                acc += -(dmin * mv) * d8 * sumq as f32;
+                            }
+                        }
+                    }
+                }
+                unsafe { *out_ptr.add(i * n + j) = acc };
+            }
+        }
+    });
 }
 
 /// Simulation MatMulQ: implements the Q4K/Q6K entries with the e4m3
@@ -839,6 +1048,77 @@ mod tests {
             worst <= 1.0,
             "sim vs real max err/gate = {worst} (layout bug if >> 1)"
         );
+    }
+
+    #[test]
+    fn mmq_f16_sim_within_f16_scale_band() {
+        // The mmq-class sim (Q8_1 acts + f16 scale products) must agree with
+        // the real CpuMatMulQ4KOpt within the f16-scale band: each of the
+        // three f16 roundings contributes <= 2^-11 relative, so gate
+        // |got - ref| <= 0.01 * sum|terms| + 1e-6 (cancellation-aware).
+        use crate::quantized::{CpuMatMulQ4KOpt, MatMulQ};
+        let (m, n, k) = (4usize, 64usize, 256usize);
+        let bpr = k / Q4K_BLOCK_SIZE;
+        let mut b = vec![0u8; n * bpr * Q4K_BLOCK_BYTES];
+        let mut x = 0xdeadbeefu32;
+        for blk in b.chunks_mut(Q4K_BLOCK_BYTES) {
+            blk[0..2].copy_from_slice(
+                &crate::ggml::helpers::f32_to_f16(0.01).to_le_bytes(),
+            );
+            blk[2..4].copy_from_slice(
+                &crate::ggml::helpers::f32_to_f16(0.001).to_le_bytes(),
+            );
+            for byte in blk[4..].iter_mut() {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (x >> 24) as u8;
+            }
+        }
+        let mut a = vec![0.0f32; m * k];
+        for v in a.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = ((x >> 8) as i32 as f32 / 8388608.0) - 1.0;
+        }
+
+        let mut ref_out = vec![0.0f32; m * n];
+        CpuMatMulQ4KOpt
+            .forward_b_transposed_q4k(&a, &b, &mut ref_out, m, n, k)
+            .unwrap();
+
+        for (label, mode) in [("q8act", FP8_SIM_Q8ACT), ("mmq", FP8_SIM_Q8ACT | FP8_SIM_MMQF16)] {
+            let saved = fp8_sim_mode();
+            fp8_sim_set_mode(mode);
+            let mut sim_out = vec![0.0f32; m * n];
+            Fp8SimMatMulQ
+                .forward_b_transposed_q4k(&a, &b, &mut sim_out, m, n, k)
+                .unwrap();
+            fp8_sim_set_mode(saved);
+
+            let mut worst = 0.0f64;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut abssum = 0.0f64;
+                    for blk in 0..bpr {
+                        let block = &b[(j * bpr + blk) * Q4K_BLOCK_BYTES..][..Q4K_BLOCK_BYTES];
+                        let a_slice = &a[i * k + blk * Q4K_BLOCK_SIZE..][..Q4K_BLOCK_SIZE];
+                        let mut deq = [0.0f32; Q4K_BLOCK_SIZE];
+                        q4k_dequant_block(block, &mut deq);
+                        for t in 0..Q4K_BLOCK_SIZE {
+                            abssum += (a_slice[t].abs() * deq[t].abs()) as f64;
+                        }
+                    }
+                    let diff = (sim_out[i * n + j] - ref_out[i * n + j]).abs() as f64;
+                    let gate = 0.01 * abssum + 1e-6;
+                    let ratio = diff / gate;
+                    if ratio > worst {
+                        worst = ratio;
+                    }
+                }
+            }
+            assert!(
+                worst <= 1.0,
+                "{label} sim vs real max err/gate = {worst} (layout bug if >> 1)"
+            );
+        }
     }
 
     #[test]

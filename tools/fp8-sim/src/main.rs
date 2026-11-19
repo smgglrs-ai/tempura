@@ -219,6 +219,8 @@ fn parse_mode(spec: &str) -> u8 {
             "arowscale" => mode |= fp8_sim::FP8_SIM_AROWSCALE,
             "ftz" => mode |= fp8_sim::FP8_SIM_FTZ,
             "noop" => mode |= fp8_sim::FP8_SIM_NOOP,
+            "q8act" => mode |= fp8_sim::FP8_SIM_Q8ACT,
+            "mmq" => mode |= fp8_sim::FP8_SIM_Q8ACT | fp8_sim::FP8_SIM_MMQF16,
             other => panic!("unknown mode part {other:?}"),
         }
     }

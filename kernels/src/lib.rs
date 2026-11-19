@@ -43,6 +43,7 @@ pub mod q4k_batch_sm120_ptx;
 pub mod q4k_mma_batch_sm120_ptx;
 pub mod q4k_mma128_batch_sm120_ptx;
 pub mod q4k_mma128w_batch_sm120_ptx;
+pub mod q4k_mmq_batch_sm120_ptx;
 pub mod q4k_streamk_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
 pub mod greedy_argmax;

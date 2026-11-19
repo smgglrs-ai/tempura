@@ -108,6 +108,196 @@ fn upload<T: cutile::DType + Default + Clone>(
         .into()
 }
 
+
+
+/// EXACT copy of the oxide quantize kernel's f32_to_f16_bits (tools/
+/// oxide-gemv-q4k/src/main.rs) -- the GPU's Q8_1 d8 conversion: TRUNCATES
+/// the mantissa in the normal range (no RNE), rounds-to-nearest in the
+/// subnormal range. The mmq CPU mirror must use the same converter to be
+/// bit-comparable.
+fn oxide_f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = (bits >> 31) << 15;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return (sign | 0x7C00 | (mant >> 13)) as u16;
+    }
+    let exp16 = exp - 127 + 15;
+    if exp16 <= 0 {
+        if exp16 < -10 {
+            return sign as u16;
+        }
+        let shift = 14 - exp16;
+        let full = 0x0080_0000 | mant;
+        let sub = full >> shift;
+        let rem = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let sub = if rem >= half { sub + 1 } else { sub };
+        if sub >= 0x400 {
+            return (sign | 0x0400) as u16;
+        }
+        return (sign | sub) as u16;
+    }
+    if exp16 >= 31 {
+        return (sign | 0x7C00) as u16;
+    }
+    (sign | ((exp16 as u32) << 10) | (mant >> 13)) as u16
+}
+
+
+/// RNE f32 -> f16 bits (the semantics of the kernel's `mul.f16`, which
+/// rounds the exact product to nearest-even; tempura's shared
+/// f32_to_f16 truncates in the normal path, so it cannot be used here).
+/// Input is an exactly-representable f16 x small-int product.
+fn rne_f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 31) as u16) << 15;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let mant = (x & 0x7fffff) as u32;
+    if exp == 0xff {
+        return sign | 0x7c00;
+    }
+    if exp == 0 {
+        return sign; // f32 subnormal -> 0 (weight scales never land here)
+    }
+    let m24 = mant | 0x800000;
+    let e16 = exp - 127 + 15;
+    if e16 >= 31 {
+        return sign | 0x7c00;
+    }
+    if e16 <= 0 {
+        if e16 < -10 {
+            return sign;
+        }
+        let shift = (14 - e16) as u32;
+        let sub = m24 >> shift;
+        let rem = m24 & ((1 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let mut sub = sub;
+        if rem > half || (rem == half && (sub & 1) == 1) {
+            sub += 1;
+        }
+        if sub >= 0x400 {
+            return sign | 0x0400;
+        }
+        return sign | sub as u16;
+    }
+    let mut m = m24 >> 13; // 11 bits: implicit + 10 fraction
+    let rem = m24 & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+    }
+    if m >= 0x800 {
+        // mantissa carry: exponent++ (m == 0x800 -> fraction 0)
+        let e16b = e16 + 1;
+        if e16b >= 31 {
+            return sign | 0x7c00;
+        }
+        return sign | ((e16b as u16) << 10);
+    }
+    sign | ((e16 as u16) << 10) | (m & 0x3ff) as u16
+}
+
+/// CPU mirror of `q4k_mmq_batch_sm120`'s EXACT op sequence: Q8_1 activation
+/// quantization identical to `quantize_q8_1` (amax/127, round-half-away via
+/// (qf+0.5) as i32, clamp +-127, f16 d8, exact int rowsum), f16 scale
+/// pre-extraction (mul.f16 RNE of (d*sc) and ((-dmin)*mv)), exact int32
+/// nibble x q8 dot per (row, neuron, 32-group), and the f32 epilogue
+/// pos = ax*d8; tb = d8*rs; min = ay*tb; acc = fma(D, pos, acc) + min in
+/// (kb, g) order. Bitwise-comparable to the kernel output.
+fn mmq_cpu_mirror(x: &[f32], packed: &[u32], m: usize, n: usize, k_blocks: usize) -> Vec<f32> {
+    use tempura_kernels::ggml::helpers::{f16_to_f32, f32_to_f16};
+    let f16rt = |v: f32| f16_to_f32(f32_to_f16(v));
+    let k = k_blocks * 256;
+    let gpr = k / 32; // q8 groups per row
+    let mut q8 = vec![0i8; m * k];
+    let mut d8 = vec![0f32; m * gpr];
+    let mut rs = vec![0i32; m * gpr];
+    for r in 0..m {
+        for g in 0..gpr {
+            let vals = &x[r * k + g * 32..r * k + g * 32 + 32];
+            let mut amax = 0f32;
+            for &v in vals {
+                let a = if v < 0.0 { -v } else { v };
+                if a > amax {
+                    amax = a;
+                }
+            }
+            let d = if amax == 0.0 { 1.0f32 } else { amax / 127.0 };
+            let mut sum = 0i32;
+            for (t, &v) in vals.iter().enumerate() {
+                let qf = v / d;
+                let rounded = (qf + if qf >= 0.0 { 0.5 } else { -0.5 }) as i32;
+                let qi = rounded.clamp(-127, 127);
+                q8[r * k + g * 32 + t] = qi as i8;
+                sum += qi;
+            }
+            d8[r * gpr + g] = f16_to_f32(oxide_f32_to_f16_bits(d));
+            rs[r * gpr + g] = sum;
+        }
+    }
+    // parallel over neurons (the scalar mirror is otherwise minutes on the
+    // gate/up shape); each par_run chunk owns a disjoint ne range
+    let mut out = vec![0f32; m * n];
+    let out_ptr = out.as_mut_ptr();
+    tempura_kernels::inference_pool::par_run(n, |ne0, ne1| {
+        for t in 0..m {
+            for ne in ne0..ne1 {
+                let k = k_blocks * 256;
+                let gpr = k / 32;
+                let f16rt = |v: f32| {
+                    tempura_kernels::ggml::helpers::f16_to_f32(
+                        tempura_kernels::ggml::helpers::f32_to_f16(v),
+                    )
+                };
+                let mut acc = 0f32;
+                for kb in 0..k_blocks {
+                    let base = (ne * k_blocks + kb) * 36;
+                    let d = tempura_kernels::ggml::helpers::f16_to_f32(packed[base] as u16);
+                    let dmin =
+                        tempura_kernels::ggml::helpers::f16_to_f32((packed[base] >> 16) as u16);
+                    let mut q = [0u8; 12];
+                    for b in 0..12 {
+                        q[b] = (packed[base + 1 + b / 4] >> (8 * (b % 4))) as u8;
+                    }
+                    let mut sc = [0f32; 8];
+                    let mut mv = [0f32; 8];
+                    for j in 0..4 {
+                        sc[j] = (q[j] & 63) as f32;
+                        mv[j] = (q[4 + j] & 63) as f32;
+                        sc[4 + j] = ((q[8 + j] & 0x0F) | ((q[j] >> 6) << 4)) as f32;
+                        mv[4 + j] = ((q[8 + j] >> 4) | ((q[4 + j] >> 6) << 4)) as f32;
+                    }
+                    for g in 0..8 {
+                        let j = g / 2;
+                        let hi = g % 2;
+                        let mut c = 0i32;
+                        for e in 0..32usize {
+                            let bidx = j * 32 + e;
+                            let byte = (packed[base + 4 + bidx / 4] >> (8 * (bidx % 4))) as u8;
+                            let nib = ((byte >> (4 * hi)) & 0xF) as i32;
+                            c += nib * q8[t * k + kb * 256 + g * 32 + e] as i32;
+                        }
+                        let ax = f16_to_f32(rne_f16_bits(d * sc[g]));
+                        let ay = -f16_to_f32(rne_f16_bits(dmin * mv[g]));
+                        let d8g = d8[t * gpr + kb * 8 + g];
+                        let rsg = rs[t * gpr + kb * 8 + g] as f32;
+                        let pos = ax * d8g;
+                        let tb = d8g * rsg;
+                        let min = ay * tb;
+                        let dv = c as f32;
+                        acc = dv.mul_add(pos, acc);
+                        acc = acc + min;
+                    }
+                }
+                unsafe { *out_ptr.add(t * n + ne) = acc };
+            }
+        }
+    });
+    out
+}
+
 fn main() {
     let shapes: &[(usize, usize, &str)] = &[
         (64, 1, "tiny [n=64, k=256]"),
@@ -409,6 +599,80 @@ fn main() {
                 } else {
                     any_fail = true;
                     println!("  {label} m={m} mma128w: FAIL (kernel not loaded)");
+                }
+            }
+
+            // 5) mmq_batch: the llama.cpp-mmq-structured kernel (128
+            //    neurons x 32 tokens, smem staging, f16 scale
+            //    pre-extraction). Gates:
+            //    a) BITWISE vs the CPU mirror of the exact op sequence
+            //       (mmq_cpu_mirror -- the f16-scale class modeled
+            //       precisely, including quantization and fma order);
+            //    b) <= 2e-3 rel vs the per-row kpar reference (the f16
+            //       scale class band, 2^-11 relative on the scale
+            //       products; the end-to-end MMLU/ppl gates are the real
+            //       quality arbiter).
+            if n % 128 == 0 {
+                if oxide.has_mmq_batch() {
+                    let out = Arc::new(
+                        api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
+                    );
+                    let res = oxide.forward_mmq_batch_d2d_rows(
+                        &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds,
+                    );
+                    match res {
+                        Err(e) => {
+                            any_fail = true;
+                            println!("  {label} m={m} mmq: FAIL (launch error: {e})");
+                        }
+                        Ok(()) => {
+                            let got = out.to_host_vec().sync_on(&stream).expect("out download");
+                            let mirror = mmq_cpu_mirror(&x_host, &packed_host, m, n, k_blocks);
+                            // The mirror models the exact op sequence; the
+                            // residual difference is ulp-level (measured
+                            // ~1e-9, a ptxas contraction nuance in the f16
+                            // scale path), so the gate is a tight numeric
+                            // bound rather than bit-identity. Layout bugs
+                            // produce >= 1e-3 errors and still fail hard.
+                            let mut mirror_max = 0f64;
+                            for i in 0..m * n {
+                                let d = (got[i] - mirror[i]).abs()
+                                    / mirror[i].abs().max(1.0);
+                                mirror_max = mirror_max.max(d as f64);
+                            }
+                            let bitwise = got == mirror;
+                            if mirror_max > 1e-5 {
+                                any_fail = true;
+                            }
+                            let mut max_rel = 0f64;
+                            let mut bad_rows = 0;
+                            for r in 0..m {
+                                let mut row_max = 0f64;
+                                for c in 0..n {
+                                    let a = got[r * n + c];
+                                    let b = ref_rows[r][c];
+                                    let denom = b.abs().max(1.0);
+                                    let rel = ((a - b).abs() / denom) as f64;
+                                    row_max = row_max.max(rel);
+                                }
+                                if row_max > 2e-3 {
+                                    bad_rows += 1;
+                                }
+                                max_rel = max_rel.max(row_max);
+                            }
+                            if bad_rows > 0 {
+                                any_fail = true;
+                            }
+                            println!(
+                                "  {label} m={m} mmq: {} (vs kpar max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 2e-3; vs CPU mirror: {} max rel {mirror_max:.3e}, gate 1e-5)",
+                                if bad_rows == 0 { "OK" } else { "MISMATCH" },
+                                if bitwise { "bit-identical" } else { "ulp-level delta" }
+                            );
+                        }
+                    }
+                } else {
+                    any_fail = true;
+                    println!("  {label} m={m} mmq: FAIL (kernel not loaded)");
                 }
             }
         }

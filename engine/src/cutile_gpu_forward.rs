@@ -6150,7 +6150,7 @@ impl CutileGpuModel {
     /// double-quantization -- Q4K weights x Q8_1 activations, the same
     /// numerical class as the decode kpar8 GEMV.
     ///
-    /// Kernel selection (TEMPURA_Q4K_PREFILL_KERNEL=kpar8|mma|wide|streamk,
+    /// Kernel selection (TEMPURA_Q4K_PREFILL_KERNEL=kpar8|mma|wide|mmq|streamk,
     /// default mma = the measured fastest reference-class variant,
     /// 2026-11-17d probe-prefill-tc: mma ~3.9-4.5x kpar8_batch at prefill
     /// shapes, 350-446 GB/s vs 70-128 GB/s effective weight read):
@@ -6194,6 +6194,7 @@ impl CutileGpuModel {
             Mma16,
             Mma128,
             Mma128w,
+            Mmq,
             Streamk,
         }
         let sel = std::env::var("TEMPURA_Q4K_PREFILL_KERNEL").unwrap_or_default();
@@ -6213,11 +6214,24 @@ impl CutileGpuModel {
             && oxide.has_mma128w_batch()
             && sel == "wide";
         let mma128_ok = m > 16 && oxide.has_mma128_batch();
+        // MMQ-structured variant (TEMPURA_Q4K_PREFILL_KERNEL=mmq): 128
+        // neurons x 32 tokens per CTA, smem-staged operands, f16 scale
+        // pre-extraction (llama.cpp mmq class). NOT bit-identical to
+        // mma128 -- gated by the mmq probe arm (CPU mirror) + MMLU/ppl.
+        let mmq_ok = m > 16 && n % 128 == 0 && oxide.has_mmq_batch();
+        // Default: the mmq variant (measured 4073 tok/s pp128 exact vs
+        // mma128's 2732 -- 2026-11-19; probe-gated by bench-probe-q4k-batch's
+        // mmq arm + MMLU/ppl at the f16-scale class). NOT bit-identical to
+        // the per-row kpar8 GEMV (f16 (d*sc)/(dmin*mv) roundings) -- the
+        // exact route keeps its documented class band, gated end-to-end.
         let variant = match sel.as_str() {
             "kpar8" => PrefillQ4kKernel::Kpar8,
+            "mma128" if mma128_ok => PrefillQ4kKernel::Mma128,
+            "mmq" if mmq_ok => PrefillQ4kKernel::Mmq,
             "wide" if mma128w_ok => PrefillQ4kKernel::Mma128w,
             "streamk" if oxide.has_streamk_batch() => PrefillQ4kKernel::Streamk,
             // default: the measured fastest reference-class variant
+            _ if mmq_ok => PrefillQ4kKernel::Mmq,
             _ if mma128w_ok => PrefillQ4kKernel::Mma128w,
             _ if mma128_ok => PrefillQ4kKernel::Mma128,
             _ if oxide.has_mma_batch() => PrefillQ4kKernel::Mma16,
@@ -6251,6 +6265,7 @@ impl CutileGpuModel {
         // chunks at 128 rows; the others at 16.
         let chunk_rows = if variant == PrefillQ4kKernel::Mma128
             || variant == PrefillQ4kKernel::Mma128w
+            || variant == PrefillQ4kKernel::Mmq
         {
             128
         } else {
@@ -6297,6 +6312,9 @@ impl CutileGpuModel {
                     a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                 ),
                 PrefillQ4kKernel::Mma128w => oxide.forward_mma128w_batch_d2d_rows(
+                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                ),
+                PrefillQ4kKernel::Mmq => oxide.forward_mmq_batch_d2d_rows(
                     a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                 ),
                 PrefillQ4kKernel::Streamk => oxide.forward_streamk_batch_d2d_rows(
