@@ -306,7 +306,7 @@ pub fn ptx() -> &'static str {
             for i in 0..4usize {
                 let acc = 40 + jt * 4 + i;
                 wb.push_str(&format!(
-                    "        add.u32 %r300, %r40, {tok};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {neur};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        setp.ne.u32 %p31, %r7, 1;\n        @!%p31 bra WB_SPLIT_{jt}_{i};\n        add.u64 %rd30, %rd30, %rd3;\n        bra WB_STORE_{jt}_{i};\nWB_SPLIT_{jt}_{i}:\n        add.u64 %rd30, %rd30, %rd31;\n        add.u64 %rd30, %rd30, %rd4;\nWB_STORE_{jt}_{i}:\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
+                    "        add.u32 %r300, %r40, {tok};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {neur};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        setp.ne.u32 %p31, %r7, 1;\n        @%p31 bra WB_SPLIT_{jt}_{i};\n        add.u64 %rd30, %rd30, %rd3;\n        bra WB_STORE_{jt}_{i};\nWB_SPLIT_{jt}_{i}:\n        add.u64 %rd30, %rd30, %rd31;\n        add.u64 %rd30, %rd30, %rd4;\nWB_STORE_{jt}_{i}:\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
                     tok = jt * 8 + (i & 1),
                     neur = 8 * (i >> 1),
                     acc = acc,
