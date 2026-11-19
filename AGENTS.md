@@ -503,6 +503,16 @@ Qwen3.6-27B weights** — see open work.
       (mma128 arm: random-data CPU f64 reference from the same quantized
       activations, cancellation-aware gate 1e-5 * sum|terms| -- a naive
       rel-to-result gate false-positives on cancellative sums).
+      2026-11-20 (q6k mmq port, kernels/src/q6k_mmq_batch_sm120_ptx.rs):
+      the q4k-mmq treatment ported to the Q6K side -- 128 neurons x 32
+      tokens per CTA, single cp.async staging buffer, borrow-free SWAR s8
+      unpack, f16 (d*sc) pre-extraction (one product rounding); the exact
+      route's Q6K DEFAULT (TEMPURA_Q6K_PREFILL_KERNEL=mma128 bisects).
+      Probe arm 4: bit-identical to the CPU mirror + 2e-3*abssum class
+      band vs mma128. q6k stack 6.9 -> 4.64 ms/step, exact mode
+      4101 -> 4381 tok/s pp128 (llama.cpp gap 1.7x); q4k_mmq now dominates
+      the step (20.3 ms, 71%) -- f16x2 scale pipes / GLU fusion / k-split
+      remain the levers to the 6000-tok/s default-flip bar.
       2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
       docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
       the ds word's high bits (llama.cpp's Q8_1 ds layout; all other

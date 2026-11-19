@@ -3,8 +3,8 @@
   "sample": "/home/fdupont/.cache/tempura/eval/mmlu/mmlu_sample.jsonl",
   "questions": 250,
   "cpu_accuracy": 0.6160,
-  "gpu_accuracy": 0.6280,
-  "llama_accuracy": null,
-  "gpu_cpu_agreement": 0.9680,
+  "gpu_accuracy": 0.6360,
+  "llama_accuracy": 0.6240,
+  "gpu_cpu_agreement": 0.9640,
   "passed": true
 }

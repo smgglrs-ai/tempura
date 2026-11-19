@@ -76,6 +76,11 @@ pub struct OxideQ6kGemv {
     /// weights once, Q8_1 activations).
     cu_mma128_module: Option<CUmodule>,
     cu_mma128_batch: Option<CUfunction>,
+    /// q6k_mmq_batch_sm120: the llama.cpp-mmq-structured LARGE-m INT8 batch
+    /// (128 neurons x 32 tokens per CTA, cp.async smem staging, f16 (d*sc)
+    /// pre-extraction; the 2026-11-20 port of the q4k mmq winner).
+    cu_mmq_module: Option<CUmodule>,
+    cu_mmq_batch: Option<CUfunction>,
     /// Pre-allocated kpar output scratch -- avoids allocation during CUDA graph capture.
     /// Set via `pre_allocate_kpar_output_scratch(max_n)` before first graph capture.
     kpar_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
@@ -100,6 +105,9 @@ impl Drop for OxideQ6kGemv {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
         }
         if let Some(m) = self.cu_mma128_module.take() {
+            let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+        }
+        if let Some(m) = self.cu_mmq_module.take() {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
         }
     }
@@ -486,6 +494,65 @@ impl OxideQ6kGemv {
             (None, None)
         };
 
+        // -- Try sm_120 MMQ-structured batch PTX (q6k_mmq_batch_sm120) -------
+        // The 2026-11-20 port of the q4k mmq winner: 128 neurons x 32 tokens
+        // per CTA, cp.async smem staging, f16 (d*sc) pre-extraction --
+        // different numerics class from mma128 (the f16 scale roundings);
+        // gated by the mmq probe arm (CPU mirror + class band) + MMLU/ppl.
+        let (cu_mmq_module, cu_mmq_batch) = if !sm120_force_off && sm120_cc_ok {
+            let ptx_cstr =
+                CString::new(crate::q6k_mmq_batch_sm120_ptx::ptx()).unwrap_or_default();
+            let mut m = std::mem::MaybeUninit::uninit();
+            let rc = unsafe {
+                cuda_core::sys::cuModuleLoadData(m.as_mut_ptr(), ptx_cstr.as_ptr() as *const _)
+            };
+            if rc == CUDA_SUCCESS {
+                let m = unsafe { m.assume_init() };
+                let entry = CString::new(crate::q6k_mmq_batch_sm120_ptx::ENTRY).unwrap_or_default();
+                let mut f = std::mem::MaybeUninit::uninit();
+                let rc2 = unsafe {
+                    cuda_core::sys::cuModuleGetFunction(f.as_mut_ptr(), m, entry.as_ptr())
+                };
+                if rc2 == CUDA_SUCCESS {
+                    let mmq_fn = unsafe { f.assume_init() };
+                    // 37888 B dynamic smem is under the 48 KiB static limit,
+                    // but the opt-in matches the q4k mmq pattern (best-effort;
+                    // on failure the launch errors and callers fall back).
+                    let rc_attr = unsafe {
+                        cuda_core::sys::cuFuncSetAttribute(
+                            mmq_fn,
+                            cuda_core::sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            crate::q6k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as i32,
+                        )
+                    };
+                    if rc_attr != CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q6k: cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) \
+                             failed for mmq_batch (rc={rc_attr})"
+                        );
+                    }
+                    eprintln!(
+                        "oxide-gemv-q6k: loaded sm_120 MMQ batch PTX ({} bytes) -- INT8 tensor cores, 128 neurons x 32 tokens/block, cp.async staging, f16 scales",
+                        ptx_cstr.as_bytes().len(),
+                    );
+                    (Some(m), Some(mmq_fn))
+                } else {
+                    let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+                    eprintln!(
+                        "oxide-gemv-q6k: cuModuleGetFunction(mmq_batch) failed (rc={rc2})"
+                    );
+                    (None, None)
+                }
+            } else {
+                eprintln!(
+                    "oxide-gemv-q6k: cuModuleLoadData(mmq_batch PTX) failed (rc={rc})"
+                );
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         // Return Some only when at least one kernel is available.
         let any_loaded = !cu_function.is_null()
             || cu_function_kpar.is_some()
@@ -502,6 +569,9 @@ impl OxideQ6kGemv {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
             if let Some(m) = cu_mma128_module {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+            if let Some(m) = cu_mmq_module {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
             eprintln!("oxide-gemv-q6k: no Q6K kernel variant available; falling back to cuTile");
@@ -536,6 +606,8 @@ impl OxideQ6kGemv {
             cu_function_sm120_db_batch,
             cu_mma128_module,
             cu_mma128_batch,
+            cu_mmq_module,
+            cu_mmq_batch,
             kpar_out_scratch: RefCell::new(None),
             stream,
         })
@@ -570,6 +642,15 @@ impl OxideQ6kGemv {
     /// [`Self::forward_mma128_batch_d2d_rows`].
     pub fn has_mma128_batch(&self) -> bool {
         self.cu_mma128_batch.is_some()
+    }
+
+    /// Returns `true` when the sm_120 MMQ-structured LARGE-m batch kernel
+    /// (`q6k_mmq_batch_sm120`) was loaded. Same activation contract as
+    /// `forward_mma128_batch_d2d_rows` (Q8_1-quantized, llama.cpp's
+    /// Q6_K x Q8_K class) but the f16 (d*sc) scale-product numerics class
+    /// (see [`Self::forward_mmq_batch_d2d_rows`]).
+    pub fn has_mmq_batch(&self) -> bool {
+        self.cu_mmq_batch.is_some()
     }
 
     /// sm_120 M-row batch db GEMV (native GGUF Q6K) with row-window offsets:
@@ -833,6 +914,104 @@ impl OxideQ6kGemv {
             )
         }
         .map_err(|e| KernelError::InvalidConfig(format!("q6k mma128_batch gemm rows: {e}")))?;
+        Ok(())
+    }
+
+    /// MMQ-structured LARGE-m batch GEMM (`q6k_mmq_batch_sm120`): 128
+    /// neurons x 32 tokens per CTA, cp.async smem staging, weight scale
+    /// products pre-extracted as f16 (the q4k mmq numerics class ported to
+    /// Q6K's d-only per-16-element scales). NOT bit-identical to mma128
+    /// (the f16 scale roundings) -- the q6k mmq probe arm gates it against
+    /// a CPU mirror of the exact op sequence plus a class band vs the f64
+    /// reference; end-to-end quality is gated by MMLU/ppl. Requires
+    /// `n % 128 == 0`; `x_qs`/`x_ds` must already hold the Q8_1 window for
+    /// rows `[x_row, x_row + m)` (same contract as
+    /// `forward_mma128_batch_d2d_rows`).
+    pub fn forward_mmq_batch_d2d_rows(
+        &self,
+        _x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 128 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k forward_mmq_batch_d2d_rows: m must be in 1..=128; got {m}"
+            )));
+        }
+        if n % 128 != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k forward_mmq_batch_d2d_rows: n must be a multiple of 128; got {n}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > _x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mmq: x slice [{x_row}, {}+{m}) x {k} exceeds tensor ({} f32)",
+                x_row,
+                _x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mmq: out slice [{out_row}, {}+{m}) x {n} exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+        if x_qs.size() < m * k / 4 || x_ds.size() < m * k.div_ceil(32) {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k mmq: Q8_1 scratch too small (qs {} < {}, ds {} < {})",
+                x_qs.size(),
+                m * k / 4,
+                x_ds.size(),
+                m * k.div_ceil(32)
+            )));
+        }
+        let mmq_fn = match self.cu_mmq_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q6k mmq_batch not loaded".into())),
+        };
+        let cu_stream = self.stream.cu_stream();
+        let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+        let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+        let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+        let n_u32: u32 = n as u32;
+        let kb_u32: u32 = k_blocks as u32;
+        let m_u32: u32 = m as u32;
+        let mut params: [*mut c_void; 7] = [
+            &wt_ptr as *const _ as *mut c_void,
+            &qs_ptr as *const _ as *mut c_void,
+            &ds_ptr as *const _ as *mut c_void,
+            &ou_ptr as *const _ as *mut c_void,
+            &n_u32  as *const _ as *mut c_void,
+            &kb_u32 as *const _ as *mut c_void,
+            &m_u32  as *const _ as *mut c_void,
+        ];
+        // grid (n/128, ceil(m/32)): 128 neurons x 32 tokens per CTA.
+        let grid_x = n_u32 / 128;
+        let grid_y = m_u32.div_ceil(32);
+        unsafe {
+            launch_kernel(
+                mmq_fn,
+                (grid_x, grid_y, 1),
+                (256, 1, 1),
+                crate::q6k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32,
+                cu_stream,
+                &mut params,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("q6k mmq_batch gemm rows: {e}")))?;
         Ok(())
     }
 

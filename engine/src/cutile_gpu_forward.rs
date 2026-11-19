@@ -5983,7 +5983,10 @@ impl CutileGpuModel {
     /// treatment the exact-mode Q4K side already uses; NOT bit-identical to
     /// the f32-activation sm120 batch route (quality gated by bench-mmlu /
     /// ppl; layout gated by bench-probe-q6k-batch's mma128 arm).
-    /// TEMPURA_Q6K_PREFILL_KERNEL=sm120 restores the f32-activation route.
+    /// TEMPURA_Q6K_PREFILL_KERNEL=sm120 restores the f32-activation route;
+    /// =mma128 bisects back to the exact-int kernel (since 2026-11-20 the
+    /// route defaults to the mmq-structured `q6k_mmq_batch_sm120` when
+    /// available -- f16 (d*sc) pre-extraction, the q4k mmq class).
     /// Returns None when the kernel is unavailable or the activation is not
     /// a compact `[m, k]` layout.
     fn gemm_q6k_prefill_mma128(
@@ -6057,16 +6060,36 @@ impl CutileGpuModel {
                 .unwrap_or_else(|e| {
                     panic!("q6k mma128 prefill quantize {weight_name} rows {row}..{}: {e}", row + rows)
                 });
-            oxide6
-                .forward_mma128_batch_d2d_rows(
-                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "q6k mma128 prefill batch {weight_name} rows {row}..{}: {e}",
-                        row + rows
+            // 2026-11-20: the mmq-structured kernel (cp.async smem staging,
+            // f16 (d*sc) pre-extraction -- the q4k mmq class ported to Q6K)
+            // is the DEFAULT for the exact route; TEMPURA_Q6K_PREFILL_KERNEL
+            // =mma128 bisects back to the exact-int f32-scale kernel.
+            let use_mmq = oxide6.has_mmq_batch()
+                && n % 128 == 0
+                && std::env::var("TEMPURA_Q6K_PREFILL_KERNEL").as_deref() != Ok("mma128");
+            if use_mmq {
+                oxide6
+                    .forward_mmq_batch_d2d_rows(
+                        a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                     )
-                });
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "q6k mmq prefill batch {weight_name} rows {row}..{}: {e}",
+                            row + rows
+                        )
+                    });
+            } else {
+                oxide6
+                    .forward_mma128_batch_d2d_rows(
+                        a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "q6k mma128 prefill batch {weight_name} rows {row}..{}: {e}",
+                            row + rows
+                        )
+                    });
+            }
             row += rows;
         }
         Some(out)

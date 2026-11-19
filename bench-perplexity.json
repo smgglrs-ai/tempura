@@ -4,9 +4,9 @@
   "n_ctx": 512,
   "max_chunks": 8,
   "cpu": {"ppl": 8.104846, "nll": 4268.622717, "count": 2040},
-  "gpu": {"ppl": 8.086309, "nll": 4263.951739, "count": 2040},
-  "llama_cpp_ppl": null,
-  "gpu_cpu_ratio": 0.997713,
+  "gpu": {"ppl": 8.088900, "nll": 4264.605283, "count": 2040},
+  "llama_cpp_ppl": 8.019200,
+  "gpu_cpu_ratio": 0.998033,
   "gpu_nan_steps": 0,
   "passed": true
 }
