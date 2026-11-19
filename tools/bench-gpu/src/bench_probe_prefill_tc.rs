@@ -261,6 +261,62 @@ fn main() {
                 );
             }
         }
+
+        // ---- mmq k-split sweep at the engine chunk (m=128), opt-in via
+        // SWEEP=1: per-S latency to place the engine's fill heuristic ----
+        if std::env::var("SWEEP").is_ok() {
+            let m_total = 128usize;
+            let k = k_blocks * 256;
+            let mut x_host = vec![0f32; m_total * k];
+            let mut rng2 = Rng(0x5E11_0000 + n as u64 + k_blocks as u64);
+            for v in x_host.iter_mut() {
+                *v = rng2.f32_in(-1.0, 1.0);
+            }
+            let x = upload(&x_host, &stream);
+            let out = Arc::new(
+                api::zeros::<f32>(&[m_total * n])
+                    .sync_on(&stream)
+                    .expect("out alloc"),
+            );
+            let x_qs = Arc::new(
+                api::zeros::<u32>(&[m_total * k / 4])
+                    .sync_on(&stream)
+                    .expect("qs alloc"),
+            );
+            let x_ds = Arc::new(
+                api::zeros::<u32>(&[m_total * k.div_ceil(32)])
+                    .sync_on(&stream)
+                    .expect("ds alloc"),
+            );
+            let partials = Arc::new(
+                api::zeros::<f32>(&[8 * m_total * n])
+                    .sync_on(&stream)
+                    .expect("partials alloc"),
+            );
+            println!("  mmq split sweep (m=128):");
+            for splits in 1..=8usize.min(k_blocks) {
+                let mut run = || {
+                    oxide
+                        .forward_mmq_split_batch_d2d_rows(
+                            &x, 0, &packed, &out, 0, m_total, n, k_blocks, &x_qs, &x_ds, splits,
+                            &partials,
+                        )
+                        .expect("split run");
+                };
+                for _ in 0..3 {
+                    run();
+                    stream.synchronize().expect("warmup sync");
+                }
+                let iters = 30;
+                let start = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                stream.synchronize().expect("timed sync");
+                let ms = start.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                println!("    S={splits}: {ms:9.3} ms");
+            }
+        }
     }
 
     // Model-level projection: per 128-token prefill step, the Q4K projection
