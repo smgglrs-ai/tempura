@@ -6351,14 +6351,23 @@ impl CutileGpuModel {
                     // reduce combines the partials (deterministic; sum-order
                     // class change gated by the mmq probe's split arms).
                     // TEMPURA_Q4K_MMQ_SPLIT=0 bisects off (S=1 everywhere).
-                    let slots = (n / 128) * m.div_ceil(32);
-                    let sm_count = oxide.sm_count() as usize;
+                    // S depends ONLY on n (never the runtime m/rows): a
+                    // smaller final chunk must not change the sum order of
+                    // the same token's row (composition invariance, the
+                    // bench-ab-repro composition gate). slots are computed
+                    // at the fixed 128-row chunk the exact route uses.
+                    // Calibrated on the fishtank S-sweep (2026-11-21):
+                    // k_proj n=1024 (32 slots) best at S>=4 (0.059 ->
+                    // 0.019 ms), q/o n=4096 (128 slots) best at S~5
+                    // (0.060 -> 0.049), gate/up n=14336 (448 slots) a wash
+                    // -> S=1. Rule: S = round(640 / slots), clamped [1, 8].
+                    let slots = (n / 128) * 4;
                     let want_split = oxide.has_mmq_split_batch()
                         && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
                             .map(|v| v != "0")
                             .unwrap_or(true);
-                    let splits = if want_split && slots < 2 * sm_count {
-                        let target = (2 * sm_count).div_ceil(slots.max(1));
+                    let splits = if want_split {
+                        let target = (640f64 / slots as f64).round() as usize;
                         target.clamp(1, 8).min(dw.k_blocks)
                     } else {
                         1
