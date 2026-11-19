@@ -113,6 +113,7 @@ pub struct OxideQ4kGemv {
     cu_mma128w_batch:           Option<CUfunction>,
     cu_mmq_batch_module:        Option<CUmodule>,
     cu_mmq_batch:               Option<CUfunction>,
+    cu_mmq_reduce:              Option<CUfunction>,
     /// Optional sm_120 stream-K batch GEMM (persistent blocks, grid=(SM_COUNT,1,1)).
     /// Each block processes ceil(N_col_tiles/SM_COUNT) output tiles sequentially,
     /// computing the full K-dimension per tile. 100% SM utilisation regardless of N.
@@ -552,7 +553,7 @@ impl OxideQ4kGemv {
             // class from mma128 (f16 (d*sc)/(dmin*mv) products); gated by
             // the mmq probe arm (CPU mirror, bit-level) + MMLU/ppl.
             let mut cu_mmq_mod: Option<CUmodule> = None;
-            let cu_mmq_batch: Option<CUfunction> = if !sm120_disabled
+            let mmq_fns: (Option<CUfunction>, Option<CUfunction>) = if !sm120_disabled
                 && caps.cc() >= q4k_mmq_batch_sm120_ptx::MIN_CC
             {
                 let ptx_cstr = CString::new(q4k_mmq_batch_sm120_ptx::ptx()).unwrap_or_default();
@@ -592,22 +593,40 @@ impl OxideQ4kGemv {
                             ptx_cstr.as_bytes().len(),
                         );
                         cu_mmq_mod = Some(m);
-                        Some(mmq_fn)
+                        let reduce_entry =
+                            CString::new(q4k_mmq_batch_sm120_ptx::ENTRY_REDUCE).unwrap_or_default();
+                        let mut rf = std::mem::MaybeUninit::uninit();
+                        let rc3 = unsafe {
+                            cuda_core::sys::cuModuleGetFunction(rf.as_mut_ptr(), m, reduce_entry.as_ptr())
+                        };
+                        let cu_mmq_reduce = if rc3 == CUDA_SUCCESS {
+                            Some(unsafe { rf.assume_init() })
+                        } else {
+                            eprintln!(
+                                "oxide-gemv-q4k: cuModuleGetFunction(mmq_split_reduce) failed (rc={rc3})"
+                            );
+                            None
+                        };
+                        (Some(mmq_fn), cu_mmq_reduce)
                     } else {
                         let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
                         eprintln!(
                             "oxide-gemv-q4k: cuModuleGetFunction(mmq_batch) failed (rc={rc2})"
                         );
-                        None
+                        (None, None)
                     }
                 } else {
                     eprintln!(
                         "oxide-gemv-q4k: cuModuleLoadData(mmq_batch PTX) failed (rc={rc})"
                     );
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
+            };
+            let (cu_mmq_batch, cu_mmq_reduce) = {
+                let (a, b) = mmq_fns;
+                (a, b)
             };
 
             // -- Load sm_120 stream-K persistent batch GEMM PTX ----------------
@@ -750,7 +769,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -1551,6 +1570,13 @@ impl OxideQ4kGemv {
         self.uses_raw_gguf && self.cu_mmq_batch.is_some()
     }
 
+    /// Returns true when the mmq grid.z k-split path is available (main
+    /// entry + the fixed-order split reduce entry). The engine uses this
+    /// for grid fill on small-n shapes (q/o/k_proj).
+    pub fn has_mmq_split_batch(&self) -> bool {
+        self.uses_raw_gguf && self.cu_mmq_batch.is_some() && self.cu_mmq_reduce.is_some()
+    }
+
     /// Returns true when the sm_120 M-row batch kpar8 kernel is loaded.
     /// This is the CORRECT general-M batch kernel: per-row math is
     /// bit-identical to the per-row kpar8 GEMV (unlike mma_batch/streamk,
@@ -2340,7 +2366,9 @@ impl OxideQ4kGemv {
             let n_u32: u32 = n as u32;
             let kb_u32: u32 = k_blocks as u32;
             let m_u32: u32 = m as u32;
-            let mut params: [*mut c_void; 7] = [
+            let splits_u32: u32 = 1;
+            let partials_ptr: u64 = 0;
+            let mut params: [*mut c_void; 9] = [
                 &wt_ptr as *const _ as *mut c_void,
                 &qs_ptr as *const _ as *mut c_void,
                 &ds_ptr as *const _ as *mut c_void,
@@ -2348,6 +2376,8 @@ impl OxideQ4kGemv {
                 &n_u32  as *const _ as *mut c_void,
                 &kb_u32 as *const _ as *mut c_void,
                 &m_u32  as *const _ as *mut c_void,
+                &splits_u32 as *const _ as *mut c_void,
+                &partials_ptr as *const _ as *mut c_void,
             ];
             let grid_x = n_u32 / 128;
             let grid_y = (m_u32 + 31) / 32; // 32 tokens per CTA (J=32)
@@ -2362,6 +2392,161 @@ impl OxideQ4kGemv {
                     &mut params,
                 )
             }.map_err(|e| KernelError::InvalidConfig(format!("mmq_batch q4k gemm rows: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
+        Ok(())
+    }
+
+    /// MMQ batch GEMM with a grid.z K-SPLIT for grid fill on small-n shapes
+    /// (the 2026-11-21 lever: q/o_proj run 128 CTAs and k_proj 32 CTAs on
+    /// 170 SMs -- 75%/19% fill). CTA (x, y, z) computes k-blocks
+    /// [z*kb/S, (z+1)*kb/S) and writes its f32 partial to
+    /// `partials[z*m*n ..]`; the fixed-order `q4k_mmq_split_reduce` entry
+    /// then combines the partials (out = p0 + p1 + ..., ascending z).
+    ///
+    /// Numerics vs the unsplit kernel: the per-split f32 accumulation is
+    /// identical (same (kb, g, jt) order within the range); the combine
+    /// changes the SUM ORDER (per-split partials added in z order instead
+    /// of one sequential chain) -- the mmq probe's split arms gate this
+    /// against a mirror of the exact split op sequence. `splits == 1`
+    /// delegates to the unsplit kernel (bit-identical path).
+    ///
+    /// `partials` must hold `splits * m * n` f32 (only touched when
+    /// splits > 1).
+    pub fn forward_mmq_split_batch_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+        splits: usize,
+        partials: &Arc<Tensor<f32>>,
+    ) -> Result<()> {
+        if splits <= 1 {
+            return self.forward_mmq_batch_d2d_rows(
+                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds,
+            );
+        }
+        if m == 0 || m > 128 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: m must be in 1..=128; got {m}"
+            )));
+        }
+        if n % 128 != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: n must be a multiple of 128; got {n}"
+            )));
+        }
+        if splits > k_blocks {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: splits {splits} > k_blocks {k_blocks}"
+            )));
+        }
+        if partials.size() < splits * m * n {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: partials holds {} f32, need {splits}*{m}*{n}",
+                partials.size()
+            )));
+        }
+        let mma_fn = match self.cu_mmq_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("mmq_batch not loaded".into())),
+        };
+        let reduce_fn = match self.cu_mmq_reduce {
+            Some(f) => f,
+            None => {
+                return Err(KernelError::InvalidConfig(
+                    "mmq_split_reduce not loaded".into(),
+                ))
+            }
+        };
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: x slice [{x_row}, {}+{m}) x {k} exceeds \
+                 tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mmq_split_batch_d2d_rows: out slice [{out_row}, {}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+        let cu_stream = self.stream.cu_stream();
+        self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
+        let splits_u32: u32 = splits as u32;
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let pt_ptr: u64 = partials.device_pointer().cu_deviceptr();
+            let n_u32: u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32: u32 = m as u32;
+            let mut params: [*mut c_void; 9] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32  as *const _ as *mut c_void,
+                &splits_u32 as *const _ as *mut c_void,
+                &pt_ptr as *const _ as *mut c_void,
+            ];
+            let grid_x = n_u32 / 128;
+            let grid_y = (m_u32 + 31) / 32;
+            let block_dim = 256u32;
+            unsafe {
+                launch_kernel(
+                    mma_fn,
+                    (grid_x, grid_y, splits_u32),
+                    (block_dim, 1, 1),
+                    q4k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("mmq_split q4k gemm rows: {e}")))?;
+        }
+        {
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let pt_ptr: u64 = partials.device_pointer().cu_deviceptr();
+            let total_u32: u32 = (m * n) as u32;
+            let mut params: [*mut c_void; 4] = [
+                &ou_ptr as *const _ as *mut c_void,
+                &pt_ptr as *const _ as *mut c_void,
+                &total_u32 as *const _ as *mut c_void,
+                &splits_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = (total_u32 + 255) / 256;
+            unsafe {
+                launch_kernel(
+                    reduce_fn,
+                    (grid_x, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("mmq_split_reduce: {e}")))?;
         }
 
         // No stream.synchronize() -- caller owns the sync.

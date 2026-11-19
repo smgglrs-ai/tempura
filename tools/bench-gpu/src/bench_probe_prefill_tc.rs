@@ -93,6 +93,7 @@ enum Variant {
     Mma128,
     Mma128w,
     Mmq,
+    MmqSplit,
     Streamk,
 }
 
@@ -131,6 +132,7 @@ fn main() {
         (Variant::Mma128, "mma128_batch"),
         (Variant::Mma128w, "mma128w_batch"),
         (Variant::Mmq, "mmq_batch"),
+        (Variant::MmqSplit, "mmq_split"),
         (Variant::Streamk, "streamk_batch"),
     ];
 
@@ -165,7 +167,7 @@ fn main() {
                 // Q8_1 scratch for one chunk (16 rows for the 16-row-cap
                 // kernels, 128 for mma128; same sizing as the engine's
                 // gemm_q4k_prefill_batch).
-                let scr_rows = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq) { 128 } else { CHUNK };
+                let scr_rows = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
                 let x_qs = Arc::new(
                     api::zeros::<u32>(&[scr_rows * k / 4])
                         .sync_on(&stream)
@@ -177,11 +179,12 @@ fn main() {
                         .expect("ds alloc"),
                 );
 
+                let mut partials: Option<Arc<Tensor<f32>>> = None;
                 let mut run_pass = |sync: bool| {
                     let mut row = 0usize;
                     // The mma128 variant chunks at 128 rows (weights once
                     // per launch); the others at the kernels' 16-row cap.
-                    let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq) { 128 } else { CHUNK };
+                    let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
                     while row < m_total {
                         let rows = (m_total - row).min(chunk);
                         let res = match variant {
@@ -200,6 +203,30 @@ fn main() {
                             Variant::Mmq => oxide.forward_mmq_batch_d2d_rows(
                                 &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
                             ),
+                            Variant::MmqSplit => {
+                                // engine fill heuristic: S so that
+                                // (n/128)*ceil(m/32)*S >= 2*SM_COUNT, capped 8
+                                let slots = (n / 128) * m_total.div_ceil(32);
+                                let sms = 170usize;
+                                let splits = if slots < 2 * sms {
+                                    ((2 * sms).div_ceil(slots.max(1))).clamp(1, 8).min(k_blocks)
+                                } else {
+                                    1
+                                };
+                                let partials = partials
+                                    .get_or_insert_with(|| {
+                                        Arc::new(
+                                            api::zeros::<f32>(&[8 * 128 * n])
+                                                .sync_on(&stream)
+                                                .expect("partials alloc"),
+                                        )
+                                    })
+                                    .clone();
+                                oxide.forward_mmq_split_batch_d2d_rows(
+                                    &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                                    splits, &partials,
+                                )
+                            }
                             Variant::Streamk => oxide.forward_streamk_batch_d2d_rows(
                                 &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
                             ),
@@ -226,7 +253,7 @@ fn main() {
                 // Effective weight bandwidth: the chunk loop re-reads the
                 // full weight matrix ceil(m_total/16) times.
                 let weight_bytes = (n * k_blocks * 144) as f64;
-                let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq) { 128 } else { CHUNK };
+                let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
                 let re_reads = m_total.div_ceil(chunk) as f64;
                 let gbps = weight_bytes * re_reads / (ms / 1e3) / 1e9;
                 println!(

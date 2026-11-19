@@ -48,6 +48,9 @@
 ///   compute(kb)              -- 256 mmas + epilogues
 pub const MIN_CC: u32 = 1200;
 pub const ENTRY: &str = "q4k_mmq_batch_sm120";
+/// Split-reduce entry (same module): out[i] = sum_s partials[s][i], s in
+/// fixed order 0..splits-1 (deterministic combine for grid.z k-splits).
+pub const ENTRY_REDUCE: &str = "q4k_mmq_split_reduce";
 /// Dynamic shared memory: one 29696-byte staging buffer.
 pub const DYNAMIC_SMEM: usize = 29696;
 /// Buffer layout offsets (bytes).
@@ -295,14 +298,17 @@ pub fn ptx() -> &'static str {
         }
         // writeback: token = token_base + jt*8 + 2*tid4 + (i&1);
         // neuron = n_base + neuron_rel + 8*(i>>1); out[token*n + neuron]
+        // When splits > 1 (grid.z k-split), the partial goes to
+        // partials[z*m*n + token*n + neuron]; a fixed-order reduce kernel
+        // combines them. splits == 1 keeps the direct out store.
         let mut wb = String::new();
         for jt in 0..4usize {
             for i in 0..4usize {
                 let acc = 40 + jt * 4 + i;
                 wb.push_str(&format!(
-                    "        add.u32 %r300, %r40, {};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        add.u64 %rd30, %rd30, %rd3;\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
-                    jt * 8 + (i & 1),
-                    8 * (i >> 1),
+                    "        add.u32 %r300, %r40, {tok};\n        add.u32 %r300, %r300, %r41;\n        setp.ge.u32 %p30, %r300, %r6;\n        @%p30 bra WB_SKIP_{jt}_{i};\n        add.u32 %r302, %r281, {neur};\n        mad.lo.u32 %r301, %r300, %r2, %r302;\n        shl.b32 %r301, %r301, 2;\n        cvt.u64.u32 %rd30, %r301;\n        setp.ne.u32 %p31, %r7, 1;\n        @!%p31 bra WB_SPLIT_{jt}_{i};\n        add.u64 %rd30, %rd30, %rd3;\n        bra WB_STORE_{jt}_{i};\nWB_SPLIT_{jt}_{i}:\n        add.u64 %rd30, %rd30, %rd31;\n        add.u64 %rd30, %rd30, %rd4;\nWB_STORE_{jt}_{i}:\n        st.global.f32 [%rd30], %f{acc};\nWB_SKIP_{jt}_{i}:\n",
+                    tok = jt * 8 + (i & 1),
+                    neur = 8 * (i >> 1),
                     acc = acc,
                     jt = jt,
                     i = i
@@ -339,7 +345,9 @@ pub fn ptx() -> &'static str {
     .param .u64 param_out,
     .param .u32 param_n,
     .param .u32 param_k_blocks,
-    .param .u32 param_m
+    .param .u32 param_m,
+    .param .u32 param_splits,
+    .param .u64 param_partials
 )
 {{
     .reg .u32  %r<320>;
@@ -355,8 +363,26 @@ pub fn ptx() -> &'static str {
     ld.param.u32 %r2,  [param_n];
     ld.param.u32 %r1,  [param_k_blocks];
     ld.param.u32 %r6,  [param_m];
+    ld.param.u32 %r7,  [param_splits];
+    ld.param.u64 %rd4, [param_partials];
 
     mov.u32 %r18, dyn_smem;
+
+    // ---- k-split range (grid.z): CTA z owns k-blocks [z*kb/S, (z+1)*kb/S).
+    // splits == 1 (z == 0) covers [0, kb) -- the unsplit path, numerically
+    // identical to the pre-split kernel.
+    mov.u32 %r42, %ctaid.z;
+    mul.lo.u32 %r44, %r42, %r1;
+    div.u32 %r45, %r44, %r7;              // kb_lo
+    add.u32 %r46, %r42, 1;
+    mul.lo.u32 %r46, %r46, %r1;
+    div.u32 %r46, %r46, %r7;              // kb_hi
+    // partials tile offset (bytes): z * m * n * 4
+    mul.lo.u32 %r43, %r6, %r2;            // m*n (u32: <= 128*14336)
+    cvt.u64.u32 %rd31, %r42;
+    cvt.u64.u32 %rd32, %r43;
+    mul.lo.u64 %rd31, %rd31, %rd32;
+    shl.b64 %rd31, %rd31, 2;
 
     // ---- thread decomposition ---------------------------------------------
     mov.u32 %r5, %tid.x;
@@ -389,11 +415,11 @@ pub fn ptx() -> &'static str {
     // ---- zero the 16 f32 accumulators --------------------------------------
 {acc_zero}
 
-    // ---- outer loop: k_blocks ----------------------------------------------
-    mov.u32 %r21, 0;                       // kb
+    // ---- outer loop: k_blocks (this CTA's split range) ---------------------
+    mov.u32 %r21, %r45;                   // kb = kb_lo
 
 KB_LOOP:
-    setp.ge.u32 %p5, %r21, %r1;
+    setp.ge.u32 %p5, %r21, %r46;
     @%p5 bra KB_DONE;
 
     // all warps done computing on the buffer before restaging it
@@ -487,6 +513,55 @@ KB_DONE:
 
     ret;
 }}
+
+// Deterministic split combine: out[i] = sum_s partials[s*total + i], s in
+// fixed order 0..splits-1 (f32 adds, ascending s). Grid
+// (ceil(total/256),1,1), block (256,1,1).
+.visible .entry q4k_mmq_split_reduce(
+    .param .u64 param_out,
+    .param .u64 param_partials,
+    .param .u32 param_total,
+    .param .u32 param_splits
+)
+{{
+    .reg .u32  %r<12>;
+    .reg .u64  %rd<12>;
+    .reg .f32  %f<4>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd0, [param_out];
+    ld.param.u64 %rd1, [param_partials];
+    ld.param.u32 %r2,  [param_total];
+    ld.param.u32 %r3,  [param_splits];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r4, 256, %r5;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra RED_DONE;
+
+    cvt.u64.u32 %rd2, %r6;
+    shl.b64 %rd2, %rd2, 2;
+
+    mov.u32 %r8, 0;
+    mov.f32 %f0, 0f00000000;
+RED_LOOP:
+    setp.ge.u32 %p2, %r8, %r3;
+    @%p2 bra RED_FIN;
+    mul.wide.u32 %rd3, %r8, %r2;
+    shl.b64 %rd3, %rd3, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd4, %rd4, %rd2;
+    ld.global.f32 %f1, [%rd4];
+    add.f32 %f0, %f0, %f1;
+    add.u32 %r8, %r8, 1;
+    bra RED_LOOP;
+RED_FIN:
+    add.u64 %rd5, %rd0, %rd2;
+    st.global.f32 [%rd5], %f0;
+RED_DONE:
+    ret;
+}}
 "#,
             acc_zero = acc_zero,
             wdm_load = WDM_LOAD,
@@ -515,9 +590,11 @@ mod tests {
             std::fs::write(&path, p).unwrap();
         }
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120"));
+        // split-reduce entry in the same module
+        assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
         // 4 jt bodies (the g loop is a runtime loop: 8 g x 4 jt at runtime)
         assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
-        assert_eq!(p.matches("st.global.f32").count(), 16);
+        assert_eq!(p.matches("st.global.f32").count(), 17); // 16 wb + 1 reduce
         // single-buffered staging: one stage body; 3 textual cp.async sites
         // (the word loops are runtime loops)
         assert_eq!(p.matches("cp.async.ca.shared.global").count(), 3);

@@ -439,6 +439,11 @@ struct NoGraphBatchScratch {
     /// entry. Written fully by the quantize kernel before the GEMM reads it.
     q4k_batch_qs: std::collections::HashMap<(usize, usize), Arc<Tensor<u32>>>,
     q4k_batch_ds: std::collections::HashMap<(usize, usize), Arc<Tensor<u32>>>,
+    /// Q4K mmq grid.z k-split partials [splits * m * n] f32, keyed
+    /// (splits, m, n) -- written by the split CTAs, read by the
+    /// fixed-order reduce entry in the same stream (no host sync needed
+    /// between them).
+    q4k_mmq_partials: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
     /// Q4K batch compact activation rows [m * k] f32, keyed (slot, k, m) --
     /// the row-strided GEMM input repacked to contiguous rows when
     /// row_stride != k. Fully overwritten by D->D row copies in stream order.
@@ -6337,9 +6342,51 @@ impl CutileGpuModel {
                 PrefillQ4kKernel::Mma128w => oxide.forward_mma128w_batch_d2d_rows(
                     a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                 ),
-                PrefillQ4kKernel::Mmq => oxide.forward_mmq_batch_d2d_rows(
-                    a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
-                ),
+                PrefillQ4kKernel::Mmq => {
+                    // 2026-11-21 grid-fill lever: small-n shapes leave the
+                    // machine idle (q/o_proj 128 CTAs = 75% of 170 SMs,
+                    // k_proj 32 CTAs = 19% -- it runs at the same latency as
+                    // n=4096). Split K across grid.z so the (x,y) tile count
+                    // times splits reaches >= 2 CTAs/SM; the fixed-order
+                    // reduce combines the partials (deterministic; sum-order
+                    // class change gated by the mmq probe's split arms).
+                    // TEMPURA_Q4K_MMQ_SPLIT=0 bisects off (S=1 everywhere).
+                    let slots = (n / 128) * m.div_ceil(32);
+                    let sm_count = self.matmul.sm_count();
+                    let want_split = oxide.has_mmq_split_batch()
+                        && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                    let splits = if want_split && slots < 2 * sm_count {
+                        let target = (2 * sm_count).div_ceil(slots.max(1));
+                        target.clamp(1, 8).min(dw.k_blocks)
+                    } else {
+                        1
+                    };
+                    if splits > 1 {
+                        let partials = {
+                            let mut pool = self.nograph.borrow_mut();
+                            pool.q4k_mmq_partials
+                                .entry((splits, chunk_rows_max, n))
+                                .or_insert_with(|| {
+                                    Arc::new(
+                                        api::zeros::<f32>(&[splits * chunk_rows_max * n])
+                                            .sync_on(stream)
+                                            .expect("gemm_q4k_prefill_batch: mmq partials alloc"),
+                                    )
+                                })
+                                .clone()
+                        };
+                        oxide.forward_mmq_split_batch_d2d_rows(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                            splits, &partials,
+                        )
+                    } else {
+                        oxide.forward_mmq_batch_d2d_rows(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                        )
+                    }
+                }
                 PrefillQ4kKernel::Streamk => oxide.forward_streamk_batch_d2d_rows(
                     a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                 ),
