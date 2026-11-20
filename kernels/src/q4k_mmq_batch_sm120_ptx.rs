@@ -48,6 +48,10 @@
 ///   compute(kb)              -- 256 mmas + epilogues
 pub const MIN_CC: u32 = 1200;
 pub const ENTRY: &str = "q4k_mmq_batch_sm120";
+/// FMA-form epilogue variant entry (micro-experiment 2026-11-21).
+pub const ENTRY_FFMA: &str = "q4k_mmq_batch_sm120_ffma";
+/// f16x2 packed-pos epilogue variant entry (micro-experiment 2026-11-21).
+pub const ENTRY_H2: &str = "q4k_mmq_batch_sm120_h2";
 /// Split-reduce entry (same module): out[i] = sum_s partials[s][i], s in
 /// fixed order 0..splits-1 (deterministic combine for grid.z k-splits).
 pub const ENTRY_REDUCE: &str = "q4k_mmq_split_reduce";
@@ -100,6 +104,118 @@ const JT_BODY: &str = r#"
             {%r202, %r203},
             {%r220, %r221, %r222, %r223};
         // epilogue: acc += D * pos + min (f32 fma + add, kb order)
+        cvt.rn.f32.s32 %f220, %r220;
+        fma.rn.f32 %f{ACC0}, %f220, %f210, %f{ACC0};
+        add.f32 %f{ACC0}, %f{ACC0}, %f216;
+        cvt.rn.f32.s32 %f221, %r221;
+        fma.rn.f32 %f{ACC1}, %f221, %f211, %f{ACC1};
+        add.f32 %f{ACC1}, %f{ACC1}, %f217;
+        cvt.rn.f32.s32 %f222, %r222;
+        fma.rn.f32 %f{ACC2}, %f222, %f212, %f{ACC2};
+        add.f32 %f{ACC2}, %f{ACC2}, %f218;
+        cvt.rn.f32.s32 %f223, %r223;
+        fma.rn.f32 %f{ACC3}, %f223, %f213, %f{ACC3};
+        add.f32 %f{ACC3}, %f{ACC3}, %f219;
+"#;
+
+/// FMA-FORM epilogue variant (micro-experiment 2026-11-21): the min/max
+/// decomposition is regrouped as acc += d8 * fma(D, ax, ay*rs) -- 12 fp ops
+/// per (g, jt) instead of 18 (4 mul + 8 fma vs 10 mul + 4 fma + 4 add),
+/// the cheap restructure the 2026-11-21 status entry recorded ahead of the
+/// f16x2 packed form. DIFFERENT numerics class (fewer roundings: ay*rs
+/// rounds once, then two fused adds) -- mirror-gated before any default
+/// flip; measurement-only until then.
+const JT_BODY_FFMA: &str = r#"
+        add.u32  %r201, %r150, %r60;
+        add.u32  %r201, %r201, JT2048;
+        ld.shared.b32 %r202, [%r201];
+        ld.shared.b32 %r203, [%r201 + 16];
+        shl.b32  %r204, %r25, 7;
+        add.u32  %r205, %r151, %r204;
+        add.u32  %r205, %r205, JT32;
+        ld.shared.v2.b32 {%r206, %r207}, [%r205];
+        mov.b32 {%h10, %h11}, %r206;
+        mov.b32 {%h12, %h13}, %r207;
+        cvt.f32.f16 %f200, %h10;
+        cvt.f32.f16 %f201, %h12;
+        cvt.s32.s16 %r208, %h11;
+        cvt.rn.f32.s32 %f202, %r208;
+        cvt.s32.s16 %r209, %h13;
+        cvt.rn.f32.s32 %f203, %r209;
+        // regrouped min term: m[h][c] = ay_h * rs_c (4 muls)
+        mul.f32 %f210, %f32, %f202;         // m[lo][c0]
+        mul.f32 %f211, %f32, %f203;         // m[lo][c1]
+        mul.f32 %f212, %f33, %f202;         // m[hi][c0]
+        mul.f32 %f213, %f33, %f203;         // m[hi][c1]
+        mov.u32 %r220, 0; mov.u32 %r221, 0;
+        mov.u32 %r222, 0; mov.u32 %r223, 0;
+        mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+            {%r220, %r221, %r222, %r223},
+            {%r70, %r71, %r72, %r73},
+            {%r202, %r203},
+            {%r220, %r221, %r222, %r223};
+        // acc += d8_c * (D*ax_h + m[h][c]) -- 8 fmas, 2 roundings per term
+        cvt.rn.f32.s32 %f220, %r220;
+        fma.rn.f32 %f221, %f220, %f30, %f210;
+        fma.rn.f32 %f{ACC0}, %f200, %f221, %f{ACC0};
+        cvt.rn.f32.s32 %f222, %r221;
+        fma.rn.f32 %f223, %f222, %f30, %f211;
+        fma.rn.f32 %f{ACC1}, %f201, %f223, %f{ACC1};
+        cvt.rn.f32.s32 %f224, %r222;
+        fma.rn.f32 %f225, %f224, %f31, %f212;
+        fma.rn.f32 %f{ACC2}, %f200, %f225, %f{ACC2};
+        cvt.rn.f32.s32 %f226, %r223;
+        fma.rn.f32 %f227, %f226, %f31, %f213;
+        fma.rn.f32 %f{ACC3}, %f201, %f227, %f{ACC3};
+"#;
+
+/// F16X2 packed-POS epilogue variant (micro-experiment 2026-11-21): the
+/// four pos products ax*d8 are computed as TWO mul.f16x2 packed ops (the
+/// d8 pair packed from the ds words, ax duplicated per g) and unpacked
+/// with cvt.f32.f16 -- the paper analysis says the issue count is a wash
+/// (8 muls + 6 cvts + 1 mov vs 10 muls + 2 cvts) unless the f16 pipe
+/// dual-issues under the cvt wall. DIFFERENT numerics class (pos rounds
+/// to f16 once, 2^-11). Measurement-only until mirror-gated.
+/// Uses %br5 (ax_lo dup) / %br6 (ax_hi dup), packed per g by the caller.
+const JT_BODY_H2: &str = r#"
+        add.u32  %r201, %r150, %r60;
+        add.u32  %r201, %r201, JT2048;
+        ld.shared.b32 %r202, [%r201];
+        ld.shared.b32 %r203, [%r201 + 16];
+        shl.b32  %r204, %r25, 7;
+        add.u32  %r205, %r151, %r204;
+        add.u32  %r205, %r205, JT32;
+        ld.shared.v2.b32 {%r206, %r207}, [%r205];
+        mov.b32 {%h10, %h11}, %r206;
+        mov.b32 {%h12, %h13}, %r207;
+        cvt.f32.f16 %f200, %h10;            // d8[c0] f32 (the min chain)
+        cvt.f32.f16 %f201, %h12;            // d8[c1] f32
+        mov.b32 %br0, {%h10, %h12};        // packed d8 pair
+        mul.f16x2 %br1, %br5, %br0;         // {pos[lo][c0], pos[lo][c1]}
+        mul.f16x2 %br2, %br6, %br0;         // {pos[hi][c0], pos[hi][c1]}
+        mov.b32 {%h15, %h16}, %br1;
+        mov.b32 {%h17, %h18}, %br2;
+        cvt.f32.f16 %f210, %h15;
+        cvt.f32.f16 %f211, %h16;
+        cvt.f32.f16 %f212, %h17;
+        cvt.f32.f16 %f213, %h18;
+        cvt.s32.s16 %r208, %h11;
+        cvt.rn.f32.s32 %f202, %r208;
+        cvt.s32.s16 %r209, %h13;
+        cvt.rn.f32.s32 %f203, %r209;
+        mul.f32 %f214, %f200, %f202;        // tb[c0]
+        mul.f32 %f215, %f201, %f203;        // tb[c1]
+        mul.f32 %f216, %f32, %f214;
+        mul.f32 %f217, %f32, %f215;
+        mul.f32 %f218, %f33, %f214;
+        mul.f32 %f219, %f33, %f215;
+        mov.u32 %r220, 0; mov.u32 %r221, 0;
+        mov.u32 %r222, 0; mov.u32 %r223, 0;
+        mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+            {%r220, %r221, %r222, %r223},
+            {%r70, %r71, %r72, %r73},
+            {%r202, %r203},
+            {%r220, %r221, %r222, %r223};
         cvt.rn.f32.s32 %f220, %r220;
         fma.rn.f32 %f{ACC0}, %f220, %f210, %f{ACC0};
         add.f32 %f{ACC0}, %f{ACC0}, %f216;
@@ -279,11 +395,38 @@ const WDM_LOAD: &str = r#"
 
 pub fn ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
-    PTX.get_or_init(|| {
+    PTX.get_or_init(|| build_module(ENTRY, JT_BODY, "", 16))
+}
+
+/// FMA-form epilogue variant (micro-experiment 2026-11-21): entry
+/// `q4k_mmq_batch_sm120_ffma`. Same staging/geometry/split machinery; only
+/// the per-(g, jt) scale-chain op mix changes (12 fp ops vs 18).
+pub fn ptx_ffma() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| build_module(ENTRY_FFMA, JT_BODY_FFMA, "", 16))
+}
+
+/// f16x2 packed-pos epilogue variant (micro-experiment 2026-11-21): entry
+/// `q4k_mmq_batch_sm120_h2`. The four pos products run as two mul.f16x2
+/// packed ops (ax duplicated per g into %br5/%br6, the d8 pair packed
+/// from the ds words); needs %h<24> for the pos unpack.
+pub fn ptx_h2() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| build_module(ENTRY_H2, JT_BODY_H2, G_EXTRA_H2, 24))
+}
+
+/// Per-g setup for the h2 variant: duplicate ax into packed f16x2 operands.
+const G_EXTRA_H2: &str = r#"
+    mov.b32 %br5, {%h7, %h7};              // (ax_lo, ax_lo)
+    mov.b32 %br6, {%h9, %h9};              // (ax_hi, ax_hi)
+"#;
+
+fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> String {
+    {
         let mut jt_bodies = String::new();
         for jt in 0..4usize {
             let acc0 = 40 + jt * 4;
-            let body = JT_BODY
+            let body = jt_body
                 .replace("JT2048", &format!("{}", jt * 2048))
                 .replace("JT32", &format!("{}", jt * 32))
                 .replace("{ACC0}", &format!("{acc0}"))
@@ -338,7 +481,7 @@ pub fn ptx() -> &'static str {
 // extern, sized at launch via cuLaunchKernel's sharedMemBytes.
 .extern .shared .align 16 .b8 dyn_smem[];
 
-.visible .entry q4k_mmq_batch_sm120(
+.visible .entry {entry}(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
     .param .u64 param_act_ds,
@@ -351,10 +494,11 @@ pub fn ptx() -> &'static str {
 )
 {{
     .reg .u32  %r<320>;
+    .reg .b32  %br<8>;
     .reg .u64  %rd<40>;
     .reg .f32  %f<240>;
     .reg .pred %p<32>;
-    .reg .b16  %h<16>;
+    .reg .b16  %h<{h_regs}>;
 
     ld.param.u64 %rd0, [param_weights];
     ld.param.u64 %rd1, [param_act_qs];
@@ -485,7 +629,7 @@ PLANE_DONE:
     cvt.f32.f16 %f32, %h8;                 // ay_lo
     cvt.f32.f16 %f31, %h9;                 // ax_hi
     cvt.f32.f16 %f33, %h14;                // ay_hi
-
+{g_extra}
     // per-thread a_qs / a_ds row bases
     shl.b32 %r152, %r9, 8;
     add.u32 %r150, %r29, %r152;
@@ -569,12 +713,15 @@ RED_DONE:
             wdm_loop = WDM_BODY,
             jt_bodies = jt_bodies,
             wb = wb,
+            entry = entry,
+            h_regs = h_regs,
+            g_extra = g_extra,
         )
         .replace("BUF_W_QS", &BUF_W_QS.to_string())
         .replace("BUF_W_DM", &BUF_W_DM.to_string())
         .replace("BUF_A_QS", &BUF_A_QS.to_string())
         .replace("BUF_A_DS", &BUF_A_DS.to_string())
-    })
+    }
 }
 
 use std::sync::OnceLock;
@@ -600,5 +747,27 @@ mod tests {
         assert_eq!(p.matches("cp.async.ca.shared.global").count(), 3);
         assert_eq!(p.matches("cp.async.commit_group").count(), 1);
         assert!(p.contains(".extern .shared .align 16 .b8 dyn_smem[]"));
+    }
+
+    #[test]
+    fn ptx_variants_generate() {
+        // ffma: same shape, regrouped epilogue (fma count 8 per jt body)
+        let p = ptx_ffma();
+        if let Ok(path) = std::env::var("TEMPURA_DUMP_PTX") {
+            std::fs::write(format!("{path}.ffma"), p).unwrap();
+            let h2 = ptx_h2();
+            std::fs::write(format!("{path}.h2"), h2).unwrap();
+        }
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_ffma"));
+        assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
+        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
+        // 8 fmas per jt body (4 t + 4 acc), no bare add.f32 epilogue
+        assert_eq!(p.matches("fma.rn.f32").count(), 32);
+        // h2: packed pos products, two per jt body
+        let p = ptx_h2();
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_h2"));
+        assert_eq!(p.matches("mul.f16x2").count(), 8); // 2 per jt body
+        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
+        assert!(p.contains("mov.b32 %br5, {%h7, %h7}"));
     }
 }
