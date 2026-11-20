@@ -910,7 +910,6 @@ impl OxideQ6kGemv {
         k_blocks: usize,
         x_qs: &Arc<Tensor<u32>>,
         x_ds: &Arc<Tensor<u32>>,
-        j: usize,
     ) -> Result<()> {
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
