@@ -338,8 +338,15 @@ fn main() {
             // J x S sweep (2026-11-22): the wide-token variants. J is
             // numerics-neutral; the point is the staging amortization.
             println!("  mmq J x S sweep (m=128):");
+            // JONLY="j,s" restricts the sweep to one combo (ncu target).
+            let jonly = std::env::var("JONLY").ok();
             for j in [32usize, 64, 128] {
                 for splits in 1..=8usize.min(k_blocks) {
+                    if let Some(ref f) = jonly {
+                        if f != &format!("{j},{splits}") {
+                            continue;
+                        }
+                    }
                     let mut run = || {
                         oxide
                             .forward_mmq_split_batch_d2d_rows(
