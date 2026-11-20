@@ -771,7 +771,8 @@ fn main() {
                                 }
                             }
                         }
-                    }
+                }
+                }
                     // 4c) q6k mmq J=64/128 wide-token variants (2026-11-22,
                 //     the q4k treatment ported): the per-element op
                 //     sequence is J-independent, so the SAME mirrors gate
