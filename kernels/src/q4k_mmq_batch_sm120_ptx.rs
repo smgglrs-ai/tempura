@@ -62,6 +62,11 @@ pub const ENTRY_H2: &str = "q4k_mmq_batch_sm120_h2";
 /// smem -> 1 CTA/SM; J=64 38912 B -> 2 CTAs/SM; J=32 29696 B -> 3.
 pub const ENTRY_J64: &str = "q4k_mmq_batch_sm120_j64";
 pub const ENTRY_J128: &str = "q4k_mmq_batch_sm120_j128";
+/// Epilogue micro-experiments at J=128 (the 2026-11-21 washes were
+/// measured at J=32 with 3 CTAs/SM; J=128 runs 1 CTA/SM, a different
+/// issue/latency regime -- re-measured 2026-11-22).
+pub const ENTRY_FFMA_J128: &str = "q4k_mmq_batch_sm120_ffma_j128";
+pub const ENTRY_H2_J128: &str = "q4k_mmq_batch_sm120_h2_j128";
 /// Split-reduce entry (same module): out[i] = sum_s partials[s][i], s in
 /// fixed order 0..splits-1 (deterministic combine for grid.z k-splits).
 pub const ENTRY_REDUCE: &str = "q4k_mmq_split_reduce";
@@ -509,6 +514,8 @@ fn build_module() -> String {
     m.push_str(&build_entry(ENTRY_H2, JT_BODY_H2, G_EXTRA_H2, 24, 32));
     m.push_str(&build_entry(ENTRY_J64, JT_BODY, "", 16, 64));
     m.push_str(&build_entry(ENTRY_J128, JT_BODY, "", 16, 128));
+    m.push_str(&build_entry(ENTRY_FFMA_J128, JT_BODY_FFMA, "", 16, 128));
+    m.push_str(&build_entry(ENTRY_H2_J128, JT_BODY_H2, G_EXTRA_H2, 24, 128));
     m.push_str(SPLIT_REDUCE);
     m
 }
@@ -836,13 +843,16 @@ mod tests {
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_j64"));
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_j128"));
         assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
-        // jt bodies per entry: 4 (J=32 default/ffma/h2) + 8 (J=64) + 16 (J=128)
-        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 36);
-        // writebacks: 16+16+16+32+64 + 1 (reduce)
-        assert_eq!(p.matches("st.global.f32").count(), 145);
+        // jt bodies per entry: 4 (J=32 default/ffma/h2) + 8 (J=64)
+        // + 16 (J=128 scalar/ffma/h2)
+        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 68);
+        // writebacks: 16*3 + 32 + 64*3 + 1 (reduce)
+        assert_eq!(p.matches("st.global.f32").count(), 273);
         // single-buffered staging per entry: 3 textual cp.async sites each
-        assert_eq!(p.matches("cp.async.ca.shared.global").count(), 15);
-        assert_eq!(p.matches("cp.async.commit_group").count(), 5);
+        assert_eq!(p.matches("cp.async.ca.shared.global").count(), 21);
+        assert_eq!(p.matches("cp.async.commit_group").count(), 7);
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_ffma_j128"));
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_h2_j128"));
         assert!(p.contains(".extern .shared .align 16 .b8 dyn_smem[]"));
         // J=128 geometry: 57344-byte buffer, 16 token tiles
         assert!(p.contains("// J = 128: 57344 bytes dynamic smem, 16 token tiles"));
@@ -858,13 +868,14 @@ mod tests {
         let p = ptx_ffma();
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_ffma"));
         assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
-        // 8 fmas per jt body; module-wide: default 16 + ffma 32 + h2 16 +
-        // j64 32 + j128 64
-        assert_eq!(p.matches("fma.rn.f32").count(), 160);
+        // 8 fmas per jt body in the ffma entries; module-wide: default 16
+        // + ffma 32 + h2 16 + j64 32 + j128 64 + ffma_j128 128 + h2_j128 64
+        assert_eq!(p.matches("fma.rn.f32").count(), 352);
         // h2: packed pos products, two per jt body
         let p = ptx_h2();
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_h2"));
-        assert_eq!(p.matches("mul.f16x2").count(), 8); // 2 per jt body
+        // h2 entries: 2 packed muls per jt body (4 jt at J=32, 16 at J=128)
+        assert_eq!(p.matches("mul.f16x2").count(), 40);
         assert!(p.contains("mov.b32 %br5, {%h7, %h7}"));
     }
 

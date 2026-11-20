@@ -116,6 +116,10 @@ pub struct OxideQ4kGemv {
     cu_mmq_reduce:              Option<CUfunction>,
     cu_mmq_batch_j64:           Option<CUfunction>,
     cu_mmq_batch_j128:          Option<CUfunction>,
+    cu_mmq_ffma_j128:           Option<CUfunction>,
+    cu_mmq_h2_j128:             Option<CUfunction>,
+    /// 0 = scalar epilogue, 1 = ffma, 2 = h2 (TEMPURA_Q4K_MMQ_EPILOGUE).
+    mmq_epilogue:               u8,
     /// Optional sm_120 stream-K batch GEMM (persistent blocks, grid=(SM_COUNT,1,1)).
     /// Each block processes ceil(N_col_tiles/SM_COUNT) output tiles sequentially,
     /// computing the full K-dimension per tile. 100% SM utilisation regardless of N.
@@ -653,7 +657,8 @@ impl OxideQ4kGemv {
             // -- J=64 / J=128 wide-token variants live in the SAME module
             // (2026-11-22): fetch + set their (larger) dynamic smem limits.
             // Missing entries just disable the variants.
-            let (cu_mmq_batch_j64, cu_mmq_batch_j128) = match cu_mmq_mod {
+            let (cu_mmq_batch_j64, cu_mmq_batch_j128, cu_mmq_ffma_j128, cu_mmq_h2_j128) =
+                match cu_mmq_mod {
                 Some(m) => {
                     let mut get = |entry: &str, smem: usize| -> Option<CUfunction> {
                         let c = CString::new(entry).unwrap_or_default();
@@ -690,9 +695,17 @@ impl OxideQ4kGemv {
                             q4k_mmq_batch_sm120_ptx::ENTRY_J128,
                             q4k_mmq_batch_sm120_ptx::dynamic_smem(128),
                         ),
+                        get(
+                            q4k_mmq_batch_sm120_ptx::ENTRY_FFMA_J128,
+                            q4k_mmq_batch_sm120_ptx::dynamic_smem(128),
+                        ),
+                        get(
+                            q4k_mmq_batch_sm120_ptx::ENTRY_H2_J128,
+                            q4k_mmq_batch_sm120_ptx::dynamic_smem(128),
+                        ),
                     )
                 }
-                None => (None, None),
+                    None => (None, None, None, None),
             };
 
             // -- Load sm_120 stream-K persistent batch GEMM PTX ----------------
@@ -835,7 +848,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_mmq_batch_j64, cu_mmq_batch_j128, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_mmq_batch_j64, cu_mmq_batch_j128, cu_mmq_ffma_j128, cu_mmq_h2_j128, mmq_epilogue: if epilogue_sel == "ffma" { 1 } else if epilogue_sel == "h2" { 2 } else { 0 }, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -2377,10 +2390,12 @@ impl OxideQ4kGemv {
     /// entry, 64/128 = the wide-token entries). Same numerics class; J
     /// only sets the token-tile aspect.
     fn mmq_fn_for_j(&self, j: usize) -> Result<CUfunction> {
-        let f = match j {
-            32 => self.cu_mmq_batch,
-            64 => self.cu_mmq_batch_j64,
-            128 => self.cu_mmq_batch_j128,
+        let f = match (j, self.mmq_epilogue) {
+            (32, _) => self.cu_mmq_batch, // ffma/h2 selected at module load
+            (64, _) => self.cu_mmq_batch_j64,
+            (128, 1) => self.cu_mmq_ffma_j128,
+            (128, 2) => self.cu_mmq_h2_j128,
+            (128, _) => self.cu_mmq_batch_j128,
             _ => {
                 return Err(KernelError::InvalidConfig(format!(
                     "mmq_fn_for_j: J must be 32/64/128; got {j}"
