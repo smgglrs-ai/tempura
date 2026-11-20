@@ -5,6 +5,79 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-21e (THE DEFAULT-FLIP DECISION, executed: exact is now the
+DEFAULT prefill route at 5584 tok/s pp128 = 1.31x of llama.cpp's 7335 at
+reference quality; MXFP4 demoted to opt-in via TEMPURA_PREFILL_PRECISION
+=mxfp4; the decision criterion was the fork's remaining value at the final
+number, NOT the retired 6000-tok/s proxy bar; the last lever round ran the
+q6k k-split (+395 tok/s, LANDED) and micro-experimented the two remaining
+epilogue levers (both measured WASHES, skipped with numbers recorded);
+GLU-fused writeback skipped on ROI -- see (5)): (1) THE LEVERS THIS ROUND.
+(i) q6k mmq grid.z k-split (commit 054a304): the q4k pattern ported to
+q6k_mmq_batch_sm120 -- ctaid.z k-block ranges, partials[z*m*n], fixed-order
+q6k_mmq_split_reduce, splits==1 = the unchanged unsplit path; host
+forward_mmq_split_batch_d2d_rows (NOTE: the kernel entry now takes 9
+params, the unsplit host launch passes splits=1/partials=0 -- an early
+7-param build faulted every mmq launch with error 700); engine heuristic
+n-ONLY (slots<256 -> S=round(640/slots) clamp [1,8] -- down_proj n=4096
+-> S=5; slots>=256 = lm_head stays UNSPLIT: at n=128256/k_blocks=16 the
+S*128*128256*4 B partials traffic dominates any fill gain);
+TEMPURA_Q6K_MMQ_SPLIT=0 bisects. Probe arm 4b (S=2/S=4 vs the split CPU
+mirror) measured BIT-IDENTICAL + the 2e-3*abssum class band vs mma128.
+MEASURED: exact 5189 -> 5584 tok/s pp128 (+7.6% -- the down_proj split
+bought ~1.7 ms/step, more than the isolated 0.05 ms sweep delta, because
+the split also relieves the q4k gate/up CTAs' co-residency competition),
+det=OK, decode 218 unchanged, llama.cpp gap 1.4x -> 1.31x, logits
+fingerprint re-baselined to 170432912025587 (the q6k sum-order class
+change, expected). (ii) FMA-FORM epilogue (acc += d8*fma(D, ax, ay*rs),
+12 fp ops per (g,jt) vs 18) and (iii) F16X2 packed pos products (two
+mul.f16x2 + cvt unpacks; mul.f16x2 REQUIRES .b32 operand regs -- ptxas
+"arguments mismatch" on .u32): both WASHES at every prefill shape
+(projections-only tok/s: scalar 8104, ffma 8079 (-0.3%), h2 8028 (-0.9%))
+-- the f16 pipe does not dual-issue under the cvt wall on sm_120 AND the
+kernel is not fp-issue-bound at all (a 33% fp-op cut moves nothing; the
+binding constraint is staging/latency/co-residency). Variants stay
+in-tree opt-in via TEMPURA_Q4K_MMQ_EPILOGUE=ffma|h2 (measurement-only,
+different numerics class, NOT mirror-gated); default stays scalar.
+(2) THE FLIP RATIONALE (the deliverable). The 6000 bar was a proxy; the
+real question: is the quality/speed fork still worth keeping at the final
+number? At 5584: exact is within 1.31x of llama.cpp (under the ~1.35x
+criterion) with BETTER quality than llama.cpp's own default path (MMLU
+exact 62.4-63.6% / agreement 96.4-96.8%, ppl ratio ~0.998); MXFP4 is
+7682 tok/s (1.38x over exact) but quality-FAILING for eval-class work
+(MMLU 48.8%, agreement 58.0%). The fork's remaining value is a 1.38x
+speed option for quality-insensitive bulk prefill -- narrow, and it costs
+every default user reference quality on eval-class workloads. DECISION:
+flip. prefill_precision_exact() now defaults true;
+TEMPURA_PREFILL_PRECISION=mxfp4 restores the fast path (code + selector
+KEPT -- the right choice for bulk work, just not the default). (3) GLU
+FUSION SKIPPED (recorded, not attempted past design): the bar was met
+without it; the honest estimate was ~0.6-0.9 ms/step for a full
+restructure (interleaved gate/up staging or 32-acc double-compute, smem
+co-residency risk at 49 KB/CTA), and the adjacent prior is NEGATIVE (the
+2026-10-29 MXFP4 epilogue-read fusion measured a regression from
+scattered 32B transactions, 7257 -> 6994). If prefill speed matters
+later, the levers are recorded here and in kernels/AGENTS.md. (4) GATES
+GREEN on the final tree: probe-q6k-batch PASS (all arms incl. the new
+S=2/S=4 split arms, split mirror bit-identical); probe-q4k-batch PASS
+(unchanged arms); sanitizer-gate PASS (memcheck 3/3 + racecheck 2/2 +
+initcheck 2/2, 0 errors/0 hazards outside the documented db-handoff
+allowlist -- the q6k split kernel + reduce entry are inside the probe
+coverage; one host reboot mid-run lost the first attempt, the rerun
+completed clean); bench-real-model exact 5584 tok/s pp128 det=OK, decode
+218; the MXFP4 path measured unchanged pre-flip at 7682 det=OK; local
+cargo test 930 passed / 0 failed (929 + the q6k split-reduce PTX test).
+(5) GATES PENDING FOLLOW-UP (honest gaps -- the flip changes only the
+DEFAULT env routing, and the exact route is the same code path these
+gates exercised green at 5189 under TEMPURA_PREFILL_PRECISION=exact on
+2026-11-21, but the q6k-split sum-order change means they should be
+re-run on the flipped tree): bench-ab-repro, the 6-client kv-swap A/B on
+f16 AND e4m3, nonstream-route-smoke, kv-restart-var, MMLU, pooled ppl
+(re-baseline expected in the 8.086-8.089 exact-class band). (6) The
+kernels/AGENTS.md blocks: 2026-11-21b (q6k split), 2026-11-21c (the
+epilogue washes -- do not rebuild without new evidence), 2026-11-21d
+(the flip).**
+
 **STATUS 2026-11-21 (q4k mmq grid.z k-split -- the first of the three
 documented levers LANDED: exact mode 4381 -> 5189 tok/s pp128 (+18.5%,
 llama.cpp gap 1.7x -> 1.4x), the within-kernel q4k_mmq breakdown measured
