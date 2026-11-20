@@ -104,10 +104,17 @@ solo/repeat/interleave/composition IDENTICAL; nonstream-route-smoke
 PASS; kv-restart-var PASS; 6-client kv-swap A/B PASS on f16 AND e4m3
 (byte-identical, eviction exercised); sanitizer-gate PASS (memcheck +
 racecheck + initcheck, 0 hazards -- the J variants + padded strides are
-inside the probe coverage); MMLU exact [PENDING AT WRITE TIME -- fill
-in]; pooled ppl [PENDING]; local cargo test 931 passed / 0 failed
+inside the probe coverage); MMLU exact GPU 62.4% (CPU 61.6%, llama 62.4%), GPU/CPU choice
+agreement 96.8% (gate 95%) PASS; pooled ppl 8 chunks 8.0877
+(exact-class baseline 8.0863-8.0909, GPU/CPU ratio 0.9979, 0 NaN)
+PASS; local cargo test 931 passed / 0 failed
 (929 + the new PTX/geometry tests; --exclude tempura-bench-gpu on the
-CPU-only laptop per the documented caveat). (8) WHAT REMAINS (the honest
+CPU-only laptop per the documented caveat). (7b) THE FINAL PROFILE (nsys, the after-column of the table): per step
+q4k_mmq_j64 9.32 ms (was 15.78; llama 8.5 incl. fixups), q6k_mmq_j64
+2.00 + reduce 0.08 (was 3.33; llama 1.9), lm_head-last-row 0.44, flash
+attn 1.40 (llama 0.99), quantize 0.83 (llama 0.34), rope 0.26 (0.18),
+norms 0.21, add 0.16, silu 0.18 (0.24 -- we win), q4k split-reduce 0.79.
+(8) WHAT REMAINS (the honest
 differential, recorded for the next round, all sub-1 ms/step): quantize
 0.79 vs 0.34 ms (their quantize_mmq_q8_1 is ~2.3x faster per launch --
 vectorization/layout), attention 1.39 vs 0.99 (our paged flash attn vs
