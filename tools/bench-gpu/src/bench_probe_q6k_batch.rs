@@ -137,6 +137,22 @@ fn rne_f16_bits(v: f32) -> u16 {
 /// per-element abssum (Σ|D*P| terms) for the cancellation-aware class
 /// band gate.
 fn q6k_mmq_cpu_mirror(x: &[f32], packed: &[u32], m: usize, n: usize, k_blocks: usize) -> (Vec<f32>, Vec<f64>) {
+    q6k_mmq_cpu_mirror_split(x, packed, m, n, k_blocks, 1)
+}
+
+/// Split variant: models `forward_mmq_split_batch_d2d_rows` exactly -- each
+/// split z accumulates its k-block range in (kb, gw, sub) order into a
+/// private f32 partial, then the reduce entry adds the partials in ascending
+/// z (out = 0.0 + p0 + p1 + ...). splits == 1 reduces to the unsplit mirror.
+#[allow(clippy::too_many_arguments)]
+fn q6k_mmq_cpu_mirror_split(
+    x: &[f32],
+    packed: &[u32],
+    m: usize,
+    n: usize,
+    k_blocks: usize,
+    splits: usize,
+) -> (Vec<f32>, Vec<f64>) {
     let k = k_blocks * 256;
     let gpr = k / 32;
     let mut q8 = vec![0i8; m * k];
@@ -167,9 +183,13 @@ fn q6k_mmq_cpu_mirror(x: &[f32], packed: &[u32], m: usize, n: usize, k_blocks: u
     tempura_kernels::inference_pool::par_run(n, |ne0, ne1| {
         for t in 0..m {
             for ne in ne0..ne1 {
-                let mut acc = 0f32;
-                let mut ab = 0f64;
-                for kb in 0..k_blocks {
+                let mut partials = vec![0f32; splits];
+                for (z, part) in partials.iter_mut().enumerate() {
+                    let kb_lo = z * k_blocks / splits;
+                    let kb_hi = (z + 1) * k_blocks / splits;
+                    let mut acc = 0f32;
+                    let mut ab = 0f64;
+                    for kb in kb_lo..kb_hi {
                     let base = (ne * k_blocks + kb) * 53;
                     let d = f32::from_bits(packed[base]);
                     let mut ax = [0f32; 16];
@@ -216,9 +236,17 @@ fn q6k_mmq_cpu_mirror(x: &[f32], packed: &[u32], m: usize, n: usize, k_blocks: u
                         ab += (d2 as f32 * q).abs() as f64;
                     }
                 }
+                *part = acc;
+                    unsafe {
+                        *abs_ptr.add(t * n + ne) += ab;
+                    }
+                }
+                let mut acc = 0f32;
+                for &p in &partials {
+                    acc = acc + p;
+                }
                 unsafe {
                     *out_ptr.add(t * n + ne) = acc;
-                    *abs_ptr.add(t * n + ne) = ab;
                 }
             }
         }
@@ -666,6 +694,84 @@ fn main() {
                         if bad_rows == 0 { "OK" } else { "MISMATCH" },
                         if bitwise { "bit-identical" } else { "ulp-level delta" },
                     );
+
+                    // 4b) q6k mmq grid.z k-split (the 2026-11-21 port of
+                    //     the q4k lever): same per-split op sequence,
+                    //     partials combined in ascending z by the reduce
+                    //     entry. Gates: ulp-level vs the split mirror
+                    //     (1e-5) + the class band vs the mma128 reference
+                    //     (2e-3*abssum -- the split changes only the f32
+                    //     sum order).
+                    if oxide.has_mmq_split_batch() && k_blocks >= 2 {
+                        for splits in [2usize, 4usize] {
+                            if splits > k_blocks {
+                                continue;
+                            }
+                            let partials = Arc::new(
+                                api::zeros::<f32>(&[splits * m * n])
+                                    .sync_on(&stream)
+                                    .expect("q6k split partials alloc"),
+                            );
+                            let out = Arc::new(
+                                api::zeros::<f32>(&[m * n])
+                                    .sync_on(&stream)
+                                    .expect("out alloc"),
+                            );
+                            let res = oxide.forward_mmq_split_batch_d2d_rows(
+                                &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds, splits,
+                                &partials,
+                            );
+                            match res {
+                                Err(e) => {
+                                    any_fail = true;
+                                    println!(
+                                        "  {label} m={m} mmq-split S={splits}: FAIL (launch error: {e})"
+                                    );
+                                }
+                                Ok(()) => {
+                                    let got = out
+                                        .to_host_vec()
+                                        .sync_on(&stream)
+                                        .expect("out download");
+                                    let (mirror, mirror_abssum) = q6k_mmq_cpu_mirror_split(
+                                        &x_host, &packed_host, m, n, k_blocks, splits,
+                                    );
+                                    let mut mirror_max = 0f64;
+                                    for i in 0..m * n {
+                                        let d =
+                                            (got[i] - mirror[i]).abs() / mirror[i].abs().max(1.0);
+                                        mirror_max = mirror_max.max(d as f64);
+                                    }
+                                    if mirror_max > 1e-5 {
+                                        any_fail = true;
+                                    }
+                                    let mut max_rel = 0f64;
+                                    let mut bad_rows = 0;
+                                    for r in 0..m {
+                                        let mut row_max = 0f64;
+                                        for c in 0..n {
+                                            let a = got[r * n + c];
+                                            let b = ref_got[r * n + c];
+                                            let gate = 2e-3 * mirror_abssum[r * n + c] + 1e-6;
+                                            let rel = (a - b).abs() as f64 / gate;
+                                            row_max = row_max.max(rel);
+                                        }
+                                        if row_max > 1.0 {
+                                            bad_rows += 1;
+                                        }
+                                        max_rel = max_rel.max(row_max);
+                                    }
+                                    if bad_rows > 0 {
+                                        any_fail = true;
+                                    }
+                                    println!(
+                                        "  {label} m={m} mmq-split S={splits}: {} (vs mma128 max err/gate {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 2e-3*abssum; vs split mirror: max rel {mirror_max:.3e}, gate 1e-5)",
+                                        if bad_rows == 0 { "OK" } else { "MISMATCH" },
+                                    );
+                                }
+                            }
+                        }
+                    }
                 } else {
                     any_fail = true;
                     println!("  {label} m={m} mmq: FAIL (kernel not loaded)");

@@ -553,17 +553,37 @@ impl OxideQ4kGemv {
             // class from mma128 (f16 (d*sc)/(dmin*mv) products); gated by
             // the mmq probe arm (CPU mirror, bit-level) + MMLU/ppl.
             let mut cu_mmq_mod: Option<CUmodule> = None;
+            // Epilogue micro-experiment selector (2026-11-21): ffma =
+            // regrouped min/max chain (12 fp ops per (g,jt) vs 18), h2 =
+            // f16x2 packed pos products. Both are MEASUREMENT-ONLY variants
+            // (different numerics class, not yet mirror-gated); default is
+            // the scalar chain.
+            let epilogue_sel = std::env::var("TEMPURA_Q4K_MMQ_EPILOGUE").unwrap_or_default();
+            let (mmq_ptx, mmq_entry_name): (&str, String) = match epilogue_sel.as_str() {
+                "ffma" => (
+                    q4k_mmq_batch_sm120_ptx::ptx_ffma(),
+                    q4k_mmq_batch_sm120_ptx::ENTRY_FFMA.to_string(),
+                ),
+                "h2" => (
+                    q4k_mmq_batch_sm120_ptx::ptx_h2(),
+                    q4k_mmq_batch_sm120_ptx::ENTRY_H2.to_string(),
+                ),
+                _ => (
+                    q4k_mmq_batch_sm120_ptx::ptx(),
+                    q4k_mmq_batch_sm120_ptx::ENTRY.to_string(),
+                ),
+            };
             let mmq_fns: (Option<CUfunction>, Option<CUfunction>) = if !sm120_disabled
                 && caps.cc() >= q4k_mmq_batch_sm120_ptx::MIN_CC
             {
-                let ptx_cstr = CString::new(q4k_mmq_batch_sm120_ptx::ptx()).unwrap_or_default();
+                let ptx_cstr = CString::new(mmq_ptx).unwrap_or_default();
                 let mut m = std::mem::MaybeUninit::uninit();
                 let rc = unsafe {
                     cuda_core::sys::cuModuleLoadData(m.as_mut_ptr(), ptx_cstr.as_ptr() as *const _)
                 };
                 if rc == CUDA_SUCCESS {
                     let m = unsafe { m.assume_init() };
-                    let entry = CString::new(q4k_mmq_batch_sm120_ptx::ENTRY).unwrap_or_default();
+                    let entry = CString::new(mmq_entry_name.clone()).unwrap_or_default();
                     let mut f = std::mem::MaybeUninit::uninit();
                     let rc2 = unsafe {
                         cuda_core::sys::cuModuleGetFunction(f.as_mut_ptr(), m, entry.as_ptr())

@@ -444,6 +444,9 @@ struct NoGraphBatchScratch {
     /// fixed-order reduce entry in the same stream (no host sync needed
     /// between them).
     q4k_mmq_partials: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
+    /// Q6K mmq grid.z k-split partials [splits * m * n] f32, keyed
+    /// (splits, m, n) -- same contract as the q4k pool.
+    q6k_mmq_partials: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
     /// Q4K batch compact activation rows [m * k] f32, keyed (slot, k, m) --
     /// the row-strided GEMM input repacked to contiguous rows when
     /// row_stride != k. Fully overwritten by D->D row copies in stream order.
@@ -6073,16 +6076,58 @@ impl CutileGpuModel {
                 && n % 128 == 0
                 && std::env::var("TEMPURA_Q6K_PREFILL_KERNEL").as_deref() != Ok("mma128");
             if use_mmq {
-                oxide6
-                    .forward_mmq_batch_d2d_rows(
-                        a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
-                    )
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "q6k mmq prefill batch {weight_name} rows {row}..{}: {e}",
-                            row + rows
+                // 2026-11-21 q6k k-split (the q4k pattern ported): down_proj
+                // n=4096 runs (4096/128)*4 = 128 CTAs on 170 SMs = 75% fill
+                // (the fishtank sweep measured the shape 0.206 -> 0.158 ms
+                // at S=5). Rule: slots < 256 -> S = round(640/slots), clamp
+                // [1, 8]; slots >= 256 stays UNSPLIT -- unlike the q4k side,
+                // the q6k large-n shape is lm_head (n=128256, k_blocks=16)
+                // where the partials traffic (S * 128 * 128256 * 4 B)
+                // dominates any fill gain. S depends ONLY on n (composition
+                // invariance; the 128-row chunk is fixed).
+                // TEMPURA_Q6K_MMQ_SPLIT=0 bisects off (S=1 everywhere).
+                let slots = (n / 128) * 4;
+                let want_split = oxide6.has_mmq_split_batch()
+                    && std::env::var("TEMPURA_Q6K_MMQ_SPLIT")
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                let splits = if want_split && slots < 256 {
+                    let target = (640f64 / slots as f64).round() as usize;
+                    target.clamp(1, 8).min(dw.k_blocks)
+                } else {
+                    1
+                };
+                let launch = |rows: usize| {
+                    if splits > 1 {
+                        let partials = {
+                            let mut pool = self.nograph.borrow_mut();
+                            pool.q6k_mmq_partials
+                                .entry((splits, chunk_rows_max, n))
+                                .or_insert_with(|| {
+                                    Arc::new(
+                                        api::zeros::<f32>(&[splits * chunk_rows_max * n])
+                                            .sync_on(stream)
+                                            .expect("gemm_q6k_prefill_mma128: mmq partials alloc"),
+                                    )
+                                })
+                                .clone()
+                        };
+                        oxide6.forward_mmq_split_batch_d2d_rows(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                            splits, &partials,
                         )
-                    });
+                    } else {
+                        oxide6.forward_mmq_batch_d2d_rows(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                        )
+                    }
+                };
+                launch(rows).unwrap_or_else(|e| {
+                    panic!(
+                        "q6k mmq prefill batch {weight_name} rows {row}..{}: {e}",
+                        row + rows
+                    )
+                });
             } else {
                 oxide6
                     .forward_mma128_batch_d2d_rows(
