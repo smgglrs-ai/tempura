@@ -772,12 +772,7 @@ fn main() {
                             }
                         }
                     }
-                } else {
-                    any_fail = true;
-                    println!("  {label} m={m} mmq: FAIL (kernel not loaded)");
-                }
-
-                // 4c) q6k mmq J=64/128 wide-token variants (2026-11-22,
+                    // 4c) q6k mmq J=64/128 wide-token variants (2026-11-22,
                 //     the q4k treatment ported): the per-element op
                 //     sequence is J-independent, so the SAME mirrors gate
                 //     them (ulp-level vs the mirror, class band vs mma128).
@@ -857,6 +852,9 @@ fn main() {
                             }
                         }
                     }
+                } else {
+                    any_fail = true;
+                    println!("  {label} m={m} mmq: FAIL (kernel not loaded)");
                 }
             }
         }
