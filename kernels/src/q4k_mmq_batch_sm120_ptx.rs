@@ -339,7 +339,7 @@ STAGE_DS_LOOP:
         setp.ge.u32 %p16, %r95, {iters};
         @%p16 bra STAGE_DS_DONE;
         shr.u32 %r110, %r5, 3;
-        shl.b32 %r240, %r95, 8;             // 32*i tokens
+        shl.b32 %r240, %r95, 5;             // 32*i tokens
         add.u32 %r110, %r110, %r240;
         and.b32 %r111, %r5, 7;
         add.u32 %r112, %r40, %r110;        // global row
