@@ -546,6 +546,31 @@ Qwen3.6-27B weights** — see open work.
       bulk prefill). The 6000-tok/s proxy bar was retired in favor of
       the real criterion -- the fork's remaining value at the final
       number -- see the 2026-11-21 status entry for the full rationale.
+      2026-11-22 (differential-profiling round, PARITY ACHIEVED: exact
+      7962 tok/s pp128 = 1.08x of llama.cpp's 7335, decode 216, det=OK --
+      and now FASTER than the opt-in MXFP4 path at 7783, retiring the
+      quality/speed fork outright for Q4_K_M): the per-kernel nsys
+      differential vs llama.cpp (same GPU/model, their checkout 418f905
+      at 9752 tok/s) showed our q4k_mmq 2.3x slower per shape on gate/up
+      -- TWO root causes fixed: (a) J=32 token tiles restage the weights
+      4x at m=128 (llama stages once per 128-token tile) -> new
+      q4k_mmq_batch_sm120_j64/_j128 entries (J numerics-neutral, probe
+      bit-identical to the same mirrors; n-only (J,S) table in the
+      engine: n<=1024 (64,8), n<=4096 (64,5), else (64,5);
+      TEMPURA_Q4K_MMQ_J bisects); (b) ncu on the j128 kernel: 6-way
+      AVERAGE BANK CONFLICTS on the shared fragment loads (78% of
+      wavefronts; all smem row strides were multiples of 32 words) ->
+      PADDED STRIDES w_qs 128->144 B, a_qs 256->272 B, w_dm 32->36 B
+      (lane gid*4+tid4's word lands in a distinct bank; per-shape gains
+      gate/up 0.117->0.091 ms, q/o 0.045->0.031, k 0.018->0.014). Both
+      treatments PORTED to q6k_mmq (w_raw 192->196, w_dsc 32->36;
+      q6k stack +0.9 ms/step; probe arm 4c bit-identical to the mirror).
+      The epilogue restructures RE-MEASURED at J=128 (ffma/h2 entries
+      q4k_mmq_batch_sm120_ffma_j128/_h2_j128): STILL washes -- the
+      kernel is bound by smem/load latency, not fp issue. Remaining
+      recorded deltas vs llama's per-step: quantize 0.79 vs 0.34 ms,
+      attention 1.39 vs 0.99, lm_head-last-row 0.43, rope 0.27 vs 0.18.
+      TEMPURA_Q6K_MMQ_J bisects the q6k J.
       2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
       docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
       the ds word's high bits (llama.cpp's Q8_1 ds layout; all other

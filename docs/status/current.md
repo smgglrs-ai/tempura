@@ -5,6 +5,120 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-22 (differential-profiling round: the llama.cpp prefill
+gap CLOSED -- exact mode 5618 -> 7962 tok/s pp128 (1.42x, vs llama.cpp's
+7335 reference we are now 1.08x FASTER at reference quality, and faster
+than our own opt-in MXFP4 path at 7783, retiring the quality/speed fork
+for Q4_K_M), the DIFFERENTIAL PROFILE TABLE built (the round's method:
+per-kernel nsys on BOTH engines, same GPU + model, delta per kernel --
+not lever-guessing), TWO root causes found and fixed (the J=32 weight
+restaging + a 6-way smem bank-conflict on the fragment loads), both
+fixes PORTED to q6k_mmq, the ffma/h2 epilogue washes re-measured at
+J=128 (still washes), all gates green incl. the flip-tree pending-gate
+battery): (1) THE METHOD AND THE TABLE. llama.cpp was rebuilt with CUDA
+on fishtank (build-cuda, checkout 418f905; llama-bench pp128 = 9752 +/-
+525 tok/s -- the NEWER checkout is faster than the recorded 7335
+reference; all gap ratios below cite the 7335 record) and profiled with
+nsys alongside our bench-real-model exact. Per 128-token step, GPU kernel
+time: llama 12.9 ms vs ours 22.9. Per kernel pair (llama / ours-before):
+Q4K GEMMs 8.5 / 15.8 (q 29 / 66 us, k 9.8 / 15, v 21 / 15, o 21 / 66,
+gate 61 / 142, up 60 / 142 -- llama splits each mul_mat_q into kernel +
+stream_k_fixup ~10 us); Q6K down 1.9 / 3.3 (incl. our lm_head-last-row
+kpar8_db 0.43); flash attn 0.99 / 1.39; quantize 0.34 / 0.79 (both
+quantize per projection, 7/layer); silu 0.24 / 0.16 (we WIN); norms
+0.21 / 0.23; add 0.16 / 0.17; rope 0.18 / 0.27. SUM OF DELTAS ~ 9.5 ms
+~= the 9.4 ms gap; ~75% of it in the Q4K GEMMs, concentrated in gate/up
+(+6.4 ms) and q/o (+2.0). (2) ROOT CAUSE A -- THE J (TOKENS-PER-CTA)
+TILE ASPECT. llama's mmq config at pp128 is I=128 neurons x J=128 TOKENS
+per CTA: the weight tile is staged into smem ONCE per 128 tokens. Ours
+was J=32 -> grid.y=4 CTAs each restage the same weights (4x the cp.async
+smem traffic + 4x the per-k-block CTA barriers; the k-split grid.z
+multiplies the CTAs further). The 2026-11-19 J=64 failure was grid-tail,
+which the k-split now fixes. LANDED: the kernel generator is
+J-parameterized (kernels/src/q4k_mmq_batch_sm120_ptx.rs build_entry:
+jt unroll J/8, J/2 accumulators, a_qs staging J/4 words/thread, a_ds
+staging looped J/32 with a J-dependent group stride, token_base =
+blockIdx.y << log2 J, per-J dynamic smem) with new entries
+q4k_mmq_batch_sm120_j64 (38912 -> 42496 B after (3)) and _j128 (57344 ->
+61952); the host loads them from the SAME module and forward_mmq_* take
+a j param. J IS NUMERICS-NEUTRAL (per-element accumulation order is
+J-independent; the probe's existing CPU mirrors gate the J arms
+UNCHANGED -- measured ulp-level/bitm-identical) and the engine picks
+(J, S) by n ONLY (composition invariance; the (J,S) table is calibrated
+on a J x S sweep in bench-probe-prefill-tc: n<=1024 -> (64,8), n<=4096
+-> (64,5), else (64,5); TEMPURA_Q4K_MMQ_J=32|64|128 bisects,
+TEMPURA_Q4K_MMQ_SPLIT=0 still bisects S). MEASURED (isolated per-shape):
+gate/up 0.146 -> 0.117 (J=128 S=3), q/o 0.049 -> 0.045 (J=64 S=5); END-
+TO-END 5618 -> 6209 tok/s, logits fingerprint UNCHANGED (the S values
+per shape did not change in this step). (3) ROOT CAUSE B -- SMEM BANK
+CONFLICTS (the one the wash-measurements could not see). ncu on the j128
+gate/up kernel: 6-way AVERAGE conflicts on the shared loads, 29.1M
+conflicts / 37.2M wavefronts = 78% (est. speedup 67%), stalls 43% on
+MIO-scoreboard latency, 96 regs, 0 spills. CAUSE: every smem row stride
+was a multiple of 32 words (w_qs 128 B/neuron, a_qs 256 B/token, w_dm
+32 B/neuron), so the 8 neurons/tokens a warp's fragment load touches all
+map to the SAME bank set (bank = (row*32 + off) % 32 = off). FIX: PADDED
+STRIDES -- w_qs 144 B (bank = 4*neuron + j*8 + tid4 = lane + const, a
+per-instruction BIJECTION), a_qs 272 B (bank = 4*token + lane offset),
+w_dm 36 B; pad words are never written or read. MEASURED (isolated):
+gate/up 0.117 -> 0.091, q/o 0.045 -> 0.031 (BEATS llama's 0.030+0.010
+fixup), k 0.018 -> 0.014, down-shape 0.155 -> 0.088. END-TO-END 6209 ->
+7350 tok/s = PARITY with the 7335 reference; fingerprint shifted
+(expected: the gate/up S changed 3 -> 5 with the table update -- the
+same validated split sum-order class, probe-gated). (4) THE Q6K PORT:
+the same two treatments in q6k_mmq_batch_sm120_ptx.rs (J entries
+q6k_mmq_batch_sm120_j64/_j128; padded strides w_raw 192 -> 196 B
+(bank = 17*neuron + c, distinct for the 8 fragment neurons), w_dsc
+32 -> 36 B, a_qs 272 B; forward_mmq_* take j; engine default J=64,
+TEMPURA_Q6K_MMQ_J bisects). Probe arm 4c (j64/j128 x S=1/2 at every
+shape x m): BIT-IDENTICAL to the unchanged CPU mirrors (0.000e0).
+MEASURED: 7350 -> 7962 tok/s end-to-end (the J=32 bisect with padding
+alone: 7513 -- the padding bought +163, J=64 +449); logits fingerprint
+UNCHANGED from (3). THE MXFP4 OPT-IN PATH MEASURED UNCHANGED at 7783
+tok/s det=OK -- exact is now the fastest AND the reference-quality
+route; the fork's remaining value for Q4_K_M is zero (the selector stays
+for quality-insensitive bulk prefill / other formats). (5) THE WASHES
+RE-MEASURED AT J=128: the 2026-11-21c epilogue restructures (ffma 12-op
+chain, h2 f16x2 packed pos) were washes at J=32 with 3 CTAs/SM; at
+J=128/1 CTA the issue regime differs, so they were rebuilt as
+q4k_mmq_batch_sm120_ffma_j128/_h2_j128 entries and swept: STILL WASHES
+(gate/up J=128 S=3: scalar 0.117, ffma 0.118, h2 0.119 ms). The kernel
+is bound by smem/load latency (the ncu stall profile), not fp issue --
+consistent with (3) being the win. (6) BRING-UP BUGS (both caught by the
+gates, both one-liners): the a_ds staging loop's token stride was
+i*256 instead of i*32 (shl 8 vs shl 5 -- silent smem OOB writes past the
+buffer at J>=64, compute-sanitizer memcheck localized it to
+q4k_mmq_batch_sm120_j128+0x3b40 = the ds zfill STS with BUF_A_DS base;
+at J=64 it corrupted nothing visible and PASSED the m=1 probe -- the
+probe now covers all J arms at every m, and J=128's m=128 arm would
+have caught it too); the q6k host loader tuple arity / a stray j param
+on forward_mma128 (compile errors). (7) GATES ALL GREEN ON THE FINAL
+TREE (this battery doubles as the 2026-11-21d default-flip validation
+the previous entry left pending -- it ran on the flipped tree at 7962):
+probe-q4k-batch PASS (all mmq arms incl. the NEW 5c J=64/128 x S=1/2
+arms at every shape x m, ulp-level vs the unchanged mirrors + class
+band vs kpar); probe-q6k-batch PASS (arm 4c bit-identical to the
+mirror); bench-real-model exact 7962 tok/s pp128 det=OK (fingerprint
+170452491303490), decode 216; mxfp4 opt-in 7783 det=OK; bench-ab-repro
+solo/repeat/interleave/composition IDENTICAL; nonstream-route-smoke
+PASS; kv-restart-var PASS; 6-client kv-swap A/B PASS on f16 AND e4m3
+(byte-identical, eviction exercised); sanitizer-gate PASS (memcheck +
+racecheck + initcheck, 0 hazards -- the J variants + padded strides are
+inside the probe coverage); MMLU exact [PENDING AT WRITE TIME -- fill
+in]; pooled ppl [PENDING]; local cargo test 931 passed / 0 failed
+(929 + the new PTX/geometry tests; --exclude tempura-bench-gpu on the
+CPU-only laptop per the documented caveat). (8) WHAT REMAINS (the honest
+differential, recorded for the next round, all sub-1 ms/step): quantize
+0.79 vs 0.34 ms (their quantize_mmq_q8_1 is ~2.3x faster per launch --
+vectorization/layout), attention 1.39 vs 0.99 (our paged flash attn vs
+their flash_attn_ext_f16 + fixup), lm_head-last-row 0.43 (kpar8_db at
+714 GB/s), rope 0.27 vs 0.18. vs the CURRENT llama.cpp checkout
+(9752 tok/s) we are at 0.82x -- the remaining levers above are worth
+~1.5-2 ms/step (~8500-9000 tok/s optimistic). (9) THE DECISION: exact
+stays the DEFAULT prefill route at 1.08x the 7335 record; the mmq J=64
+variants + padded strides are the default kernels; the MXFP4 selector
+stays opt-in.**
+
 **STATUS 2026-11-21e (THE DEFAULT-FLIP DECISION, executed: exact is now the
 DEFAULT prefill route at 5584 tok/s pp128 = 1.31x of llama.cpp's 7335 at
 reference quality; MXFP4 demoted to opt-in via TEMPURA_PREFILL_PRECISION
