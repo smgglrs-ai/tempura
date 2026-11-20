@@ -114,6 +114,8 @@ pub struct OxideQ4kGemv {
     cu_mmq_batch_module:        Option<CUmodule>,
     cu_mmq_batch:               Option<CUfunction>,
     cu_mmq_reduce:              Option<CUfunction>,
+    cu_mmq_batch_j64:           Option<CUfunction>,
+    cu_mmq_batch_j128:          Option<CUfunction>,
     /// Optional sm_120 stream-K batch GEMM (persistent blocks, grid=(SM_COUNT,1,1)).
     /// Each block processes ceil(N_col_tiles/SM_COUNT) output tiles sequentially,
     /// computing the full K-dimension per tile. 100% SM utilisation regardless of N.
@@ -648,6 +650,50 @@ impl OxideQ4kGemv {
                 let (a, b) = mmq_fns;
                 (a, b)
             };
+            // -- J=64 / J=128 wide-token variants live in the SAME module
+            // (2026-11-22): fetch + set their (larger) dynamic smem limits.
+            // Missing entries just disable the variants.
+            let (cu_mmq_batch_j64, cu_mmq_batch_j128) = match cu_mmq_mod {
+                Some(m) => {
+                    let mut get = |entry: &str, smem: usize| -> Option<CUfunction> {
+                        let c = CString::new(entry).unwrap_or_default();
+                        let mut f = std::mem::MaybeUninit::uninit();
+                        let rc = unsafe {
+                            cuda_core::sys::cuModuleGetFunction(f.as_mut_ptr(), m, c.as_ptr())
+                        };
+                        if rc != CUDA_SUCCESS {
+                            return None;
+                        }
+                        let f = unsafe { f.assume_init() };
+                        let rc_attr = unsafe {
+                            cuda_core::sys::cuFuncSetAttribute(
+                                f,
+                                cuda_core::sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                smem as i32,
+                            )
+                        };
+                        if rc_attr != CUDA_SUCCESS {
+                            eprintln!(
+                                "oxide-gemv-q4k: cuFuncSetAttribute(smem {smem}) failed for \
+                                  {entry} (rc={rc_attr})"
+                            );
+                            return None;
+                        }
+                        Some(f)
+                    };
+                    (
+                        get(
+                            q4k_mmq_batch_sm120_ptx::ENTRY_J64,
+                            q4k_mmq_batch_sm120_ptx::dynamic_smem(64),
+                        ),
+                        get(
+                            q4k_mmq_batch_sm120_ptx::ENTRY_J128,
+                            q4k_mmq_batch_sm120_ptx::dynamic_smem(128),
+                        ),
+                    )
+                }
+                None => (None, None),
+            };
 
             // -- Load sm_120 stream-K persistent batch GEMM PTX ----------------
             // Grid (SM_COUNT,1,1): all SMs busy simultaneously; each block processes
@@ -789,7 +835,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_mmq_batch_j64, cu_mmq_batch_j128, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -2327,7 +2373,28 @@ impl OxideQ4kGemv {
         Ok(())
     }
 
-    /// MMQ-structured batch GEMM (q4k_mmq_batch_sm120): 128 neurons x 32
+    /// Resolve the mmq kernel function for a J variant (32 = the default
+    /// entry, 64/128 = the wide-token entries). Same numerics class; J
+    /// only sets the token-tile aspect.
+    fn mmq_fn_for_j(&self, j: usize) -> Result<CUfunction> {
+        let f = match j {
+            32 => self.cu_mmq_batch,
+            64 => self.cu_mmq_batch_j64,
+            128 => self.cu_mmq_batch_j128,
+            _ => {
+                return Err(KernelError::InvalidConfig(format!(
+                    "mmq_fn_for_j: J must be 32/64/128; got {j}"
+                )))
+            }
+        };
+        f.ok_or_else(|| {
+            KernelError::InvalidConfig(format!(
+                "mmq_fn_for_j: J={j} variant not loaded"
+            ))
+        })
+    }
+
+    /// MMQ-structured batch GEMM (q4k_mmq_batch_sm120): 128 neurons x J
     /// tokens per CTA, both operands staged through shared memory per
     /// k-block, weight scale products pre-extracted as f16 (llama.cpp mmq
     /// class). m <= 128, requires n % 128 == 0. NOT bit-identical to
@@ -2345,7 +2412,9 @@ impl OxideQ4kGemv {
         k_blocks: usize,
         x_qs: &Arc<Tensor<u32>>,
         x_ds: &Arc<Tensor<u32>>,
+        j: usize,
     ) -> Result<()> {
+        let mma_fn = self.mmq_fn_for_j(j)?;
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
                 "forward_mmq_batch_d2d_rows: m must be in 1..=128; got {m}"
@@ -2376,14 +2445,10 @@ impl OxideQ4kGemv {
                 out.size()
             )));
         }
-        let mma_fn = match self.cu_mmq_batch {
-            Some(f) => f,
-            None => return Err(KernelError::InvalidConfig("mmq_batch not loaded".into())),
-        };
         let cu_stream = self.stream.cu_stream();
         self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
 
-        // Launch MMQ kernel: grid (n/128, ceil(m/32), 1), block (256, 1, 1).
+        // Launch MMQ kernel: grid (n/128, ceil(m/J), 1), block (256, 1, 1).
         {
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
@@ -2406,14 +2471,14 @@ impl OxideQ4kGemv {
                 &partials_ptr as *const _ as *mut c_void,
             ];
             let grid_x = n_u32 / 128;
-            let grid_y = (m_u32 + 31) / 32; // 32 tokens per CTA (J=32)
+            let grid_y = ((m_u32 as usize + j - 1) / j) as u32; // J tokens per CTA
             let block_dim = 256u32;
             unsafe {
                 launch_kernel(
                     mma_fn,
                     (grid_x, grid_y, 1),
                     (block_dim, 1, 1),
-                    q4k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32, // dynamic smem (2 buffers)
+                    q4k_mmq_batch_sm120_ptx::dynamic_smem(j) as u32,
                     cu_stream,
                     &mut params,
                 )
@@ -2454,10 +2519,11 @@ impl OxideQ4kGemv {
         x_ds: &Arc<Tensor<u32>>,
         splits: usize,
         partials: &Arc<Tensor<f32>>,
+        j: usize,
     ) -> Result<()> {
         if splits <= 1 {
             return self.forward_mmq_batch_d2d_rows(
-                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds,
+                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j,
             );
         }
         if m == 0 || m > 128 {
@@ -2481,10 +2547,7 @@ impl OxideQ4kGemv {
                 partials.size()
             )));
         }
-        let mma_fn = match self.cu_mmq_batch {
-            Some(f) => f,
-            None => return Err(KernelError::InvalidConfig("mmq_batch not loaded".into())),
-        };
+        let mma_fn = self.mmq_fn_for_j(j)?;
         let reduce_fn = match self.cu_mmq_reduce {
             Some(f) => f,
             None => {
@@ -2537,14 +2600,14 @@ impl OxideQ4kGemv {
                 &pt_ptr as *const _ as *mut c_void,
             ];
             let grid_x = n_u32 / 128;
-            let grid_y = (m_u32 + 31) / 32;
+            let grid_y = ((m_u32 as usize + j - 1) / j) as u32;
             let block_dim = 256u32;
             unsafe {
                 launch_kernel(
                     mma_fn,
                     (grid_x, grid_y, splits_u32),
                     (block_dim, 1, 1),
-                    q4k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32,
+                    q4k_mmq_batch_sm120_ptx::dynamic_smem(j) as u32,
                     cu_stream,
                     &mut params,
                 )

@@ -94,7 +94,20 @@ enum Variant {
     Mma128w,
     Mmq,
     MmqSplit,
+    MmqJ64,
+    MmqJ128,
+    MmqJ64Split,
+    MmqJ128Split,
     Streamk,
+}
+
+/// Tokens per CTA for the mmq variants (J is numerics-neutral).
+fn variant_j(v: Variant) -> usize {
+    match v {
+        Variant::MmqJ64 | Variant::MmqJ64Split => 64,
+        Variant::MmqJ128 | Variant::MmqJ128Split => 128,
+        _ => 32,
+    }
 }
 
 fn main() {
@@ -133,6 +146,10 @@ fn main() {
         (Variant::Mma128w, "mma128w_batch"),
         (Variant::Mmq, "mmq_batch"),
         (Variant::MmqSplit, "mmq_split"),
+        (Variant::MmqJ64, "mmq_j64"),
+        (Variant::MmqJ128, "mmq_j128"),
+        (Variant::MmqJ64Split, "mmq_j64_split"),
+        (Variant::MmqJ128Split, "mmq_j128_split"),
         (Variant::Streamk, "streamk_batch"),
     ];
 
@@ -167,7 +184,7 @@ fn main() {
                 // Q8_1 scratch for one chunk (16 rows for the 16-row-cap
                 // kernels, 128 for mma128; same sizing as the engine's
                 // gemm_q4k_prefill_batch).
-                let scr_rows = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
+                let scr_rows = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit | Variant::MmqJ64 | Variant::MmqJ128 | Variant::MmqJ64Split | Variant::MmqJ128Split) { 128 } else { CHUNK };
                 let x_qs = Arc::new(
                     api::zeros::<u32>(&[scr_rows * k / 4])
                         .sync_on(&stream)
@@ -184,7 +201,7 @@ fn main() {
                     let mut row = 0usize;
                     // The mma128 variant chunks at 128 rows (weights once
                     // per launch); the others at the kernels' 16-row cap.
-                    let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
+                    let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit | Variant::MmqJ64 | Variant::MmqJ128 | Variant::MmqJ64Split | Variant::MmqJ128Split) { 128 } else { CHUNK };
                     while row < m_total {
                         let rows = (m_total - row).min(chunk);
                         let res = match variant {
@@ -200,13 +217,15 @@ fn main() {
                             Variant::Mma128w => oxide.forward_mma128w_batch_d2d_rows(
                                 &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
                             ),
-                            Variant::Mmq => oxide.forward_mmq_batch_d2d_rows(
-                                &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
-                            ),
-                            Variant::MmqSplit => {
+                            Variant::Mmq | Variant::MmqJ64 | Variant::MmqJ128 => oxide
+                                .forward_mmq_batch_d2d_rows(
+                                    &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                                    variant_j(*variant),
+                                ),
+                            Variant::MmqSplit | Variant::MmqJ64Split | Variant::MmqJ128Split => {
                                 // engine fill heuristic: S so that
-                                // (n/128)*ceil(m/32)*S >= 2*SM_COUNT, capped 8
-                                let slots = (n / 128) * m_total.div_ceil(32);
+                                // (n/128)*ceil(m/J)*S >= 2*SM_COUNT, capped 8
+                                let slots = (n / 128) * m_total.div_ceil(variant_j(*variant));
                                 let sms = 170usize;
                                 let splits = if slots < 2 * sms {
                                     ((2 * sms).div_ceil(slots.max(1))).clamp(1, 8).min(k_blocks)
@@ -224,7 +243,7 @@ fn main() {
                                     .clone();
                                 oxide.forward_mmq_split_batch_d2d_rows(
                                     &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
-                                    splits, &partials,
+                                    splits, &partials, variant_j(*variant),
                                 )
                             }
                             Variant::Streamk => oxide.forward_streamk_batch_d2d_rows(
@@ -253,7 +272,7 @@ fn main() {
                 // Effective weight bandwidth: the chunk loop re-reads the
                 // full weight matrix ceil(m_total/16) times.
                 let weight_bytes = (n * k_blocks * 144) as f64;
-                let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit) { 128 } else { CHUNK };
+                let chunk = if matches!(*variant, Variant::Mma128 | Variant::Mma128w | Variant::Mmq | Variant::MmqSplit | Variant::MmqJ64 | Variant::MmqJ128 | Variant::MmqJ64Split | Variant::MmqJ128Split) { 128 } else { CHUNK };
                 let re_reads = m_total.div_ceil(chunk) as f64;
                 let gbps = weight_bytes * re_reads / (ms / 1e3) / 1e9;
                 println!(
@@ -299,7 +318,7 @@ fn main() {
                     oxide
                         .forward_mmq_split_batch_d2d_rows(
                             &x, 0, &packed, &out, 0, m_total, n, k_blocks, &x_qs, &x_ds, splits,
-                            &partials,
+                            &partials, 32,
                         )
                         .expect("split run");
                 };
@@ -315,6 +334,38 @@ fn main() {
                 stream.synchronize().expect("timed sync");
                 let ms = start.elapsed().as_secs_f64() * 1e3 / iters as f64;
                 println!("    S={splits}: {ms:9.3} ms");
+            }
+            // J x S sweep (2026-11-22): the wide-token variants. J is
+            // numerics-neutral; the point is the staging amortization.
+            println!("  mmq J x S sweep (m=128):");
+            for j in [32usize, 64, 128] {
+                for splits in 1..=8usize.min(k_blocks) {
+                    let mut run = || {
+                        oxide
+                            .forward_mmq_split_batch_d2d_rows(
+                                &x, 0, &packed, &out, 0, m_total, n, k_blocks, &x_qs, &x_ds,
+                                splits, &partials, j,
+                            )
+                            .expect("split run");
+                    };
+                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut run));
+                    if ok.is_err() {
+                        println!("    J={j} S={splits}: FAILED");
+                        continue;
+                    }
+                    for _ in 0..3 {
+                        run();
+                        stream.synchronize().expect("warmup sync");
+                    }
+                    let iters = 30;
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        run();
+                    }
+                    stream.synchronize().expect("timed sync");
+                    let ms = start.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                    println!("    J={j:3} S={splits}: {ms:9.3} ms");
+                }
             }
         }
     }

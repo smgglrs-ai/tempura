@@ -6395,6 +6395,21 @@ impl CutileGpuModel {
                     a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
                 ),
                 PrefillQ4kKernel::Mmq => {
+                    // 2026-11-22 differential round: J = tokens per CTA.
+                    // The nsys differential vs llama.cpp (same GPU, same
+                    // model) showed our J=32 kernel 2.3x slower per shape
+                    // than their mul_mat_q on gate/up -- their config at
+                    // pp128 stages the weights ONCE per 128-token tile
+                    // (J=128) while J=32 re-stages them 4x (grid.y=4).
+                    // J is numerics-neutral (per-element accumulation
+                    // order is J-independent) and chosen by n ONLY
+                    // (composition invariance).
+                    // TEMPURA_Q4K_MMQ_J=32|64|128 selects (bisect).
+                    let j = std::env::var("TEMPURA_Q4K_MMQ_J")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| matches!(v, 32 | 64 | 128))
+                        .unwrap_or(32);
                     // 2026-11-21 grid-fill lever: small-n shapes leave the
                     // machine idle (q/o_proj 128 CTAs = 75% of 170 SMs,
                     // k_proj 32 CTAs = 19% -- it runs at the same latency as
@@ -6407,14 +6422,15 @@ impl CutileGpuModel {
                     // smaller final chunk must not change the sum order of
                     // the same token's row (composition invariance, the
                     // bench-ab-repro composition gate). slots are computed
-                    // at the fixed 128-row chunk the exact route uses.
-                    // Calibrated on the fishtank S-sweep (2026-11-21):
-                    // k_proj n=1024 (32 slots) best at S=8 (0.059 ->
+                    // at the fixed 128-row chunk the exact route uses, for
+                    // the actual J (grid.y = 128/J).
+                    // Calibrated on the fishtank S-sweep (2026-11-21,
+                    // J=32): k_proj n=1024 (32 slots) best at S=8 (0.059 ->
                     // 0.019 ms), q/o n=4096 (128 slots) best at S=5
                     // (0.060 -> 0.049), gate/up n=14336 (448 slots) best at
                     // S=3 (0.157 -> 0.146). Rule: slots < 256 ->
                     // S = round(640/slots); else S = 3; clamped [1, 8].
-                    let slots = (n / 128) * 4;
+                    let slots = (n / 128) * (128 / j);
                     let want_split = oxide.has_mmq_split_batch()
                         && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
                             .map(|v| v != "0")
@@ -6445,11 +6461,11 @@ impl CutileGpuModel {
                         };
                         oxide.forward_mmq_split_batch_d2d_rows(
                             a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
-                            splits, &partials,
+                            splits, &partials, j,
                         )
                     } else {
                         oxide.forward_mmq_batch_d2d_rows(
-                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds, j,
                         )
                     }
                 }

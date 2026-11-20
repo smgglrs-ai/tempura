@@ -52,17 +52,42 @@ pub const ENTRY: &str = "q4k_mmq_batch_sm120";
 pub const ENTRY_FFMA: &str = "q4k_mmq_batch_sm120_ffma";
 /// f16x2 packed-pos epilogue variant entry (micro-experiment 2026-11-21).
 pub const ENTRY_H2: &str = "q4k_mmq_batch_sm120_h2";
+/// Wide token-tile variants (2026-11-22 differential round): the SAME
+/// kernel with J = 64 / 128 tokens per CTA so the weight staging, the
+/// per-k-block barriers and the A-fragment unpack amortize over 2x / 4x
+/// more token tiles (llama.cpp's mmq runs J=128 at pp128 -- its per-shape
+/// advantage over our J=32 is ~2.3x on gate/up). Numerics are UNCHANGED
+/// (the per-element op sequence and accumulation order are J-independent:
+/// J only sets which tokens a CTA owns). J=128 needs 57344 B of dynamic
+/// smem -> 1 CTA/SM; J=64 38912 B -> 2 CTAs/SM; J=32 29696 B -> 3.
+pub const ENTRY_J64: &str = "q4k_mmq_batch_sm120_j64";
+pub const ENTRY_J128: &str = "q4k_mmq_batch_sm120_j128";
 /// Split-reduce entry (same module): out[i] = sum_s partials[s][i], s in
 /// fixed order 0..splits-1 (deterministic combine for grid.z k-splits).
 pub const ENTRY_REDUCE: &str = "q4k_mmq_split_reduce";
-/// Dynamic shared memory: one 29696-byte staging buffer.
+/// Dynamic shared memory: the J=32 staging buffer (29696 bytes).
 pub const DYNAMIC_SMEM: usize = 29696;
-/// Buffer layout offsets (bytes).
+/// Buffer layout offsets (bytes) -- J=32 layout.
 pub const BUF_W_QS: u32 = 0;
 pub const BUF_W_DM: u32 = 16384;
 pub const BUF_A_QS: u32 = 20480;
 pub const BUF_A_DS: u32 = 28672;
 pub const BUF_BYTES: u32 = 29696;
+
+/// Per-J geometry: (smem bytes, a_qs offset, a_ds offset). The weight
+/// sides are J-independent (16 KiB raw nibbles + 4 KiB f16 scales per
+/// k-block); the activation sides scale with J.
+pub fn geometry(j: usize) -> (usize, u32, u32) {
+    assert!(j == 32 || j == 64 || j == 128, "J must be 32/64/128");
+    let a_qs = BUF_A_QS;
+    let a_ds = BUF_A_QS + (j * 256) as u32;
+    (20480 + j * 288, a_qs, a_ds)
+}
+
+/// Dynamic smem bytes for a J variant.
+pub fn dynamic_smem(j: usize) -> usize {
+    geometry(j).0
+}
 
 /// One token-tile mma body (jt = 0..4, unrolled by the generator).
 const JT_BODY: &str = r#"
@@ -72,7 +97,7 @@ const JT_BODY: &str = r#"
         ld.shared.b32 %r202, [%r201];
         ld.shared.b32 %r203, [%r201 + 16];
         // ds pair (tokens 2*tid4, 2*tid4+1 of the tile), group-major
-        shl.b32  %r204, %r25, 7;           // g*128 (32 tokens per group)
+        shl.b32  %r204, %r25, DSGSHIFT;
         add.u32  %r205, %r151, %r204;
         add.u32  %r205, %r205, JT32;
         ld.shared.v2.b32 {%r206, %r207}, [%r205];
@@ -130,7 +155,7 @@ const JT_BODY_FFMA: &str = r#"
         add.u32  %r201, %r201, JT2048;
         ld.shared.b32 %r202, [%r201];
         ld.shared.b32 %r203, [%r201 + 16];
-        shl.b32  %r204, %r25, 7;
+        shl.b32  %r204, %r25, DSGSHIFT;
         add.u32  %r205, %r151, %r204;
         add.u32  %r205, %r205, JT32;
         ld.shared.v2.b32 {%r206, %r207}, [%r205];
@@ -182,7 +207,7 @@ const JT_BODY_H2: &str = r#"
         add.u32  %r201, %r201, JT2048;
         ld.shared.b32 %r202, [%r201];
         ld.shared.b32 %r203, [%r201 + 16];
-        shl.b32  %r204, %r25, 7;
+        shl.b32  %r204, %r25, DSGSHIFT;
         add.u32  %r205, %r151, %r204;
         add.u32  %r205, %r205, JT32;
         ld.shared.v2.b32 {%r206, %r207}, [%r205];
@@ -231,6 +256,8 @@ const JT_BODY_H2: &str = r#"
 "#;
 
 /// cp.async staging of k-block `%r21` into the buffer at base `%r28`.
+/// AQITER = a_qs words per thread (J/4); the ds section is appended per-J
+/// by `stage_ds` (g-major layout with a J-dependent group stride).
 const STAGE_BODY: &str = r#"
         // ---- w_qs raw words: thread t handles words t + i*256 (16 each)
         mov.u32 %r95, 0;
@@ -261,10 +288,10 @@ STAGE_W_LOOP:
         bra STAGE_W_LOOP;
 STAGE_W_DONE:
 
-        // ---- a_qs words: thread t handles words t + i*256 (8 each)
+        // ---- a_qs words: thread t handles words t + i*256 (J/4 each)
         mov.u32 %r95, 0;
 STAGE_A_LOOP:
-        setp.ge.u32 %p13, %r95, 8;
+        setp.ge.u32 %p13, %r95, AQITER;
         @%p13 bra STAGE_A_DONE;
         mad.lo.u32 %r101, %r95, 256, %r5;  // w
         shr.u32 %r102, %r101, 6;           // token (local)
@@ -294,12 +321,29 @@ STAGE_A_NEXT:
         add.u32 %r95, %r95, 1;
         bra STAGE_A_LOOP;
 STAGE_A_DONE:
+"#;
 
-        // ---- a_ds word: thread t: token = t>>3, g = t&7
+/// a_ds staging (J tokens x 8 groups, one u32 word each): thread t covers
+/// words t + i*256, i in 0..J/32 -- token = (t>>3) + 32*i, g = t&7. The
+/// smem layout is group-major with a J-dependent group stride (J*4 bytes),
+/// matching the JT_BODY read (DSGSHIFT).
+fn stage_ds(j: usize) -> String {
+    let gstride = j * 4;
+    let iters = j / 32;
+    let mut s = String::new();
+    s.push_str(&format!(
+        r#"
+        // ---- a_ds words: J/32 = {iters} per thread, group-major
+        mov.u32 %r95, 0;
+STAGE_DS_LOOP:
+        setp.ge.u32 %p16, %r95, {iters};
+        @%p16 bra STAGE_DS_DONE;
         shr.u32 %r110, %r5, 3;
+        shl.b32 %r240, %r95, 8;             // 32*i tokens
+        add.u32 %r110, %r110, %r240;
         and.b32 %r111, %r5, 7;
         add.u32 %r112, %r40, %r110;        // global row
-        shl.b32 %r116, %r111, 7;           // g*128 (32 tokens per group)
+        shl.b32 %r116, %r111, {log2g};     // g*{gstride} ({j} tokens per group)
         shl.b32 %r117, %r110, 2;           // token*4
         add.u32 %r116, %r116, %r117;
         add.u32 %r116, %r116, %r28;
@@ -316,11 +360,21 @@ STAGE_A_DONE:
         cvt.u64.u32 %rd13, %r114;
         add.u64 %rd13, %rd13, %rd2;
         cp.async.ca.shared.global [%r116], [%rd13], 4;
-        bra STAGE_DS_DONE;
+        bra STAGE_DS_NEXT;
 STAGE_DS_ZFILL:
         st.shared.b32 [%r116], %r113;
+STAGE_DS_NEXT:
+        add.u32 %r95, %r95, 1;
+        bra STAGE_DS_LOOP;
 STAGE_DS_DONE:
-"#;
+"#,
+        iters = iters,
+        gstride = gstride,
+        j = j,
+        log2g = log2(gstride),
+    ));
+    s
+}
 
 /// w_dm computation + store into the buffer at base `%r28`, from the
 /// header words in %r160 (d|dmin), %r161 (s0), %r162 (s1), %r163 (s2).
@@ -395,15 +449,14 @@ const WDM_LOAD: &str = r#"
 
 pub fn ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
-    PTX.get_or_init(|| build_module(ENTRY, JT_BODY, "", 16))
+    PTX.get_or_init(build_module)
 }
 
 /// FMA-form epilogue variant (micro-experiment 2026-11-21): entry
 /// `q4k_mmq_batch_sm120_ffma`. Same staging/geometry/split machinery; only
 /// the per-(g, jt) scale-chain op mix changes (12 fp ops vs 18).
 pub fn ptx_ffma() -> &'static str {
-    static PTX: OnceLock<String> = OnceLock::new();
-    PTX.get_or_init(|| build_module(ENTRY_FFMA, JT_BODY_FFMA, "", 16))
+    ptx()
 }
 
 /// f16x2 packed-pos epilogue variant (micro-experiment 2026-11-21): entry
@@ -411,8 +464,7 @@ pub fn ptx_ffma() -> &'static str {
 /// packed ops (ax duplicated per g into %br5/%br6, the d8 pair packed
 /// from the ds words); needs %h<24> for the pos unpack.
 pub fn ptx_h2() -> &'static str {
-    static PTX: OnceLock<String> = OnceLock::new();
-    PTX.get_or_init(|| build_module(ENTRY_H2, JT_BODY_H2, G_EXTRA_H2, 24))
+    ptx()
 }
 
 /// Per-g setup for the h2 variant: duplicate ax into packed f16x2 operands.
@@ -421,14 +473,115 @@ const G_EXTRA_H2: &str = r#"
     mov.b32 %br6, {%h9, %h9};              // (ax_hi, ax_hi)
 "#;
 
-fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> String {
+fn build_module() -> String {
+    let header = r#".version 8.7
+.target sm_120
+.address_size 64
+
+// q4k_mmq_batch_sm120 -- llama.cpp-mmq-structured Q4K x Q8_1 batch GEMM.
+// 128 neurons x J tokens per CTA, cp.async smem staging (single buffer),
+// raw-weight staging with load-time nibble unpack, f16 scale
+// pre-extraction. Grid (n/128, ceil(m/J)), block (256,1,1).
+//
+// Entries: the J=32 default (+ the ffma/h2 epilogue micro-experiments,
+// J=32) and the J=64/J=128 wide-token variants (2026-11-22): J only sets
+// the token-tile aspect -- the per-element op sequence and accumulation
+// order are J-independent, so all entries share one numerics class and
+// one CPU probe mirror.
+//
+// Parameters:
+//   param_weights:  *const u32 -- native GGUF Q4K [N * k_blocks * 36 u32]
+//   param_act_qs:   *const u32 -- Q8_1 activations [M * k_blocks * 64 u32]
+//   param_act_ds:   *const u32 -- Q8_1 ds words    [M * k_blocks * 8 u32]
+//   param_out:      *mut f32   -- output [M * N]
+//   param_n:        u32        -- N (multiple of 128)
+//   param_k_blocks: u32        -- K = k_blocks * 256
+//   param_m:        u32        -- M (actual rows, <= 128)
+//   param_splits:   u32        -- grid.z k-split count (1 = unsplit)
+//   param_partials: *mut f32   -- [splits * M * N] (split path)
+// Dynamic shared memory (the staging buffer); module-scope extern, sized
+// at launch via cuLaunchKernel's sharedMemBytes (J-dependent).
+.extern .shared .align 16 .b8 dyn_smem[];
+"#;
+    let mut m = String::from(header);
+    m.push_str(&build_entry(ENTRY, JT_BODY, "", 16, 32));
+    m.push_str(&build_entry(ENTRY_FFMA, JT_BODY_FFMA, "", 16, 32));
+    m.push_str(&build_entry(ENTRY_H2, JT_BODY_H2, G_EXTRA_H2, 24, 32));
+    m.push_str(&build_entry(ENTRY_J64, JT_BODY, "", 16, 64));
+    m.push_str(&build_entry(ENTRY_J128, JT_BODY, "", 16, 128));
+    m.push_str(SPLIT_REDUCE);
+    m
+}
+
+fn log2(x: usize) -> usize {
+    usize::BITS as usize - 1 - x.leading_zeros() as usize
+}
+
+/// Deterministic split combine (shared by every entry): out[i] =
+/// sum_s partials[s*total + i], s in fixed order 0..splits-1 (f32 adds,
+/// ascending s). Grid (ceil(total/256),1,1), block (256,1,1).
+const SPLIT_REDUCE: &str = r#"
+.visible .entry q4k_mmq_split_reduce(
+    .param .u64 param_out,
+    .param .u64 param_partials,
+    .param .u32 param_total,
+    .param .u32 param_splits
+)
+{
+    .reg .u32  %r<12>;
+    .reg .u64  %rd<12>;
+    .reg .f32  %f<4>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd0, [param_out];
+    ld.param.u64 %rd1, [param_partials];
+    ld.param.u32 %r2,  [param_total];
+    ld.param.u32 %r3,  [param_splits];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r4, 256, %r5;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra RED_DONE;
+
+    cvt.u64.u32 %rd2, %r6;
+    shl.b64 %rd2, %rd2, 2;
+
+    mov.u32 %r8, 0;
+    mov.f32 %f0, 0f00000000;
+RED_LOOP:
+    setp.ge.u32 %p2, %r8, %r3;
+    @%p2 bra RED_FIN;
+    mul.wide.u32 %rd3, %r8, %r2;
+    shl.b64 %rd3, %rd3, 2;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd4, %rd4, %rd2;
+    ld.global.f32 %f1, [%rd4];
+    add.f32 %f0, %f0, %f1;
+    add.u32 %r8, %r8, 1;
+    bra RED_LOOP;
+RED_FIN:
+    add.u64 %rd5, %rd0, %rd2;
+    st.global.f32 [%rd5], %f0;
+RED_DONE:
+    ret;
+}
+"#;
+
+/// Build one `.visible .entry` for a J variant. All register/predicate
+/// names are entry-local (each entry is an independent function scope).
+fn build_entry(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize, j: usize) -> String {
+    let (smem_bytes, buf_a_qs, buf_a_ds) = geometry(j);
+    let jt_count = j / 8;
+    let acc_count = j / 2;
     {
         let mut jt_bodies = String::new();
-        for jt in 0..4usize {
+        for jt in 0..jt_count {
             let acc0 = 40 + jt * 4;
             let body = jt_body
                 .replace("JT2048", &format!("{}", jt * 2048))
                 .replace("JT32", &format!("{}", jt * 32))
+                .replace("DSGSHIFT", &format!("{}", log2(j * 4)))
                 .replace("{ACC0}", &format!("{acc0}"))
                 .replace("{ACC1}", &format!("{}", acc0 + 1))
                 .replace("{ACC2}", &format!("{}", acc0 + 2))
@@ -436,7 +589,7 @@ fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> Str
             jt_bodies.push_str(&body);
         }
         let mut acc_zero = String::new();
-        for i in 0..16 {
+        for i in 0..acc_count {
             acc_zero.push_str(&format!("    mov.f32 %f{}, 0f00000000;\n", 40 + i));
         }
         // writeback: token = token_base + jt*8 + 2*tid4 + (i&1);
@@ -445,7 +598,7 @@ fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> Str
         // partials[z*m*n + token*n + neuron]; a fixed-order reduce kernel
         // combines them. splits == 1 keeps the direct out store.
         let mut wb = String::new();
-        for jt in 0..4usize {
+        for jt in 0..jt_count {
             for i in 0..4usize {
                 let acc = 40 + jt * 4 + i;
                 wb.push_str(&format!(
@@ -458,29 +611,13 @@ fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> Str
                 ));
             }
         }
+        let stage = STAGE_BODY
+            .replace("AQITER", &format!("{}", j / 4))
+            .to_string();
         format!(
-            r#".version 8.7
-.target sm_120
-.address_size 64
-
-// q4k_mmq_batch_sm120 -- llama.cpp-mmq-structured Q4K x Q8_1 batch GEMM.
-// 128 neurons x 32 tokens per CTA, cp.async smem staging (single buffer,
-// 3 CTAs/SM), raw-weight staging with load-time nibble unpack, f16 scale
-// pre-extraction. Grid (n/128, ceil(m/32)), block (256,1,1), dynamic smem
-// 29696 bytes.
-//
-// Parameters:
-//   param_weights:  *const u32 -- native GGUF Q4K [N * k_blocks * 36 u32]
-//   param_act_qs:   *const u32 -- Q8_1 activations [M * k_blocks * 64 u32]
-//   param_act_ds:   *const u32 -- Q8_1 ds words    [M * k_blocks * 8 u32]
-//   param_out:      *mut f32   -- output [M * N]
-//   param_n:        u32        -- N (multiple of 128)
-//   param_k_blocks: u32        -- K = k_blocks * 256
-//   param_m:        u32        -- M (actual rows, <= 128)
-// Dynamic shared memory (the 29696-byte staging buffer); module-scope
-// extern, sized at launch via cuLaunchKernel's sharedMemBytes.
-.extern .shared .align 16 .b8 dyn_smem[];
-
+            r#"
+// J = {j}: {smem_bytes} bytes dynamic smem, {jt_count} token tiles,
+// {acc_count} f32 accumulators/thread.
 .visible .entry {entry}(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
@@ -535,11 +672,11 @@ fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> Str
     and.b32 %r8, %r19, 3;          // tid4 = lane & 3
     shr.u32 %r9, %r19, 2;          // gid = lane >> 2 (0..7)
 
-    // n_base = blockIdx.x * 128; token_base = blockIdx.y * 32
+    // n_base = blockIdx.x * 128; token_base = blockIdx.y * J
     mov.u32 %r3, %ctaid.x;
     shl.b32 %r4, %r3, 7;           // n_base
     mov.u32 %r39, %ctaid.y;
-    shl.b32 %r40, %r39, 5;         // token_base = blockIdx.y * 32
+    shl.b32 %r40, %r39, {tblog2};          // token_base = blockIdx.y * J
 
     // per-thread constants:
     // neuron_rel = w*16 + gid
@@ -556,7 +693,7 @@ fn build_module(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize) -> Str
     // n_base + neuron_rel (writeback neuron base)
     add.u32 %r281, %r4, %r10;
 
-    // ---- zero the 16 f32 accumulators --------------------------------------
+    // ---- zero the f32 accumulators ----------------------------------------
 {acc_zero}
 
     // ---- outer loop: k_blocks (this CTA's split range) ---------------------
@@ -571,6 +708,7 @@ KB_LOOP:
 
     mov.u32 %r28, 0;                       // single buffer
 {stage_loop}
+{stage_ds}
     cp.async.commit_group;
 {wdm_load}
 {wdm_loop}
@@ -657,70 +795,27 @@ KB_DONE:
 
     ret;
 }}
-
-// Deterministic split combine: out[i] = sum_s partials[s*total + i], s in
-// fixed order 0..splits-1 (f32 adds, ascending s). Grid
-// (ceil(total/256),1,1), block (256,1,1).
-.visible .entry q4k_mmq_split_reduce(
-    .param .u64 param_out,
-    .param .u64 param_partials,
-    .param .u32 param_total,
-    .param .u32 param_splits
-)
-{{
-    .reg .u32  %r<12>;
-    .reg .u64  %rd<12>;
-    .reg .f32  %f<4>;
-    .reg .pred %p<4>;
-
-    ld.param.u64 %rd0, [param_out];
-    ld.param.u64 %rd1, [param_partials];
-    ld.param.u32 %r2,  [param_total];
-    ld.param.u32 %r3,  [param_splits];
-
-    mov.u32 %r4, %ctaid.x;
-    mov.u32 %r5, %tid.x;
-    mad.lo.u32 %r6, %r4, 256, %r5;
-    setp.ge.u32 %p1, %r6, %r2;
-    @%p1 bra RED_DONE;
-
-    cvt.u64.u32 %rd2, %r6;
-    shl.b64 %rd2, %rd2, 2;
-
-    mov.u32 %r8, 0;
-    mov.f32 %f0, 0f00000000;
-RED_LOOP:
-    setp.ge.u32 %p2, %r8, %r3;
-    @%p2 bra RED_FIN;
-    mul.wide.u32 %rd3, %r8, %r2;
-    shl.b64 %rd3, %rd3, 2;
-    add.u64 %rd4, %rd1, %rd3;
-    add.u64 %rd4, %rd4, %rd2;
-    ld.global.f32 %f1, [%rd4];
-    add.f32 %f0, %f0, %f1;
-    add.u32 %r8, %r8, 1;
-    bra RED_LOOP;
-RED_FIN:
-    add.u64 %rd5, %rd0, %rd2;
-    st.global.f32 [%rd5], %f0;
-RED_DONE:
-    ret;
-}}
 "#,
             acc_zero = acc_zero,
             wdm_load = WDM_LOAD,
-            stage_loop = STAGE_BODY,
+            stage_loop = stage,
+            stage_ds = stage_ds(j),
             wdm_loop = WDM_BODY,
             jt_bodies = jt_bodies,
             wb = wb,
             entry = entry,
             h_regs = h_regs,
             g_extra = g_extra,
+            tblog2 = log2(j),
+            j = j,
+            jt_count = jt_count,
+            acc_count = acc_count,
+            smem_bytes = smem_bytes,
         )
         .replace("BUF_W_QS", &BUF_W_QS.to_string())
         .replace("BUF_W_DM", &BUF_W_DM.to_string())
-        .replace("BUF_A_QS", &BUF_A_QS.to_string())
-        .replace("BUF_A_DS", &BUF_A_DS.to_string())
+        .replace("BUF_A_QS", &buf_a_qs.to_string())
+        .replace("BUF_A_DS", &buf_a_ds.to_string())
     }
 }
 
@@ -737,37 +832,47 @@ mod tests {
             std::fs::write(&path, p).unwrap();
         }
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120"));
-        // split-reduce entry in the same module
+        // J variants + split-reduce entry in the same module
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_j64"));
+        assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_j128"));
         assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
-        // 4 jt bodies (the g loop is a runtime loop: 8 g x 4 jt at runtime)
-        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
-        assert_eq!(p.matches("st.global.f32").count(), 17); // 16 wb + 1 reduce
-        // single-buffered staging: one stage body; 3 textual cp.async sites
-        // (the word loops are runtime loops)
-        assert_eq!(p.matches("cp.async.ca.shared.global").count(), 3);
-        assert_eq!(p.matches("cp.async.commit_group").count(), 1);
+        // jt bodies per entry: 4 (J=32 default/ffma/h2) + 8 (J=64) + 16 (J=128)
+        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 36);
+        // writebacks: 16+16+16+32+64 + 1 (reduce)
+        assert_eq!(p.matches("st.global.f32").count(), 145);
+        // single-buffered staging per entry: 3 textual cp.async sites each
+        assert_eq!(p.matches("cp.async.ca.shared.global").count(), 15);
+        assert_eq!(p.matches("cp.async.commit_group").count(), 5);
         assert!(p.contains(".extern .shared .align 16 .b8 dyn_smem[]"));
+        // J=128 geometry: 57344-byte buffer, 16 token tiles
+        assert!(p.contains("// J = 128: 57344 bytes dynamic smem, 16 token tiles"));
+        // per-J staging iteration counts (J/4 a_qs words per thread)
+        assert!(p.contains("setp.ge.u32 %p13, %r95, 8;"));
+        assert!(p.contains("setp.ge.u32 %p13, %r95, 16;"));
+        assert!(p.contains("setp.ge.u32 %p13, %r95, 32;"));
     }
 
     #[test]
     fn ptx_variants_generate() {
         // ffma: same shape, regrouped epilogue (fma count 8 per jt body)
         let p = ptx_ffma();
-        if let Ok(path) = std::env::var("TEMPURA_DUMP_PTX") {
-            std::fs::write(format!("{path}.ffma"), p).unwrap();
-            let h2 = ptx_h2();
-            std::fs::write(format!("{path}.h2"), h2).unwrap();
-        }
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_ffma"));
         assert!(p.contains(".visible .entry q4k_mmq_split_reduce"));
-        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
-        // 8 fmas per jt body (4 t + 4 acc), no bare add.f32 epilogue
-        assert_eq!(p.matches("fma.rn.f32").count(), 32);
+        // 8 fmas per jt body; module-wide: default 16 + ffma 32 + h2 16 +
+        // j64 32 + j128 64
+        assert_eq!(p.matches("fma.rn.f32").count(), 160);
         // h2: packed pos products, two per jt body
         let p = ptx_h2();
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_h2"));
         assert_eq!(p.matches("mul.f16x2").count(), 8); // 2 per jt body
-        assert_eq!(p.matches("mma.sync.aligned.m16n8k32").count(), 4);
         assert!(p.contains("mov.b32 %br5, {%h7, %h7}"));
+    }
+
+    #[test]
+    fn geometry_matches() {
+        assert_eq!(geometry(32), (29696, 20480, 28672));
+        assert_eq!(geometry(64).0, 38912);
+        assert_eq!(geometry(128).0, 57344);
+        assert_eq!(dynamic_smem(128), 57344);
     }
 }
