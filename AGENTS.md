@@ -513,6 +513,17 @@ Qwen3.6-27B weights** — see open work.
       4101 -> 4381 tok/s pp128 (llama.cpp gap 1.7x); q4k_mmq now dominates
       the step (20.3 ms, 71%) -- f16x2 scale pipes / GLU fusion / k-split
       remain the levers to the 6000-tok/s default-flip bar.
+      2026-11-21 (q4k mmq grid.z k-split, same module as q4k_mmq): CTA z
+      owns a k-block range, partials combined by the fixed-order
+      q4k_mmq_split_reduce entry (deterministic; S=1 = the unchanged
+      unsplit path; S>1 changes only the f32 sum order -- probe-gated by
+      the SPLIT arms + split CPU mirror). Engine heuristic is n-ONLY
+      (composition invariance): k_proj S=8 (0.059 -> 0.019 ms), q/o S=5
+      (0.060 -> 0.049), gate/up S=3 (0.157 -> 0.146); exact mode 4381 ->
+      5189 tok/s pp128 (gap 1.4x); TEMPURA_Q4K_MMQ_SPLIT=0 bisects.
+      The 6000 bar is NOT met -- exact stays opt-in; remaining levers
+      (f16x2 epilogue, GLU fusion, the q6k-side split) recorded in the
+      2026-11-21 status entry.
       2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
       docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
       the ds word's high bits (llama.cpp's Q8_1 ds layout; all other

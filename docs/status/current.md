@@ -5,6 +5,94 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-21 (q4k mmq grid.z k-split -- the first of the three
+documented levers LANDED: exact mode 4381 -> 5189 tok/s pp128 (+18.5%,
+llama.cpp gap 1.7x -> 1.4x), the within-kernel q4k_mmq breakdown measured
+BEFORE choosing (gate/up 64% of the kernel, q/o+k 36% with k_proj running
+at 19% SM fill -- 0.059 ms at n=1024, the same latency as n=4096), an
+S-sweep per shape recorded, the 6000-tok/s DEFAULT-FLIP BAR NOT MET (needs
+~3.3 ms more; the remaining levers are each sub-2.5 ms even optimistically)
+so exact stays opt-in and MXFP4 stays default, TWO bring-up bugs caught by
+the probe (writeback split-branch polarity inverted; the splits param
+register %r7 clobbered by the warp_id decomposition -- warps != 1 wrote
+partials through the null pointer), and all gates green): (1) THE
+WITHIN-KERNEL BREAKDOWN (bench-probe-prefill-tc, mmq variant added, m=128
+per call): q 0.059 + k 0.059 + o 0.059 + gate 0.158 + up 0.158 = 0.493
+ms/layer -> 15.8 ms/step isolated (the engine-profile 20.3 ms includes
+cache-cold activations + interleaving); gate/up (448 CTAs, 210 GB/s
+effective) is issue/latency-bound NOT fill-bound, while k_proj (32 CTAs =
+19% of 170 SMs, 40 GB/s) and q/o (128 CTAs = 75%) are fill-limited -- the
+k-split lever targets exactly those. (2) THE KERNEL (all in
+kernels/src/q4k_mmq_batch_sm120_ptx.rs, same module): two new params
+(splits u32, partials ptr); CTA z = ctaid.z owns k-blocks [z*kb/S,
+(z+1)*kb/S) (u32 div, S=1 covers [0,kb) -- the unsplit path numerically
+UNCHANGED); writeback branches on splits==1 to the direct out store, else
+to partials[z*m*n + token*n + neuron]; NEW entry q4k_mmq_split_reduce in
+the same module combines out[i] = p0 + p1 + ... in ASCENDING z (fixed
+order, deterministic; f32 adds; grid ceil(m*n/256)). NUMERICS: per-split
+accumulation identical (same (kb,g,jt) order in range); the combine changes
+only the f32 SUM ORDER -- the established mma128-class band, gated by NEW
+probe arms (S=2 and S=4 at every shape x m vs a SPLIT CPU mirror:
+mmq_cpu_mirror_split models per-split accumulation + the ascending-z
+combine; measured max rel 1.5e-8..6e-8 vs mirror at every shape, class
+band vs kpar unchanged at ~5e-5). Host:
+forward_mmq_split_batch_d2d_rows (oxide_q4k_gemv_host) + has_mmq_split_batch
++ sm_count accessor; splits<=1 delegates to the unsplit method. ENGINE
+(gemm_q4k_prefill_batch Mmq arm): S depends ONLY on n, NEVER the runtime m
+-- a smaller final chunk must not change a token's sum order (composition
+invariance, validated by bench-ab-repro composition); slots computed at the
+fixed 128-row chunk; rule calibrated on the fishtank S-sweep: slots < 256
+-> S = round(640/slots) (k_proj 32 slots -> 8, q/o 128 -> 5), else S = 3
+(gate/up 448 -> 3), clamped [1,8] and <= k_blocks. TEMPURA_Q4K_MMQ_SPLIT=0
+bisects off (S=1 everywhere). (3) THE MEASURED MILESTONES (fishtank,
+bench-probe-prefill-tc m=128, then bench-real-model exact pp128): k_proj
+0.059 -> 0.019 ms (3.1x, S=8), q/o 0.060 -> 0.049 (-18%, S=5), gate/up
+0.157 -> 0.146 (-7%, S=3; the partials+reduce traffic ~cancels the fill
+gain below S=3 -- q/o at S=2/3 was a WASH, the sweep decides per shape);
+per-layer 0.497 -> 0.416 ms. END-TO-END exact: 4381 -> 5012 tok/s with
+S=round(640/slots) only, -> 5189 tok/s with gate/up S=3 included (decode
+218 unchanged, logits det=OK, fingerprint re-baselined to 170432546484652
+-- the sum-order class change, expected). Default MXFP4 path UNTOUCHED:
+7682 tok/s det=OK (unchanged band). (4) THE S-WEEP DATA (SWEEP=1 mode in
+bench-probe-prefill-tc): k_proj best S>=4 (0.019-0.020), q/o best S=5
+(0.049, noisy plateau 0.049-0.061), gate/up best S=3 (0.146 vs 0.157 S=1),
+down-shape [4096,14336] (Q6K side, NOT wired -- the q6k_mmq kernel has the
+same 128-CTA fill problem) best S=5 (0.158 vs 0.206 -- a further ~0.5
+ms/step is available by porting the split to q6k_mmq for down/v_proj).
+(5) THE REMAINING LEVERS, honestly NOT attempted this session (the bar
+needs ~3.3 ms more; f16x2 ~2 ms optimistic + GLU ~0.8 ms would land ~5900,
+short of 6000 -- better to bank the gated win than half-land two): (i)
+f16x2 scale pipes: paper analysis says the win is NOT free -- the products
+must reach the f32 accumulators, so every mul.f16x2 saved pays an unpack
+cvt.f32.f16 pair (5 packed muls + 12 unpack cvts vs the current 10 muls +
+4 cvts: a wash on issue count, the gain exists only if the f16 pipe
+dual-issues under the cvt wall -- MEASURE a variant entry before believing
+it); a cheaper epilogue restructure exists: acc += d8 * fma(D, ax, ay*rs)
+(12 fp ops vs 14, fewer roundings, different class -- same probe-mirror
+workflow); (ii) GLU-fused writeback: needs interleaved gate/up weight
+staging (llama.cpp chunks-of-8) so one CTA tile holds (gate[i], up[i])
+pairs + the silu math op-identical to the standalone kernel; saves the
+silu launch + ~30 MB/layer of intermediate traffic (~0.6-0.9 ms/step);
+(iii) the q6k-side split (see (4)). (6) GATES ALL GREEN on the final tree:
+probe-q4k-batch PASS (28 mmq arms + 56 NEW split arms S=2/S=4 at every
+shape x m incl. k=14336, ulp-level vs the split mirror); probe-q6k-batch
+PASS (unchanged); sanitizer-gate PASS (memcheck 3/3 + racecheck 2/2 +
+initcheck, 0 errors 0 hazards -- the split kernel + reduce entry are
+inside the probe coverage); bench-real-model exact 5189 tok/s pp128
+det=OK, decode 218; default MXFP4 7682 tok/s det=OK (unchanged);
+bench-ab-repro exact solo/repeat/interleave/composition IDENTICAL;
+6-client kv-swap A/B PASS on f16 AND e4m3 (byte-identical, eviction
+exercised, both under TEMPURA_PREFILL_PRECISION=exact); nonstream-route-
+smoke PASS (exact); kv-restart-var PASS (exact); MMLU exact 62.4% GPU /
+61.6% CPU / 62.4% llama, agreement 96.8% PASS (gate 95%); pooled ppl
+8 chunks 8.0909, GPU/CPU ratio 0.9983, 0 NaN PASS (exact-class baseline
+8.0863-8.0889, ratio 1.0005 -- the split is quality-neutral); local cargo
+test 929 passed / 0 failed. (7) THE DECISION: exact stays OPT-IN at 1.4x
+from llama.cpp; the k-split is the exact route's DEFAULT (bisect:
+TEMPURA_Q4K_MMQ_SPLIT=0); the quality/speed fork REMAINS (MXFP4 7682 vs
+exact 5189) and the 6000-tok/s flip bar is carried forward with the (i)-(iii)
+levers above.**
+
 **STATUS 2026-11-20 (q6k mmq port: the llama.cpp-mmq treatment ported to the
 Q6K exact-prefill projections via the NEW q6k_mmq_batch_sm120 kernel, the
 q6k stack 6.9 -> 4.64 ms/step (1.49x), exact mode 4101 -> 4381 tok/s pp128
