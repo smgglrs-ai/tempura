@@ -6404,10 +6404,12 @@ impl CutileGpuModel {
                     // J is numerics-neutral (per-element accumulation
                     // order is J-independent) and chosen by n ONLY
                     // (composition invariance). (J, S) calibrated on the
-                    // fishtank J x S sweep (bench-probe-prefill-tc
-                    // SWEEP=1, 2026-11-22): n=1024 -> J=64 S=8 (0.018 ms),
-                    // n=4096 -> J=64 S=5 (0.045), n=14336 -> J=128 S=3
-                    // (0.117, was 0.146 at J=32 S=3).
+                    // fishtank J x S sweep after the 2026-11-22 smem
+                    // stride-padding bank-conflict fix (ncu: 6-way
+                    // conflicts on the fragment loads, 78% of wavefronts):
+                    // n=1024 -> J=64 S=8 (0.014 ms), n=4096 -> J=64 S=5
+                    // (0.031), n=14336 -> J=64 S=5 / J=128 S=3 (0.091
+                    // both; J=64 picked for the 2-CTA/SM co-residency).
                     // TEMPURA_Q4K_MMQ_J=32|64|128 overrides J (bisect);
                     // TEMPURA_Q4K_MMQ_SPLIT=0 bisects S to 1.
                     let (mut j, mut splits) = if n <= 1024 {
@@ -6415,7 +6417,7 @@ impl CutileGpuModel {
                     } else if n <= 4096 {
                         (64, 5)
                     } else {
-                        (128, 3)
+                        (64, 5)
                     };
                     if let Ok(v) = std::env::var("TEMPURA_Q4K_MMQ_J") {
                         if let Ok(p) = v.parse::<usize>() {
