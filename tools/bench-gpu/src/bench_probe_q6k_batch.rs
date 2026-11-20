@@ -771,13 +771,11 @@ fn main() {
                                 }
                             }
                         }
-                }
-                }
+                    }
                     // 4c) q6k mmq J=64/128 wide-token variants (2026-11-22,
-                //     the q4k treatment ported): the per-element op
-                //     sequence is J-independent, so the SAME mirrors gate
-                //     them (ulp-level vs the mirror, class band vs mma128).
-                if oxide.has_mmq_batch() {
+                    //     the q4k treatment ported): the per-element op
+                    //     sequence is J-independent, so the SAME mirrors gate
+                    //     them (ulp-level vs the mirror, class band vs mma128).
                     for j in [64usize, 128] {
                         for splits in [1usize, 2] {
                             if splits > k_blocks.max(1) {
