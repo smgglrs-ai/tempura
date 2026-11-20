@@ -6104,6 +6104,14 @@ impl CutileGpuModel {
                 } else {
                     1
                 };
+                // 2026-11-22: the q4k J treatment ported (wide token tiles
+                // + padded smem strides). J is numerics-neutral and n-only.
+                // TEMPURA_Q6K_MMQ_J=32|64|128 bisects.
+                let j6 = std::env::var("TEMPURA_Q6K_MMQ_J")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| matches!(v, 32 | 64 | 128))
+                    .unwrap_or(64);
                 let launch = |rows: usize| {
                     if splits > 1 {
                         let partials = {
@@ -6121,11 +6129,12 @@ impl CutileGpuModel {
                         };
                         oxide6.forward_mmq_split_batch_d2d_rows(
                             a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
-                            splits, &partials,
+                            splits, &partials, j6,
                         )
                     } else {
                         oxide6.forward_mmq_batch_d2d_rows(
                             a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                            j6,
                         )
                     }
                 };

@@ -81,6 +81,8 @@ pub struct OxideQ6kGemv {
     /// pre-extraction; the 2026-11-20 port of the q4k mmq winner).
     cu_mmq_module: Option<CUmodule>,
     cu_mmq_batch: Option<CUfunction>,
+    cu_mmq_batch_j64: Option<CUfunction>,
+    cu_mmq_batch_j128: Option<CUfunction>,
     /// q6k_mmq_split_reduce: the fixed-order grid.z partials combine (the
     /// 2026-11-21 q6k k-split port).
     cu_mmq_reduce: Option<CUfunction>,
@@ -502,7 +504,8 @@ impl OxideQ6kGemv {
         // per CTA, cp.async smem staging, f16 (d*sc) pre-extraction --
         // different numerics class from mma128 (the f16 scale roundings);
         // gated by the mmq probe arm (CPU mirror + class band) + MMLU/ppl.
-        let (cu_mmq_module, cu_mmq_batch, cu_mmq_reduce) = if !sm120_force_off && sm120_cc_ok {
+        let (cu_mmq_module, cu_mmq_batch, cu_mmq_reduce, cu_mmq_j64, cu_mmq_j128) =
+            if !sm120_force_off && sm120_cc_ok {
             let ptx_cstr =
                 CString::new(crate::q6k_mmq_batch_sm120_ptx::ptx()).unwrap_or_default();
             let mut m = std::mem::MaybeUninit::uninit();
@@ -555,19 +558,51 @@ impl OxideQ6kGemv {
                         );
                         None
                     };
-                    (Some(m), Some(mmq_fn), cu_mmq_reduce)
+                    // J=64 / J=128 wide-token variants (same module,
+                    // 2026-11-22): missing entries just disable them.
+                    let get_j = |entry: &str, smem: usize| -> Option<CUfunction> {
+                        let c = CString::new(entry).unwrap_or_default();
+                        let mut jf = std::mem::MaybeUninit::uninit();
+                        let rc = unsafe {
+                            cuda_core::sys::cuModuleGetFunction(jf.as_mut_ptr(), m, c.as_ptr())
+                        };
+                        if rc != CUDA_SUCCESS {
+                            return None;
+                        }
+                        let jf = unsafe { jf.assume_init() };
+                        let rc_attr = unsafe {
+                            cuda_core::sys::cuFuncSetAttribute(
+                                jf,
+                                cuda_core::sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                smem as i32,
+                            )
+                        };
+                        if rc_attr != CUDA_SUCCESS {
+                            return None;
+                        }
+                        Some(jf)
+                    };
+                    let j64 = get_j(
+                        crate::q6k_mmq_batch_sm120_ptx::ENTRY_J64,
+                        crate::q6k_mmq_batch_sm120_ptx::dynamic_smem(64),
+                    );
+                    let j128 = get_j(
+                        crate::q6k_mmq_batch_sm120_ptx::ENTRY_J128,
+                        crate::q6k_mmq_batch_sm120_ptx::dynamic_smem(128),
+                    );
+                    (Some(m), Some(mmq_fn), cu_mmq_reduce, j64, j128)
                 } else {
                     let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
                     eprintln!(
                         "oxide-gemv-q6k: cuModuleGetFunction(mmq_batch) failed (rc={rc2})"
                     );
-                    (None, None, None)
+                    (None, None, None, None, None)
                 }
             } else {
                 eprintln!(
                     "oxide-gemv-q6k: cuModuleLoadData(mmq_batch PTX) failed (rc={rc})"
                 );
-                (None, None, None)
+                (None, None, None, None, None)
             }
         } else {
             (None, None, None)
@@ -628,6 +663,8 @@ impl OxideQ6kGemv {
             cu_mma128_batch,
             cu_mmq_module,
             cu_mmq_batch,
+            cu_mmq_batch_j64: cu_mmq_j64,
+            cu_mmq_batch_j128: cu_mmq_j128,
             cu_mmq_reduce,
             kpar_out_scratch: RefCell::new(None),
             stream,
@@ -873,6 +910,7 @@ impl OxideQ6kGemv {
         k_blocks: usize,
         x_qs: &Arc<Tensor<u32>>,
         x_ds: &Arc<Tensor<u32>>,
+        j: usize,
     ) -> Result<()> {
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
@@ -952,6 +990,23 @@ impl OxideQ6kGemv {
     /// `n % 128 == 0`; `x_qs`/`x_ds` must already hold the Q8_1 window for
     /// rows `[x_row, x_row + m)` (same contract as
     /// `forward_mma128_batch_d2d_rows`).
+    /// Resolve the mmq kernel function for a J variant.
+    fn mmq_fn_for_j(&self, j: usize) -> Result<CUfunction> {
+        let f = match j {
+            32 => self.cu_mmq_batch,
+            64 => self.cu_mmq_batch_j64,
+            128 => self.cu_mmq_batch_j128,
+            _ => {
+                return Err(KernelError::InvalidConfig(format!(
+                    "q6k mmq_fn_for_j: J must be 32/64/128; got {j}"
+                )))
+            }
+        };
+        f.ok_or_else(|| {
+            KernelError::InvalidConfig(format!("q6k mmq_fn_for_j: J={j} variant not loaded"))
+        })
+    }
+
     pub fn forward_mmq_batch_d2d_rows(
         &self,
         _x: &Arc<Tensor<f32>>,
@@ -964,6 +1019,7 @@ impl OxideQ6kGemv {
         k_blocks: usize,
         x_qs: &Arc<Tensor<u32>>,
         x_ds: &Arc<Tensor<u32>>,
+        j: usize,
     ) -> Result<()> {
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
@@ -1002,10 +1058,7 @@ impl OxideQ6kGemv {
                 m * k.div_ceil(32)
             )));
         }
-        let mmq_fn = match self.cu_mmq_batch {
-            Some(f) => f,
-            None => return Err(KernelError::InvalidConfig("q6k mmq_batch not loaded".into())),
-        };
+        let mmq_fn = self.mmq_fn_for_j(j)?;
         let cu_stream = self.stream.cu_stream();
         let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
         let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
@@ -1028,15 +1081,15 @@ impl OxideQ6kGemv {
             &splits_u32 as *const _ as *mut c_void,
             &partials_ptr as *const _ as *mut c_void,
         ];
-        // grid (n/128, ceil(m/32)): 128 neurons x 32 tokens per CTA.
+        // grid (n/128, ceil(m/J)): 128 neurons x J tokens per CTA.
         let grid_x = n_u32 / 128;
-        let grid_y = m_u32.div_ceil(32);
+        let grid_y = m_u32.div_ceil(j as u32);
         unsafe {
             launch_kernel(
                 mmq_fn,
                 (grid_x, grid_y, 1),
                 (256, 1, 1),
-                crate::q6k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32,
+                crate::q6k_mmq_batch_sm120_ptx::dynamic_smem(j) as u32,
                 cu_stream,
                 &mut params,
             )
@@ -1077,11 +1130,12 @@ impl OxideQ6kGemv {
         x_ds: &Arc<Tensor<u32>>,
         splits: usize,
         partials: &Arc<Tensor<f32>>,
+        j: usize,
     ) -> Result<()> {
         if splits <= 1 {
             return self.forward_mmq_batch_d2d_rows(
-                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds,
-            );
+                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j,
+                );
         }
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
@@ -1104,10 +1158,7 @@ impl OxideQ6kGemv {
                 partials.size()
             )));
         }
-        let mmq_fn = match self.cu_mmq_batch {
-            Some(f) => f,
-            None => return Err(KernelError::InvalidConfig("q6k mmq_batch not loaded".into())),
-        };
+        let mmq_fn = self.mmq_fn_for_j(j)?;
         let reduce_fn = match self.cu_mmq_reduce {
             Some(f) => f,
             None => {
@@ -1165,13 +1216,13 @@ impl OxideQ6kGemv {
             &pt_ptr as *const _ as *mut c_void,
         ];
         let grid_x = n_u32 / 128;
-        let grid_y = m_u32.div_ceil(32);
+        let grid_y = m_u32.div_ceil(j as u32);
         unsafe {
             launch_kernel(
                 mmq_fn,
                 (grid_x, grid_y, splits_u32),
                 (256, 1, 1),
-                crate::q6k_mmq_batch_sm120_ptx::DYNAMIC_SMEM as u32,
+                crate::q6k_mmq_batch_sm120_ptx::dynamic_smem(j) as u32,
                 cu_stream,
                 &mut params,
             )

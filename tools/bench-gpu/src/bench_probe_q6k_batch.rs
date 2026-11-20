@@ -649,7 +649,7 @@ fn main() {
                         let rows = (m - row).min(128);
                         oxide
                             .forward_mmq_batch_d2d_rows(
-                                &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                                &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds, 32,
                             )
                             .expect("q6k mmq launch");
                         row += rows;
@@ -719,7 +719,7 @@ fn main() {
                             );
                             let res = oxide.forward_mmq_split_batch_d2d_rows(
                                 &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds, splits,
-                                &partials,
+                                &partials, 32,
                             );
                             match res {
                                 Err(e) => {
@@ -775,6 +775,88 @@ fn main() {
                 } else {
                     any_fail = true;
                     println!("  {label} m={m} mmq: FAIL (kernel not loaded)");
+                }
+
+                // 4c) q6k mmq J=64/128 wide-token variants (2026-11-22,
+                //     the q4k treatment ported): the per-element op
+                //     sequence is J-independent, so the SAME mirrors gate
+                //     them (ulp-level vs the mirror, class band vs mma128).
+                if oxide.has_mmq_batch() {
+                    for j in [64usize, 128] {
+                        for splits in [1usize, 2] {
+                            if splits > k_blocks.max(1) {
+                                continue;
+                            }
+                            let partials = Arc::new(
+                                api::zeros::<f32>(&[splits * m * n])
+                                    .sync_on(&stream)
+                                    .expect("q6k j partials alloc"),
+                            );
+                            let out = Arc::new(
+                                api::zeros::<f32>(&[m * n])
+                                    .sync_on(&stream)
+                                    .expect("out alloc"),
+                            );
+                            let res = oxide.forward_mmq_split_batch_d2d_rows(
+                                &x, 0, &packed, &out, 0, m, n, k_blocks, &x_qs, &x_ds, splits,
+                                &partials, j,
+                            );
+                            let tag = format!("mmq-j{j} S={splits}");
+                            match res {
+                                Err(e) => {
+                                    any_fail = true;
+                                    println!(
+                                        "  {label} m={m} {tag}: FAIL (launch error: {e})"
+                                    );
+                                }
+                                Ok(()) => {
+                                    let got = out
+                                        .to_host_vec()
+                                        .sync_on(&stream)
+                                        .expect("out download");
+                                    let (mirror, mirror_abssum) = if splits == 1 {
+                                        q6k_mmq_cpu_mirror(&x_host, &packed_host, m, n, k_blocks)
+                                    } else {
+                                        q6k_mmq_cpu_mirror_split(
+                                            &x_host, &packed_host, m, n, k_blocks, splits,
+                                        )
+                                    };
+                                    let mut mirror_max = 0f64;
+                                    for i in 0..m * n {
+                                        let d =
+                                            (got[i] - mirror[i]).abs() / mirror[i].abs().max(1.0);
+                                        mirror_max = mirror_max.max(d as f64);
+                                    }
+                                    if mirror_max > 1e-5 {
+                                        any_fail = true;
+                                    }
+                                    let mut max_rel = 0f64;
+                                    let mut bad_rows = 0;
+                                    for r in 0..m {
+                                        let mut row_max = 0f64;
+                                        for c in 0..n {
+                                            let a = got[r * n + c];
+                                            let b = ref_got[r * n + c];
+                                            let gate = 2e-3 * mirror_abssum[r * n + c] + 1e-6;
+                                            let rel = (a - b).abs() as f64 / gate;
+                                            row_max = row_max.max(rel);
+                                        }
+                                        if row_max > 1.0 {
+                                            bad_rows += 1;
+                                        }
+                                        max_rel = max_rel.max(row_max);
+                                    }
+                                    if bad_rows > 0 {
+                                        any_fail = true;
+                                    }
+                                    println!(
+                                        "  {label} m={m} {tag}: {} (vs mma128 max err/gate {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 2e-3*abssum; vs mirror: max rel {mirror_max:.3e}, gate 1e-5)",
+                                        if bad_rows == 0 { "OK" } else { "MISMATCH" },
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
