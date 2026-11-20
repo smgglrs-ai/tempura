@@ -6403,13 +6403,35 @@ impl CutileGpuModel {
                     // (J=128) while J=32 re-stages them 4x (grid.y=4).
                     // J is numerics-neutral (per-element accumulation
                     // order is J-independent) and chosen by n ONLY
-                    // (composition invariance).
-                    // TEMPURA_Q4K_MMQ_J=32|64|128 selects (bisect).
-                    let j = std::env::var("TEMPURA_Q4K_MMQ_J")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|v| matches!(v, 32 | 64 | 128))
-                        .unwrap_or(32);
+                    // (composition invariance). (J, S) calibrated on the
+                    // fishtank J x S sweep (bench-probe-prefill-tc
+                    // SWEEP=1, 2026-11-22): n=1024 -> J=64 S=8 (0.018 ms),
+                    // n=4096 -> J=64 S=5 (0.045), n=14336 -> J=128 S=3
+                    // (0.117, was 0.146 at J=32 S=3).
+                    // TEMPURA_Q4K_MMQ_J=32|64|128 overrides J (bisect);
+                    // TEMPURA_Q4K_MMQ_SPLIT=0 bisects S to 1.
+                    let (mut j, mut splits) = if n <= 1024 {
+                        (64, 8)
+                    } else if n <= 4096 {
+                        (64, 5)
+                    } else {
+                        (128, 3)
+                    };
+                    if let Ok(v) = std::env::var("TEMPURA_Q4K_MMQ_J") {
+                        if let Ok(p) = v.parse::<usize>() {
+                            if matches!(p, 32 | 64 | 128) {
+                                j = p;
+                            }
+                        }
+                    }
+                    let want_split = oxide.has_mmq_split_batch()
+                        && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                    if !want_split {
+                        splits = 1;
+                    }
+                    splits = splits.min(dw.k_blocks);
                     // 2026-11-21 grid-fill lever: small-n shapes leave the
                     // machine idle (q/o_proj 128 CTAs = 75% of 170 SMs,
                     // k_proj 32 CTAs = 19% -- it runs at the same latency as
@@ -6421,30 +6443,10 @@ impl CutileGpuModel {
                     // S depends ONLY on n (never the runtime m/rows): a
                     // smaller final chunk must not change the sum order of
                     // the same token's row (composition invariance, the
-                    // bench-ab-repro composition gate). slots are computed
-                    // at the fixed 128-row chunk the exact route uses, for
-                    // the actual J (grid.y = 128/J).
-                    // Calibrated on the fishtank S-sweep (2026-11-21,
-                    // J=32): k_proj n=1024 (32 slots) best at S=8 (0.059 ->
-                    // 0.019 ms), q/o n=4096 (128 slots) best at S=5
-                    // (0.060 -> 0.049), gate/up n=14336 (448 slots) best at
-                    // S=3 (0.157 -> 0.146). Rule: slots < 256 ->
-                    // S = round(640/slots); else S = 3; clamped [1, 8].
-                    let slots = (n / 128) * (128 / j);
-                    let want_split = oxide.has_mmq_split_batch()
-                        && std::env::var("TEMPURA_Q4K_MMQ_SPLIT")
-                            .map(|v| v != "0")
-                            .unwrap_or(true);
-                    let splits = if want_split {
-                        let target = if slots < 256 {
-                            (640f64 / slots as f64).round() as usize
-                        } else {
-                            3
-                        };
-                        target.clamp(1, 8).min(dw.k_blocks)
-                    } else {
-                        1
-                    };
+                    // bench-ab-repro composition gate). The pre-2026-11-22
+                    // rule (slots < 256 -> S = round(640/slots), else 3)
+                    // was calibrated at J=32; the (J, S) table above
+                    // replaces it.
                     if splits > 1 {
                         let partials = {
                             let mut pool = self.nograph.borrow_mut();
