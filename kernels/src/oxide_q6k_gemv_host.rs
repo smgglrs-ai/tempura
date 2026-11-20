@@ -605,7 +605,7 @@ impl OxideQ6kGemv {
                 (None, None, None, None, None)
             }
         } else {
-            (None, None, None)
+            (None, None, None, None, None)
         };
 
         // Return Some only when at least one kernel is available.
