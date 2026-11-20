@@ -471,7 +471,9 @@ Qwen3.6-27B weights** — see open work.
       gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
       + pooled prefill norms/adds/SiLU + Q6K down_proj via MXFP4 (nsys-
       driven), TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
-- [x] Prefill precision quality mode (2026-11-17; 2026-11-19 exact route
+- [x] Prefill precision quality mode (2026-11-17; DEFAULT since
+      2026-11-21: exact -- see the 2026-11-21d flip note at the end of
+      this item; 2026-11-19 exact route
       restructured to the mmq-class kernel q4k_mmq_batch_sm120 -- 128
       neurons x 32 tokens/CTA, cp.async smem staging, f16 scale
       pre-extraction, exact 2732 -> 4101 tok/s pp128, MMLU 62.8%/96.8%,
@@ -521,9 +523,29 @@ Qwen3.6-27B weights** — see open work.
       (composition invariance): k_proj S=8 (0.059 -> 0.019 ms), q/o S=5
       (0.060 -> 0.049), gate/up S=3 (0.157 -> 0.146); exact mode 4381 ->
       5189 tok/s pp128 (gap 1.4x); TEMPURA_Q4K_MMQ_SPLIT=0 bisects.
-      The 6000 bar is NOT met -- exact stays opt-in; remaining levers
-      (f16x2 epilogue, GLU fusion, the q6k-side split) recorded in the
-      2026-11-21 status entry.
+      2026-11-21b (q6k mmq k-split, the same pattern ported to
+      q6k_mmq_batch_sm120 + forward_mmq_split_batch_d2d_rows; n-only
+      heuristic slots<256 -> S=round(640/slots), lm_head stays unsplit --
+      partials traffic dominates at n=128256; TEMPURA_Q6K_MMQ_SPLIT=0
+      bisects; probe arm 4b, split mirror bit-identical): exact mode
+      5189 -> 5584 tok/s pp128, llama.cpp gap 1.31x. 2026-11-21c: the
+      two remaining epilogue levers measured as WASHES and SKIPPED with
+      the numbers recorded (fma-form regroup 8079 vs scalar 8104
+      projections-only tok/s; f16x2 packed pos 8028 -- the kernel is not
+      fp-issue-bound; variants stay opt-in via
+      TEMPURA_Q4K_MMQ_EPILOGUE=ffma|h2); GLU-fused writeback also
+      skipped (the bar was met without it; the MXFP4 epilogue-read
+      fusion negative result 2026-10-29 is the adjacent prior).
+      DEFAULT FLIPPED (2026-11-21d): exact is now the DEFAULT prefill
+      route (5584 tok/s pp128 = 1.31x of llama.cpp's 7335 at reference
+      quality -- MMLU 62.4-63.6%/96.4-96.8% agreement, ppl ratio ~0.998,
+      BETTER quality than llama.cpp's own default path); the MXFP4 fast
+      path (7682 tok/s, MMLU 48.8% -- quality-failing for eval-class
+      work) is demoted to opt-in via TEMPURA_PREFILL_PRECISION=mxfp4
+      (code + selector kept: the right choice for quality-insensitive
+      bulk prefill). The 6000-tok/s proxy bar was retired in favor of
+      the real criterion -- the fork's remaining value at the final
+      number -- see the 2026-11-21 status entry for the full rationale.
       2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
       docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
       the ds word's high bits (llama.cpp's Q8_1 ds layout; all other

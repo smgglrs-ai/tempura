@@ -336,14 +336,20 @@ const SLOT_DOWN: usize = 6;
 const SLOT_LOGITS: usize = 7;
 const NUM_SLOTS: usize = 8;
 
-/// TEMPURA_PREFILL_PRECISION=exact: quality mode for single-prefill
-/// workloads (MMLU-style log-prob evaluation). Skips the MXFP4 prefill
-/// GEMM so every prefill projection runs an exact-class kernel (Q6K sm120
-/// batch GEMV, bit-identical-per-row Q4K kpar8 batch GEMM, or the
-/// host-dequant f32 GEMM). Default (unset / "mxfp4") keeps the MXFP4
-/// tensor-core fast path.
+/// Prefill precision fork (DEFAULT DECISION 2026-11-21: the default is
+/// EXACT). `TEMPURA_PREFILL_PRECISION=mxfp4` opts back into the MXFP4
+/// tensor-core fast path for quality-insensitive bulk prefill (its E2M1
+/// activation quant + Q6K->MXFP4 double-quantization concentrate a
+/// rel~0.1 logit band: MMLU 48.8% vs CPU 61.6% -- quality-FAILING for
+/// eval-class work). The exact route (mmq-structured int8 tensor-core
+/// kernels, MMLU 62.4-63.6% / agreement 96.4-96.8%, ppl ratio ~0.998 of
+/// llama.cpp -- BETTER quality than llama.cpp's own default path) reached
+/// 5584 tok/s pp128 = 1.31x of llama.cpp's 7335 at reference quality
+/// (2026-11-21, after the q4k + q6k mmq k-splits), which collapsed the
+/// fork's remaining value: reference quality is now the default and the
+/// MXFP4 path is the opt-in.
 fn prefill_precision_exact() -> bool {
-    std::env::var("TEMPURA_PREFILL_PRECISION").as_deref() == Ok("exact")
+    std::env::var("TEMPURA_PREFILL_PRECISION").as_deref() != Ok("mxfp4")
 }
 
 /// Per-request row buffers for the no-graph ragged batch decode path.
@@ -5684,7 +5690,8 @@ impl CutileGpuModel {
         slot: usize,
         ep: PrefillEpilogue<'_>,
     ) -> Option<Arc<Tensor<f32>>> {
-        // TEMPURA_PREFILL_PRECISION=exact opts the prefill projections out
+        // TEMPURA_PREFILL_PRECISION=mxfp4 opts the prefill projections
+        // back INTO the MXFP4 fast path (default since 2026-11-21: exact).
         // of the MXFP4 tensor-core GEMM. The E2M1 activation quantization
         // (+ the Q6K->MXFP4 double-quantized down_proj) concentrates a
         // rel~0.1 logit band on single-prefill workloads: MMLU GPU 51.2%
