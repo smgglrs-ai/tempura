@@ -70,29 +70,41 @@ pub const ENTRY_H2_J128: &str = "q4k_mmq_batch_sm120_h2_j128";
 /// Split-reduce entry (same module): out[i] = sum_s partials[s][i], s in
 /// fixed order 0..splits-1 (deterministic combine for grid.z k-splits).
 pub const ENTRY_REDUCE: &str = "q4k_mmq_split_reduce";
-/// Dynamic shared memory: the J=32 staging buffer (29696 bytes).
-pub const DYNAMIC_SMEM: usize = 29696;
-/// Buffer layout offsets (bytes) -- J=32 layout.
+/// Dynamic shared memory: the J=32 staging buffer (padded strides).
+pub const DYNAMIC_SMEM: usize = 32768;
+/// Buffer layout offsets (bytes) -- the J-independent weight regions.
 pub const BUF_W_QS: u32 = 0;
-pub const BUF_W_DM: u32 = 16384;
-pub const BUF_A_QS: u32 = 20480;
-pub const BUF_A_DS: u32 = 28672;
-pub const BUF_BYTES: u32 = 29696;
+pub const BUF_W_DM: u32 = 18432;
+pub const BUF_A_QS: u32 = 23040;
 
 /// Per-J geometry: (smem bytes, a_qs offset, a_ds offset). The weight
-/// sides are J-independent (16 KiB raw nibbles + 4 KiB f16 scales per
-/// k-block); the activation sides scale with J.
+/// sides are J-independent; the activation sides scale with J.
+///
+/// 2026-11-22 BANK-CONFLICT FIX (ncu on the j128 kernel: 6-way average
+/// conflicts on shared loads, 78% of wavefronts, est. 67% speedup): the
+/// unpadded strides (w_qs 128 B/neuron, a_qs 256 B/token, w_dm 32
+/// B/neuron) are all multiples of 32 words, so the 8 neurons/tokens a
+/// warp's fragment load touches map to the SAME bank set. Padded strides
+/// (144 / 272 / 36 B) put lane gid*4+tid4's word in bank
+/// (4*row + jt_off + tid4) % 32 -- a per-instruction bijection.
+///   w_qs: 128 * 144 = 18432 | w_dm: 128 * 36 = 4608 |
+///   a_qs: J * 272 | a_ds: J * 32
 pub fn geometry(j: usize) -> (usize, u32, u32) {
     assert!(j == 32 || j == 64 || j == 128, "J must be 32/64/128");
-    let a_qs = BUF_A_QS;
-    let a_ds = BUF_A_QS + (j * 256) as u32;
-    (20480 + j * 288, a_qs, a_ds)
+    let a_qs = 23040u32;
+    let a_ds = a_qs + (j * 272) as u32;
+    (23040 + j * 304, a_qs, a_ds)
 }
 
 /// Dynamic smem bytes for a J variant.
 pub fn dynamic_smem(j: usize) -> usize {
     geometry(j).0
 }
+
+/// Padded smem row strides (bytes).
+pub const STRIDE_W_QS: u32 = 144;
+pub const STRIDE_A_QS: u32 = 272;
+pub const STRIDE_W_DM: u32 = 36;
 
 /// One token-tile mma body (jt = 0..4, unrolled by the generator).
 const JT_BODY: &str = r#"
@@ -282,8 +294,8 @@ STAGE_W_LOOP:
         shl.b32 %r58, %r58, 2;             // word -> byte offset
         cvt.u64.u32 %rd10, %r58;
         add.u64 %rd10, %rd10, %rd0;
-        // smem dst: %r28 + neuron*128 + wi*4
-        shl.b32 %r59, %r54, 7;
+        // smem dst: %r28 + neuron*144 + wi*4 (padded stride, bank conflicts)
+        mul.lo.u32 %r59, %r54, 144;
         shl.b32 %r230, %r55, 2;
         add.u32 %r59, %r59, %r230;
         add.u32 %r59, %r59, %r28;
@@ -302,7 +314,7 @@ STAGE_A_LOOP:
         shr.u32 %r102, %r101, 6;           // token (local)
         and.b32 %r103, %r101, 63;          // word
         add.u32 %r104, %r40, %r102;        // global row
-        shl.b32 %r108, %r102, 8;           // token*256
+        mul.lo.u32 %r108, %r102, 272;      // token*272 (padded stride)
         shl.b32 %r109, %r103, 2;
         add.u32 %r108, %r108, %r109;
         add.u32 %r108, %r108, %r28;
@@ -425,7 +437,7 @@ WDM_HAVE:
     mul.f16 %h5, %h0, %h3;
     mul.f16 %h6, %h2, %h4;
     mov.b32 %r181, {%h5, %h6};
-    shl.b32 %r182, %r168, 5;               // neuron*32
+    mul.lo.u32 %r182, %r168, 36;           // neuron*36 (padded stride)
     shl.b32 %r183, %r232, 2;
     add.u32 %r182, %r182, %r183;
     add.u32 %r182, %r182, %r28;
@@ -586,7 +598,7 @@ fn build_entry(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize, j: usiz
         for jt in 0..jt_count {
             let acc0 = 40 + jt * 4;
             let body = jt_body
-                .replace("JT2048", &format!("{}", jt * 2048))
+                .replace("JT2048", &format!("{}", jt * 2176))
                 .replace("JT32", &format!("{}", jt * 32))
                 .replace("DSGSHIFT", &format!("{}", log2(j * 4)))
                 .replace("{ACC0}", &format!("{acc0}"))
@@ -689,10 +701,10 @@ fn build_entry(entry: &str, jt_body: &str, g_extra: &str, h_regs: usize, j: usiz
     // neuron_rel = w*16 + gid
     shl.b32 %r10, %r7, 4;
     add.u32 %r10, %r10, %r9;
-    // dm word offset = neuron_rel*32 (within w_dm)
-    shl.b32 %r13, %r10, 5;
-    // raw weight row byte offset within w_qs: neuron_rel*128
-    shl.b32 %r11, %r10, 7;
+    // dm word offset = neuron_rel*36 (within w_dm, padded stride)
+    mul.lo.u32 %r13, %r10, 36;
+    // raw weight row byte offset within w_qs: neuron_rel*144 (padded)
+    mul.lo.u32 %r11, %r10, 144;
     // 2*tid4 (writeback col base)
     shl.b32 %r41, %r8, 1;
     // tid4*4 (A-fragment raw-word byte offset within a group pair)
@@ -742,9 +754,9 @@ G_LOOP:
     add.u32 %r233, %r233, %r27;
     add.u32 %r233, %r233, %r239;           // + tid4*4
     ld.shared.b32 %r235, [%r233];
-    ld.shared.b32 %r236, [%r233 + 1024];   // neuron+8 row
+    ld.shared.b32 %r236, [%r233 + 1152];   // neuron+8 row (8*144)
     ld.shared.b32 %r237, [%r233 + 16];
-    ld.shared.b32 %r238, [%r233 + 1040];
+    ld.shared.b32 %r238, [%r233 + 1168];
     and.b32 %r234, %r25, 1;
     setp.eq.u32 %p17, %r234, 0;
     mov.u32 %r99, 0x0F0F0F0F;
@@ -767,7 +779,7 @@ PLANE_DONE:
     add.u32 %r121, %r121, %r120;
     add.u32 %r121, %r121, BUF_W_DM;
     ld.shared.b32 %r122, [%r121];          // (ax_lo, ay_lo) half2
-    ld.shared.b32 %r123, [%r121 + 256];    // (ax_hi, ay_hi)
+    ld.shared.b32 %r123, [%r121 + 288];    // (ax_hi, ay_hi) (8*36)
     mov.b32 {{%h7, %h8}}, %r122;
     mov.b32 {{%h9, %h14}}, %r123;
     cvt.f32.f16 %f30, %h7;                 // ax_lo
@@ -775,8 +787,8 @@ PLANE_DONE:
     cvt.f32.f16 %f31, %h9;                 // ax_hi
     cvt.f32.f16 %f33, %h14;                // ay_hi
 {g_extra}
-    // per-thread a_qs / a_ds row bases
-    shl.b32 %r152, %r9, 8;
+    // per-thread a_qs / a_ds row bases (a_qs padded stride 272)
+    mul.lo.u32 %r152, %r9, 272;
     add.u32 %r150, %r29, %r152;
     add.u32 %r150, %r150, BUF_A_QS;
     shl.b32 %r153, %r8, 3;                 // 2*tid4*4
@@ -855,7 +867,7 @@ mod tests {
         assert!(p.contains(".visible .entry q4k_mmq_batch_sm120_h2_j128"));
         assert!(p.contains(".extern .shared .align 16 .b8 dyn_smem[]"));
         // J=128 geometry: 57344-byte buffer, 16 token tiles
-        assert!(p.contains("// J = 128: 57344 bytes dynamic smem, 16 token tiles"));
+        assert!(p.contains("// J = 128: 61952 bytes dynamic smem, 16 token tiles"));
         // per-J staging iteration counts (J/4 a_qs words per thread)
         assert!(p.contains("setp.ge.u32 %p13, %r95, 8;"));
         assert!(p.contains("setp.ge.u32 %p13, %r95, 16;"));
@@ -881,9 +893,9 @@ mod tests {
 
     #[test]
     fn geometry_matches() {
-        assert_eq!(geometry(32), (29696, 20480, 28672));
-        assert_eq!(geometry(64).0, 38912);
-        assert_eq!(geometry(128).0, 57344);
-        assert_eq!(dynamic_smem(128), 57344);
+        assert_eq!(geometry(32), (32768, 23040, 31744));
+        assert_eq!(geometry(64).0, 42496);
+        assert_eq!(geometry(128).0, 61952);
+        assert_eq!(dynamic_smem(128), 61952);
     }
 }
