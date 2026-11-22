@@ -5,6 +5,92 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-22b (speculative decoding wired into the serving stack:
+the equivalence property is LANDED and GATE-GREEN — greedy spec decoding
+is byte-identical to plain greedy decode, solo AND 6-client, made
+executable as scripts/spec-equivalence.sh — but the throughput verdict
+is an HONEST NEGATIVE at v1 per-session scope: solo 0.75x, multi-client
+0.27x, so speculation stays OPT-IN via --draft-model; plus one
+PRE-EXISTING f16-pool cast bug found and fixed by the draft model):
+(1) THE DESIGN. The verify is the round's soul: the target verifies
+[last_emitted, d1..d_{K-1}] in ONE batch-decode-shaped forward over the
+session's OWN pooled run via CutileKvCache::spec_row_views — K
+lightweight handles on one run, view r reporting seq_len base+r so the
+existing batch machinery derives per-row KV write offsets (base+r) and
+attention lens (base+r+1): row r writes its K/V at offset base+r and
+attends over exactly the first base+r+1 tokens — CAUSAL verification of
+a draft block computed with the SAME decode-class kernels the plain
+batch path dispatches (ragged m>=2 graph or generic no-graph; the
+m-loop batch GEMVs, batched rope, per-row-offset scatter, oxide batch
+attention, GPU argmax — every per-row bit-identity the composition-
+invariance gates already prove). Views own nothing (pool=None,
+run_pages=0 -> Drop no-op); the owner pre-grows and rolls back. The
+engine step (server/src/engine_task.rs spec_step_gpu): lazy draft-state
+materialization + prompt prefill, K sequential m=1 greedy draft steps
+through the draft's own pool (any numerics — the draft only influences
+ACCEPTANCE LENGTH, never the output), the one verify, accept the
+longest prefix where d_i == row_i's argmax, emit the target's argmax at
+the first mismatch (no bonus token on full acceptance — K proposals
+from K draft feeds, both KV runs roll back to base+emitted, uniform).
+Greedy only (v1): sampled sessions take the plain batch step;
+spec-eligible sessions are partitioned out of plain_batch_step_gpu
+(extracted unchanged from decode_step_gpu). Draft model:
+--draft-model <gguf> (server flag, loaded after the target so VRAM
+order is target-weights -> target-pool -> draft-weights -> draft-pool;
+vocab-size hard-check — same tokenizer family required).
+Llama-3.2-1B-Instruct-Q4_K_M (bartowski) pulled to the fishtank model
+cache as the draft for Llama-3.1-8B. Telemetry: TEMPURA_ENGINE_DEBUG_
+TICKS prints cycles / mean_emitted / hist / draft-ms + verify-ms per
+cycle; TEMPURA_SPEC_K bisects K (default 4, measured best 3).
+(2) THE GATE. scripts/spec-equivalence.sh (the permanent regression
+gate): run OFF (no draft) vs run ON (--draft-model), 1 solo client +
+6 concurrent streaming clients, greedy — PASS = every client
+byte-identical. RESULT (2026-11-22, fishtank, final tree): ALL MATCH —
+solo 1686 bytes, c1..c6 1277-1444 bytes each, AND a 3-repetition solo
+rerun all byte-identical. Acceptance: mean_emitted 2.81-2.91, K=4 hist
+[156,133,85,314]/688 cycles (46% full acceptance), K=3 2.43, K=2 1.80 —
+a 1B drafting for an 8B accepts as hoped; the EQUIVALENCE is what the
+round delivered. (3) THE THROUGHPUT NEGATIVE (recorded, not hidden):
+solo OFF 5.4-5.6 s vs ON K=3 7.2-7.5 s per 400 tok (0.75x); multi 6
+clients OFF 459.5 vs ON 123.6 tok/s (0.27x — per-session spec cycles
+SERIALIZE in the engine loop while the plain batch amortizes one
+forward across all sessions). Cycle attribution (the new telemetry):
+draft m=1 step ~3.6 ms (the 1B's m=1 graph replay is NOT 8x cheaper —
+launch/graph-fixed costs dominate), verify m=4 ~20.7 ms / m=3 ~15.2 /
+m=2 ~14.3; K=3 attributes 10.6 ms/tok vs the plain path's ~13.8 — but
+wall clock still loses (per-cycle engine overheads + the draft run's
+growth/re-capture amortized in). The structural levers for a future
+win, in order: (a) BATCH the draft steps across sessions (the same
+ragged-batch machinery, m = n_sessions, one launch instead of K
+sequential m=1 replays), (b) batch the verify across sessions (m =
+n_sessions x K rows over per-session runs — the scatter/attention
+already take per-row lens/offsets/ptrs), (c) a cheaper draft decode
+path. v1 stays per-session by scope; the numbers say do not flip
+anything on. (4) THE PRE-EXISTING BUG THE DRAFT FOUND:
+d2d_into_pool's f16/e4m3 cast (engine/src/cutile_kv_cache.rs) pads
+num_elems up to CAST_B for the grid and validates the SRC against
+n_pad — a src sized exactly num_elems failed whenever num_elems was
+not a CAST_B multiple. kv_dim-1024 targets are always multiples (the
+target serving path is BIT-UNCHANGED — the pad branch never fires);
+the Llama-3.2-1B draft (kv_dim 512, 73-token prompt) is the first
+model to hit it: engine-thread panic 'cast_f32_to_f16: src holds 37376
+elements, need 37888'. Fixed with CutileKvCache::padded_cast_src — a
+cached zero-padded f32 staging D2D before the cast (pad tail is cast
+but never copied into the pool); enriched the cast error with
+layer/seq_len/kv_dim/src-size context. (5) GATES ON THE FINAL TREE
+(spec OFF default — the battery the diff structurally touches):
+kv-swap-ab-mini 3-client A/B A1==A2==B byte-identical with eviction
+exercised PASS; nonstream-route-smoke PASS; kv-restart-var PASS; local
+cargo test 931 passed / 0 failed (--exclude tempura-bench-gpu,
+CPU-only laptop). NOT rerun this round (no kernel/PTX change; the
+d2d pad branch cannot fire at kv_dim 1024): MMLU, pooled ppl, probes,
+ab-repro, sanitizer-gate — the 2026-11-22 battery stands for those.
+(6) FOLLOW-UPS RECORDED: multi-session batched draft+verify (the
+throughput lever), sampled speculation (stochastic acceptance — v1 is
+greedy; the A/B and smoke loads are greedy so the gates cover v1),
+e4m3-pool spec run (the gate ran f16; the scatter twins are dtype-
+gated so e4m3 should work but is unmeasured).**
+
 **STATUS 2026-11-22 (differential-profiling round: the llama.cpp prefill
 gap CLOSED -- exact mode 5618 -> 7962 tok/s pp128 (1.42x, vs llama.cpp's
 7335 reference we are now 1.08x FASTER at reference quality, and faster

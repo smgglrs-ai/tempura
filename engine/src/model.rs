@@ -445,6 +445,29 @@ pub trait InferenceModel: Send + Sync {
                 .collect(),
         )
     }
+    /// Greedy speculative-decode VERIFICATION: run `tokens.len()` tokens
+    /// of ONE sequence through a single batch-decode-shaped forward over
+    /// the caller's KV run -- row r sits at position `kv.seq_len() + r`,
+    /// writes its K/V at that offset, and attends over exactly the first
+    /// `kv.seq_len() + r + 1` tokens (causal) -- and return each row's
+    /// argmax.  Per-row bit-identical to plain single-token decode (the
+    /// same batch kernels the serving decode path dispatches, per-row
+    /// bit-identity probe-gated), which is what makes spec-ON output
+    /// byte-identical to spec-OFF.
+    ///
+    /// The caller must grow the run to hold `kv.seq_len() + tokens.len()`
+    /// tokens (eviction-aware) BEFORE calling.  On return the run's host
+    /// seq_len has advanced by `tokens.len()`; the caller rolls back to
+    /// the accepted length.  None = unsupported (fall back to plain
+    /// decode steps).
+    #[cfg(feature = "cutile")]
+    fn forward_spec_verify_greedy(
+        &self,
+        _token_ids: &[u32],
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+    ) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// One decode step's output row: either the already-sampled token (pure
@@ -10632,6 +10655,46 @@ impl CutileInferenceWrapper {
         gm.forward_batch_decode_greedy(token_ids, positions, qw, kv_caches, greedy)
     }
 
+    /// Greedy speculative verification over ONE pooled run (the trait's
+    /// `forward_spec_verify_greedy`): `tokens` = [last_emitted, d1..dk];
+    /// row r is the token at KV offset `kv.seq_len() + r`.  Returns the
+    /// per-row argmaxes (row r's argmax is the plain-decode prediction of
+    /// the token at offset `kv.seq_len() + r + 1`).  Advances the run's
+    /// host seq_len by `tokens.len()`; the CALLER rolls back to the
+    /// accepted length.  Grows the run when needed (callers with pool
+    /// pressure should pre-grow eviction-aware).
+    #[cfg(feature = "cutile")]
+    pub fn spec_verify_greedy(
+        &self,
+        token_ids: &[u32],
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+    ) -> Option<Vec<u32>> {
+        let gm = self.gpu_model.as_ref()?;
+        let qw = self.model.quantized_weights.as_ref()?;
+        let m = token_ids.len();
+        if m < 2 {
+            return None;
+        }
+        let base = kv.seq_len();
+        kv.ensure_capacity(base + m).ok()?;
+        let seq_lens: Vec<usize> = (0..m).map(|r| base + r).collect();
+        let mut views = kv.spec_row_views(&seq_lens);
+        let positions: Vec<u32> = seq_lens.iter().map(|&s| s as u32).collect();
+        let out =
+            gm.forward_batch_decode_greedy(token_ids, &positions, qw, &mut views, &vec![true; m]);
+        kv.advance_host_seq_len(m);
+        kv.mark_host_stale();
+        let mut tokens = Vec::with_capacity(m);
+        for row in out {
+            match row {
+                crate::model::BatchDecodeOutput::Token(t) => tokens.push(t),
+                // unreachable with greedy = [true; m]
+                crate::model::BatchDecodeOutput::Logits(_) => return None,
+            }
+        }
+        Some(tokens)
+    }
+
     /// Current GPU KV sequence length (number of K/V entries written).
     pub fn gpu_kv_seq_len(&self) -> usize {
         self.gpu_kv_cache
@@ -10778,6 +10841,13 @@ impl InferenceModel for CutileInferenceWrapper {
             token_ids.len()
         );
         Some(out)
+    }
+    fn forward_spec_verify_greedy(
+        &self,
+        token_ids: &[u32],
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+    ) -> Option<Vec<u32>> {
+        self.spec_verify_greedy(token_ids, kv)
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
         if let (Some(gm), Some(qw), Some(kv_mutex)) = (

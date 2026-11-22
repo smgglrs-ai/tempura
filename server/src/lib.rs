@@ -107,6 +107,15 @@ pub struct ServeArgs {
         help = "API key required on all non-health requests (overrides TEMPURA_API_KEY env var)"
     )]
     api_key: Option<String>,
+
+    #[arg(
+        long,
+        help = "Path to a small draft model (GGUF) for speculative decoding. \
+                Must share the target's tokenizer/vocab (e.g. Llama-3.2-1B \
+                for Llama-3.1-8B). Unset = speculation off (the default). \
+                Greedy requests only (v1); sampled requests decode normally."
+    )]
+    draft_model: Option<String>,
 }
 
 pub async fn run_server(args: ServeArgs) {
@@ -245,6 +254,50 @@ pub async fn run_server(args: ServeArgs) {
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap();
 
+        // -- Draft model (speculative decoding, --draft-model) ----------
+        // Loaded AFTER the target so VRAM allocation order is
+        // target-weights -> target-pool (lazy) -> draft-weights ->
+        // draft-pool (lazy).  Same tokenizer family required: the token
+        // ids interchange directly, so the vocab sizes must match exactly.
+        let draft_model: Option<Arc<dyn tempura_engine::InferenceModel>> = {
+            #[cfg(feature = "cutile")]
+            {
+                if !use_gpu {
+                    if args.draft_model.is_some() {
+                        eprintln!(
+                            "warning: --draft-model requires --device cuda; speculation disabled"
+                        );
+                    }
+                    None
+                } else if let Some(dp) = args.draft_model.as_deref() {
+                    let dgguf =
+                        tempura_engine::gguf_loader::GgufLoader::from_file_quantized(Path::new(dp))
+                            .unwrap_or_else(|e| panic!("failed to load draft model {dp}: {e}"));
+                    let mut dcfg = dgguf.config.clone();
+                    if dcfg.vocab_size != config.vocab_size {
+                        panic!(
+                            "--draft-model vocab size {} != target vocab size {} -- the draft \
+                             must share the target's tokenizer",
+                            dcfg.vocab_size, config.vocab_size
+                        );
+                    }
+                    dcfg.max_seq_len = dcfg.max_seq_len.min(args.max_seq_len);
+                    let dqw = dgguf.to_quantized_weights();
+                    let mut wrapper = tempura_engine::CutileInferenceWrapper::new(dcfg);
+                    wrapper.model.quantized_weights = Some(dqw);
+                    wrapper.try_upload_gpu();
+                    tracing::info!("cuTile GPU draft model ready ({dp})");
+                    Some(Arc::new(wrapper))
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "cutile"))]
+            {
+                None
+            }
+        };
+
         let scheduler =
             batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
         let scheduler = Arc::new(std::sync::Mutex::new(scheduler));
@@ -253,12 +306,14 @@ pub async fn run_server(args: ServeArgs) {
         let (engine_tx, engine_rx) =
             tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
         let engine_model = model.clone();
+        let engine_draft = draft_model.clone();
         let engine_scheduler = Arc::clone(&scheduler);
         std::thread::Builder::new()
             .name("tempura-engine".to_string())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                engine_task::EngineTask::new(engine_model, engine_rx, engine_scheduler).run();
+                engine_task::EngineTask::new(engine_model, engine_draft, engine_rx, engine_scheduler)
+                    .run();
             })
             .expect("failed to spawn engine thread");
 
@@ -376,7 +431,7 @@ pub async fn run_server(args: ServeArgs) {
         .name("tempura-engine".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            engine_task::EngineTask::new(engine_model, engine_rx, engine_scheduler).run();
+            engine_task::EngineTask::new(engine_model, None, engine_rx, engine_scheduler).run();
         })
         .expect("failed to spawn engine thread");
 

@@ -398,7 +398,15 @@ Qwen3.6-27B weights** — see open work.
       restores f32).  e4m3 (FP8, 64 KiB/token, vLLM's production density)
       opt-in via TEMPURA_KV_DTYPE=e4m3 (ppl-gated: e4m3/f16 ratio 0.995;
       shared e4m3 bit-math helpers in tempura-kernels used by the cutile
-      cast/prefill kernels, the oxide decode twins, and the mirror syncs)
+      cast/prefill kernels, the oxide decode twins, and the mirror syncs.
+      NOTE (2026-11-22, found via the spec-decode draft model — the first
+      kv_dim-512 model on this path): d2d_into_pool's f16/e4m3 cast pads
+      num_elems up to CAST_B for the grid; a src sized exactly num_elems
+      FAILED the cast's src-extent check whenever num_elems was not a
+      CAST_B multiple (odd token counts x kv_dim 512; kv_dim-1024 targets
+      are always multiples -- the target path is bit-unchanged).  Fixed
+      with a zero-padded f32 staging D2D (CutileKvCache::padded_cast_src);
+      the pad tail is cast but never copied into the pool)
 - [x] Dedicated engine thread (async HTTP ↔ sync SIMD isolation)
 - [x] Prometheus metrics, OpenTelemetry export (`otlp` feature), readiness,
       black-box /health/inference, API-key auth, timeouts, graceful shutdown
@@ -642,7 +650,28 @@ Qwen3.6-27B weights** — see open work.
       (1,2,4,5,8,16) NaN-free with bitwise-identical fresh-cache replay;
       single-seq 134 tok/s.
 
-**Decoding strategies**: speculative (target+draft), Medusa multi-token,
+**Decoding strategies**: speculative (target+draft; SERVING: greedy
+speculative decoding via `--draft-model <draft.gguf>` — a second small
+GPU model (e.g. Llama-3.2-1B for Llama-3.1-8B, same tokenizer family)
+drafts K tokens (TEMPURA_SPEC_K, default 4... measured best K=3) and the
+target verifies [last, d1..d_{K-1}] in ONE batch-decode-shaped forward
+over the session's run (`CutileKvCache::spec_row_views`: per-row views
+of one run — row r writes K/V at offset base+r and attends over exactly
+base+r+1 tokens, so the verify runs the SAME decode-class kernels,
+per-row bit-identical to plain decode) — OUTPUT-EQUIVALENT TO PLAIN
+GREEDY DECODE BY CONSTRUCTION, gate `scripts/spec-equivalence.sh`
+(spec ON vs OFF byte-identical, solo + 6 concurrent clients, PASS
+2026-11-22; mean accepted 2.8-2.9 at K=4, hist [26,11,8,54]/99 cycles).
+THROUGHPUT HONEST NEGATIVE (2026-11-22, v1 per-session): solo 0.75x
+(5.5s -> 7.3s per 400 tok; cycle attribution: draft m=1 step ~3.6 ms,
+verify m=4 ~20.7 ms, K=3 best at 10.6 ms/tok cycle-attributed but wall
+clock loses to the m=1 CUDA graph's 13.8 ms/tok incl. per-cycle
+overheads), multi-client 0.27x (per-session cycles serialize in the
+engine loop). Speculation stays OPT-IN (--draft-model unset = off);
+the wins need batched draft steps across sessions + a cheaper draft
+path — recorded as follow-up. Sampled speculation (stochastic
+acceptance) is the other follow-up; v1 is greedy-only, non-greedy
+requests decode normally), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
 typical-p/repeat/presence/frequency; decode path uses the fused top-k-heap
 sampler -- O(n log k), token-identical to the full chain)

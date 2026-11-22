@@ -142,6 +142,16 @@ impl LayerTensors {
             LayerTensors::E4M3(v) => Some(Arc::clone(&v[layer])),
         }
     }
+
+    /// A new LayerTensors sharing the SAME device tensors (Arc clones).
+    /// Used by [`CutileKvCache::spec_row_views`].
+    pub fn share(&self) -> LayerTensors {
+        match self {
+            LayerTensors::F32(v) => LayerTensors::F32(v.clone()),
+            LayerTensors::F16(v) => LayerTensors::F16(v.clone()),
+            LayerTensors::E4M3(v) => LayerTensors::E4M3(v.clone()),
+        }
+    }
 }
 
 /// Paged-attention pool views, dtype-tagged (see [`LayerTensors`]).
@@ -212,6 +222,10 @@ pub struct CutileKvCache {
     f16_stage: Option<Arc<Tensor<half::f16>>>,
     /// Same staging contract for e4m3 pools (cutile_cast_f32_e4m3).
     e4m3_stage: Option<Arc<Tensor<u8>>>,
+    /// Zero-padded f32 staging for the d2d_into_pool cast path when
+    /// num_elems is not a CAST_B multiple (kv_dim-512 models, odd token
+    /// counts).  See [`Self::padded_cast_src`].
+    f32_stage: Option<Arc<Tensor<f32>>>,
 }
 
 // SAFETY: Tensor<f32> and Stream hold raw CUDA pointers but tempura uses a
@@ -264,6 +278,7 @@ impl CutileKvCache {
             v_device: LayerTensors::F32(v_device),
             f16_stage: None,
             e4m3_stage: None,
+            f32_stage: None,
             gpu_max_seq_len,
             host_stale: false,
             block_table_dev: None,
@@ -344,6 +359,7 @@ impl CutileKvCache {
             kv_len_dev: None,
             f16_stage: None,
             e4m3_stage: None,
+            f32_stage: None,
             pool: Some(pool),
             base_page,
             run_pages,
@@ -603,8 +619,39 @@ impl CutileKvCache {
     /// offset (dtype-aware): f32 pools take a straight D2D; f16/e4m3
     /// pools cast through the staging tensor first
     /// (cutile_cast_f32_f16 / cutile_cast_f32_e4m3).
-    fn d2d_into_pool(
+    /// Zero-padded f32 staging for the cast path in [`Self::d2d_into_pool`]:
+    /// D2D `num_elems` elements from `src` into a cached `n_pad`-sized
+    /// buffer.  The (possibly stale) pad tail is cast but never copied
+    /// into the pool -- only `num_elems` elements are.
+    fn padded_cast_src(
         &mut self,
+        src: &Arc<Tensor<f32>>,
+        num_elems: usize,
+        n_pad: usize,
+    ) -> Result<Arc<Tensor<f32>>, KernelError> {
+        let st = match self.f32_stage.take() {
+            Some(t) if t.size() == n_pad => t,
+            _ => Arc::new(
+                api::zeros::<f32>(&[n_pad])
+                    .sync_on(&self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into(),
+            ),
+        };
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(
+                st.device_pointer().cu_deviceptr(),
+                src.device_pointer().cu_deviceptr(),
+                num_elems,
+                &self.stream,
+            )
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+        self.f32_stage = Some(Arc::clone(&st));
+        Ok(st)
+    }
+
+    fn d2d_into_pool(        &mut self,
         layer: usize,
         k_new: &Arc<Tensor<f32>>,
         v_new: &Arc<Tensor<f32>>,
@@ -636,6 +683,14 @@ impl CutileKvCache {
         // calls (exact-size per use).
         let n_pad = num_elems.div_ceil(tempura_kernels::cutile_elementwise::CAST_B)
             * tempura_kernels::cutile_elementwise::CAST_B;
+        // The cast grid pads n up to CAST_B and the kernel validates the
+        // SRC against n_pad: a src sized exactly num_elems fails when
+        // num_elems is not a CAST_B multiple (kv_dim-512 models with odd
+        // token counts -- e.g. the Llama-3.2-1B draft; kv_dim-1024 targets
+        // are always multiples).  Route such srcs through a zero-padded
+        // f32 staging D2D first; the stale pad tail is never copied out
+        // into the pool (only num_elems elements are).
+        let pad_needed = num_elems % tempura_kernels::cutile_elementwise::CAST_B != 0;
         let is_e4m3 = self.k_device.kv_dtype() == KvDtype::E4M3;
         if is_e4m3 {
             let mut stage = match self.e4m3_stage.take() {
@@ -648,9 +703,24 @@ impl CutileKvCache {
                 ),
             };
             for src in [k_new, v_new] {
+                let cast_src = if pad_needed && src.size() < n_pad {
+                    self.padded_cast_src(src, num_elems, n_pad)?
+                } else {
+                    Arc::clone(src)
+                };
                 stage = tempura_kernels::cutile_elementwise::cast_f32_to_e4m3_dev(
-                    src, stage, num_elems, &self.stream,
-                )?;
+                    &cast_src, stage, num_elems, &self.stream,
+                )
+                .map_err(|e| {
+                    KernelError::InvalidConfig(format!(
+                        "d2d_into_pool e4m3 cast ({}): layer={layer} seq_len={} kv_dim={} \
+                         num_elems={num_elems} src_size={} err={e:?}",
+                        if Arc::ptr_eq(src, k_new) { "K" } else { "V" },
+                        self.seq_len,
+                        self.kv_dim,
+                        src.size(),
+                    ))
+                })?;
                 let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
                     self.k_device.ptr(layer)
                 } else {
@@ -679,9 +749,24 @@ impl CutileKvCache {
                 ),
             };
             for src in [k_new, v_new] {
+                let cast_src = if pad_needed && src.size() < n_pad {
+                    self.padded_cast_src(src, num_elems, n_pad)?
+                } else {
+                    Arc::clone(src)
+                };
                 stage = tempura_kernels::cutile_elementwise::cast_f32_to_f16_dev(
-                    src, stage, num_elems, &self.stream,
-                )?;
+                    &cast_src, stage, num_elems, &self.stream,
+                )
+                .map_err(|e| {
+                    KernelError::InvalidConfig(format!(
+                        "d2d_into_pool f16 cast ({}): layer={layer} seq_len={} kv_dim={} \
+                         num_elems={num_elems} src_size={} err={e:?}",
+                        if Arc::ptr_eq(src, k_new) { "K" } else { "V" },
+                        self.seq_len,
+                        self.kv_dim,
+                        src.size(),
+                    ))
+                })?;
                 let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
                     self.k_device.ptr(layer)
                 } else {
@@ -890,6 +975,51 @@ impl CutileKvCache {
     pub fn reset(&mut self) {
         self.seq_len = 0;
         self.host_stale = false;
+    }
+
+    /// Speculative-decode verification views over THIS run (greedy spec
+    /// verify): `seq_lens.len()` lightweight handles that all address the
+    /// SAME pool run, with view r reporting `seq_lens[r]` -- so the batch
+    /// decode path derives per-row KV write offsets (`seq_lens[r]`) and
+    /// attention lengths (`seq_lens[r] + 1`) that make the rows act as one
+    /// sequence's consecutive positions (row r attends over exactly
+    /// `base + r + 1` tokens -- causal verification of a draft block,
+    /// computed with the decode-class kernels, per-row bit-identical to
+    /// plain single-token decode).
+    ///
+    /// The views own NOTHING: `pool = None` makes `try_ensure_capacity` a
+    /// no-op and `run_pages = 0` makes `Drop` a no-op -- the owner must
+    /// `ensure_capacity(base + rows)` BEFORE the call and advance/rollback
+    /// its own `seq_len` after.  Host mirrors are empty and `host_stale`
+    /// is false: the batch decode path never reads them (device attention
+    /// only), and a fresh view therefore never triggers a mirror sync.
+    pub fn spec_row_views(&self, seq_lens: &[usize]) -> Vec<CutileKvCache> {
+        seq_lens
+            .iter()
+            .map(|&sl| CutileKvCache {
+                k_host: vec![Vec::new(); self.n_layers],
+                v_host: vec![Vec::new(); self.n_layers],
+                seq_len: sl,
+                n_layers: self.n_layers,
+                kv_dim: self.kv_dim,
+                max_seq_len: self.max_seq_len,
+                stream: Arc::clone(&self.stream),
+                k_device: self.k_device.share(),
+                v_device: self.v_device.share(),
+                gpu_max_seq_len: self.gpu_max_seq_len,
+                host_stale: false,
+                pool: None,
+                base_page: self.base_page,
+                run_pages: 0,
+                capacity_gen: self.capacity_gen,
+                block_table_dev: None,
+                swap_checksum: None,
+                kv_len_dev: None,
+                f16_stage: None,
+                e4m3_stage: None,
+            f32_stage: None,
+            })
+            .collect()
     }
 
     /// Return host slices for the live K/V prefix (first `kv_len` tokens) for
@@ -1438,6 +1568,39 @@ mod tests {
         use cuda_core::Device;
         let dev = Device::new(0).expect("no CUDA device");
         dev.new_stream().expect("stream creation failed")
+    }
+
+    #[test]
+    fn test_spec_row_views_share_run_and_drop_clean() {
+        // Spec-verify views: per-row seq_lens, shared run identity, and
+        // Drop is a no-op (run_pages == 0) so the owner keeps its pages.
+        let config = ModelConfig::tiny_test();
+        let stream = make_stream();
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let pool = GpuKvPagePool::new_with_dims(
+            config.num_layers,
+            kv_dim,
+            8,
+            stream.clone(),
+        )
+        .unwrap();
+        let pool = Arc::new(std::sync::Mutex::new(pool));
+        let mut cache = CutileKvCache::new_pooled(&config, pool.clone(), 4, stream).unwrap();
+        cache.advance(3);
+        let free_before = pool.lock().unwrap().free_pages();
+        let views = cache.spec_row_views(&[3, 4, 5]);
+        assert_eq!(
+            views.iter().map(|v| v.seq_len()).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert!(views.iter().all(|v| v.base_page() == cache.base_page()));
+        assert!(views.iter().all(|v| v.kv_dtype() == cache.kv_dtype()));
+        assert!(views.iter().all(|v| v.run_pages() == 0));
+        drop(views);
+        // Views must not have returned the owner's pages to the pool.
+        assert_eq!(pool.lock().unwrap().free_pages(), free_before);
+        drop(cache);
+        assert!(pool.lock().unwrap().free_pages() > free_before);
     }
 
     #[test]

@@ -141,7 +141,11 @@ cmp_tag() {
             pass=0
         fi
     done
-    return $pass
+    # Shell convention: 0 = success.  (This returned $pass -- 1 on
+    # all-MATCH -- which the `cmp_tag ... || PASS=0` callers treated as
+    # failure: the gate printed RESULT: FAIL on a fully-matching run.
+    # Found 2026-11-22 when the spec-equivalence round re-ran it.)
+    [ "$pass" -eq 1 ]
 }
 
 if ! run_server A1 20000; then exit 1; fi
