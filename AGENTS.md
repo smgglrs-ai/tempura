@@ -661,17 +661,29 @@ base+r+1 tokens, so the verify runs the SAME decode-class kernels,
 per-row bit-identical to plain decode) — OUTPUT-EQUIVALENT TO PLAIN
 GREEDY DECODE BY CONSTRUCTION, gate `scripts/spec-equivalence.sh`
 (spec ON vs OFF byte-identical, solo + 6 concurrent clients, PASS
-2026-11-22; mean accepted 2.8-2.9 at K=4, hist [26,11,8,54]/99 cycles).
-THROUGHPUT HONEST NEGATIVE (2026-11-22, v1 per-session): solo 0.75x
-(5.5s -> 7.3s per 400 tok; cycle attribution: draft m=1 step ~3.6 ms,
-verify m=4 ~20.7 ms, K=3 best at 10.6 ms/tok cycle-attributed but wall
-clock loses to the m=1 CUDA graph's 13.8 ms/tok incl. per-cycle
-overheads), multi-client 0.27x (per-session cycles serialize in the
-engine loop). Speculation stays OPT-IN (--draft-model unset = off);
-the wins need batched draft steps across sessions + a cheaper draft
-path — recorded as follow-up. Sampled speculation (stochastic
-acceptance) is the other follow-up; v1 is greedy-only, non-greedy
-requests decode normally), Medusa multi-token,
+2026-11-22 AND 2026-11-23 v2; mean accepted 2.8-2.9 at K=4, hist
+[117,90,54,225]/486 session-cycles). v2 (2026-11-23) BATCHES the
+cycles across sessions: all spec sessions' drafts run K BATCHED
+forwards (m = live sessions) and ALL sessions verify in ONE
+multi-session forward (`spec_verify_greedy_multi`: session i
+contributes j_i spec-row-views of its own run — the per-row
+kv_len/base/offset machinery composes across mixed sessions, gate-
+proven). THROUGHPUT HONEST NEGATIVE (both v1 and v2): solo 0.72x
+(71.7 -> 51.9 tok/s), multi-client 0.35x (453 -> 160 tok/s; v1
+per-session was 0.27x). Attribution (per-engine-cycle, m=6): draft
+38 ms (4 batched 1B steps -- the 1B's f32 lm_head is 1.05 GB = 47% of
+its bytes), verify 75.6 ms for 24 rows = ~3.15 ms/row -- a verify row
+costs the same as a plain decode row and does NOT amortize with m,
+while plain batched decode already amortizes weight traffic across
+sessions: the classic speculation win condition (memory-bound solo
+decode) is absent at serving batch sizes. Verify chunking at
+max_batch_graph measured WORSE (81.4 vs 75.6 ms, weights re-read per
+chunk) -- reverted, recorded. Next levers: a cheaper draft (Q6K-
+quantized draft lm_head at load, a 0.5B draft) and EAGLE/Medusa-style
+draft heads on the target's hidden state (removes the K-draft-passes
+floor). Speculation stays OPT-IN (--draft-model unset = off).
+Sampled speculation (stochastic acceptance) is the other follow-up;
+greedy-only, non-greedy requests decode normally), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
 typical-p/repeat/presence/frequency; decode path uses the fused top-k-heap
 sampler -- O(n log k), token-identical to the full chain)

@@ -5293,7 +5293,7 @@ impl CutileGpuModel {
         let is_q4k = self.device_weights_q4k.contains_key(weight_name);
         let is_q6k = self.device_weights_q6k.contains_key(weight_name);
         let is_q2 = self.device_weights_q2.contains_key(weight_name);
-        if !is_q4k && !is_q6k && !is_q2 {
+        if !is_q4k && !is_q6k && !is_q2 && m == 1 {
             return self.gemm_any_d2d_slot(a, weight_name, m, slot);
         }
 
@@ -5308,12 +5308,71 @@ impl CutileGpuModel {
                 .get(weight_name)
                 .map(|dw| dw.n)
                 .unwrap_or(0)
-        } else {
+        } else if is_q2 {
             self.device_weights_q2
                 .get(weight_name)
                 .map(|dw| dw.n)
                 .unwrap_or(0)
+        } else {
+            // f32 weight at m > 1: falls through to the pooled per-row
+            // loop below -- the same coalesced GEMV per row as the m=1
+            // route (bit-identical per row, unlike the tiled prefill GEMM
+            // this path used to take) into pooled buffers, so a CUDA-graph
+            // capture allocates nothing. The OLD early return to
+            // gemm_any_d2d_slot dispatched the ALLOCATING tiled GEMM at
+            // m > 1: eager-legal, but a DriverError 900 panic inside a
+            // capture (found by the Llama-3.2-1B draft's f32 lm_head on
+            // the m>=2 ragged-graph route).
+            self.device_weights
+                .get(weight_name)
+                .map(|dw| dw.n)
+                .unwrap_or(0)
         };
+
+        // f32 weight at m > 1 (e.g. the Llama-3.2-1B draft's lm_head, 47%
+        // of that model's bytes): one POOLED tiled GEMM reads the weight
+        // matrix ONCE for all m rows -- the per-row loop below re-reads it
+        // m times (at m=6 that is ~5 GB of avoidable traffic per draft
+        // step).  Numerics note: the tiled GEMM is a different sum-order
+        // class than the m=1 slot GEMV; that is acceptable HERE because
+        // the only current m > 1 f32 batch consumer is the SPEC DRAFT
+        // (draft numerics influence acceptance length, never the emitted
+        // tokens) -- no current target model has an f32 weight on the
+        // batch path.  Falls back to the per-row loop when the pooled
+        // buffer cannot be reclaimed or the GEMM rejects it.
+        if !is_q4k && !is_q6k && !is_q2 && m > 1 {
+            let dw = self.device_weights.get(weight_name).unwrap();
+            let pooled: Option<Tensor<f32>> = {
+                let mut pool = self.nograph.borrow_mut();
+                match pool.gemm_out.remove(&(slot, n, m)) {
+                    Some(arc) => match Arc::try_unwrap(arc) {
+                        Ok(t) => Some(t),
+                        Err(arc_back) => {
+                            pool.gemm_out.insert((slot, n, m), arc_back);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(out_t) = pooled {
+                match self
+                    .matmul
+                    .forward_bt_d2d_into(a, &dw.tensor, out_t, m, n, dw.k_pad)
+                {
+                    Ok(result) => {
+                        let mut pool = self.nograph.borrow_mut();
+                        pool.gemm_out.insert((slot, n, m), result.clone());
+                        return result;
+                    }
+                    Err(_) => {
+                        // out_t was consumed by the failed call; the next
+                        // call re-allocates the pooled buffer.  This step
+                        // falls through to the per-row loop.
+                    }
+                }
+            }
+        }
 
         // sm_120 batch Q4K kernel: NOT dispatched here (removed 2026-11-15).
         // The PTX is M=2 hardcoded (07f74ce guarded m!=2), but even at
@@ -5614,8 +5673,12 @@ impl CutileGpuModel {
             match pool.a_row.get(&(slot, row_stride)) {
                 Some(buf) => buf.clone(),
                 None => {
+                    // Rank 2 ([1, row_stride]): the m=1 slot GEMVs hand
+                    // this to cutile_gemv_coalesced, which expects a rank-2
+                    // x (the normed-hidden tensors the decode path passes
+                    // are [1, h_pad]).
                     let buf = Arc::new(
-                        api::zeros::<f32>(&[row_stride])
+                        api::zeros::<f32>(&[1, row_stride])
                             .sync_on(stream)
                             .expect("gemm_any_d2d_batch: a_row alloc"),
                     );

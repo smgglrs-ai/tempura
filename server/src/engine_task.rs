@@ -43,13 +43,15 @@ struct ActiveSession {
     response_tx: mpsc::Sender<EngineEvent>,
 }
 
-/// Per-request DRAFT model state for speculative decoding (greedy v1):
+/// Per-request DRAFT model state for speculative decoding (greedy):
 /// the draft's own pooled KV run + a session mirror for position
-/// bookkeeping through `forward_with_kv` (prompt prefill).
+/// bookkeeping through `forward_with_kv` (prompt prefill).  `kv` is an
+/// Option so a batched draft step can `take()` every live run into a
+/// contiguous slice for `forward_batch_with_kvs_greedy` and put it back.
 #[cfg(feature = "cutile")]
 struct DraftCache {
     session: InferenceSession,
-    kv: tempura_engine::cutile_kv_cache::CutileKvCache,
+    kv: Option<tempura_engine::cutile_kv_cache::CutileKvCache>,
     prefilled: bool,
 }
 
@@ -68,9 +70,14 @@ struct SpecStats {
     tokens_emitted: u64,
     /// Wall time in the draft-propose phase vs the verify forward (the
     /// throughput attribution: which side a future optimization must
-    /// attack).  Microseconds.
+    /// attack).  Microseconds.  Accumulated per ENGINE cycle (one
+    /// spec_batch_step_gpu call), unlike `cycles`/`hist` which count
+    /// per-SESSION notes.
     draft_us: u64,
     verify_us: u64,
+    /// Engine spec cycles (spec_batch_step_gpu calls) -- the correct
+    /// denominator for draft_us/verify_us.
+    engine_cycles: u64,
 }
 
 #[cfg(feature = "cutile")]
@@ -93,6 +100,7 @@ impl SpecStats {
     fn add_timing(&mut self, draft_us: u64, verify_us: u64) {
         self.draft_us += draft_us;
         self.verify_us += verify_us;
+        self.engine_cycles += 1;
     }
 }
 
@@ -579,14 +587,13 @@ impl EngineTask {
             };
             stepped.retain(|id| !swapped.contains(id));
         }
-        // -- Speculative split (greedy v1) ----------------------------------
-        // Decode-ready PURE-GREEDY sessions speculate per-session when a
-        // draft model is loaded: the draft proposes K tokens (K sequential
-        // m=1 draft steps), then the target verifies them in ONE batch-
-        // decode-shaped forward over the session's own run (see
-        // spec_step_gpu).  Everything else -- sampled sessions included,
-        // v1 is greedy-only -- takes the plain batch step below; the
-        // batch's other sessions proceed normally on their steps.
+        // -- Speculative split (greedy) -----------------------------------
+        // Decode-ready PURE-GREEDY sessions speculate when a draft model
+        // is loaded: ALL of them run one BATCHED spec cycle (K batched
+        // draft steps across sessions, then ONE multi-session verify --
+        // see spec_batch_step_gpu).  Everything else -- sampled sessions
+        // included, speculation is greedy-only -- takes the plain batch
+        // step below.
         let (spec_ids, stepped): (Vec<String>, Vec<String>) = if self.draft_model.is_some() {
             stepped.into_iter().partition(|id| {
                 sessions
@@ -602,10 +609,8 @@ impl EngineTask {
         if !stepped.is_empty() {
             completed.extend(self.plain_batch_step_gpu(sessions, stepped));
         }
-        for id in &spec_ids {
-            if self.spec_step_gpu(sessions, id) {
-                completed.push(id.clone());
-            }
+        if !spec_ids.is_empty() {
+            completed.extend(self.spec_batch_step_gpu(sessions, spec_ids));
         }
         completed
     }
@@ -732,203 +737,408 @@ impl EngineTask {
         completed
     }
 
-    /// One speculative decode cycle for `id` (greedy v1):
-    ///
-    ///   1. (lazy) prefill the draft with the session's prompt;
-    ///   2. the draft proposes K tokens (K sequential m=1 greedy draft
-    ///      steps through the draft's own pooled run);
-    ///   3. the target VERIFIES [last_emitted, d1..d_{K-1}] in ONE
-    ///      batch-decode-shaped forward over the target run -- row r
-    ///      writes its K/V at offset base+r and attends over exactly
-    ///      base+r+1 tokens (causal), so the verify is computed with the
-    ///      SAME decode-class kernels as plain decode, per-row
-    ///      bit-identical to it;
-    ///   4. accept the longest prefix where d_i == row_i's argmax, emit
-    ///      the target's argmax at the first mismatch (or the last draft
-    ///      on full acceptance), and roll BOTH KV runs back to
-    ///      base + emitted (the K/V kept is exactly L + the accepted
-    ///      draft prefix -- what plain decode would have written).
-    ///
-    /// By construction the emitted token sequence is IDENTICAL to plain
-    /// greedy decode (the equivalence gate, scripts/spec-equivalence.sh);
-    /// the draft's numerics only influence acceptance length, never the
-    /// output.  Returns true when the request finished.  On any
-    /// speculation-path failure falls back to a plain m=1 step.
+    /// Lazy draft-state materialization + prompt prefill for `id`.
+    /// Returns true when the draft run is prefilled and in sync with the
+    /// target's prompt.  On failure the draft state is dropped and the
+    /// session stops speculating (plain decode).
     #[cfg(feature = "cutile")]
-    fn spec_step_gpu(&mut self, sessions: &mut HashMap<String, ActiveSession>, id: &str) -> bool {
-        let Some(draft_model) = self.draft_model.clone() else {
-            return false;
-        };
-        // A plain-batch eviction (or this tick's earlier spec steps) may
-        // have swapped this session out after the decode-ready list was
-        // built -- speculating on a swapped run would read freed pages.
-        let resident = self
-            .scheduler
-            .lock()
-            .map(|s| {
-                s.active_sequences()
-                    .iter()
-                    .any(|seq| seq.request_id == id && seq.state == SequenceState::Decode)
-            })
-            .unwrap_or(false);
-        if !resident {
-            return false;
-        }
-        let k = self.spec_k();
-        let entry = sessions.get(id).expect("spec decode session");
-        let last = *entry.generated.last().expect("decode has a last token");
-        let prompt_len = entry.prefill_tokens.len();
-        let base = self
-            .kv_caches
-            .get(id)
-            .map(|kv| kv.seq_len())
-            .unwrap_or(0);
-        debug_assert_eq!(base, sessions.get(id).unwrap().session.position);
-
-        // (1) Lazy draft-state materialization + prompt prefill.
+    fn ensure_draft_state(
+        &mut self,
+        draft_model: &Arc<dyn InferenceModel>,
+        sessions: &HashMap<String, ActiveSession>,
+        id: &str,
+    ) -> bool {
         if !self.draft_caches.contains_key(id) {
             self.ensure_draft_kv_pool();
-            let Some(pool) = self.draft_kv_pool.clone() else {
-                return self.plain_step_gpu(sessions, id);
-            };
-            let Some(dkv) = draft_model.new_session_kv_cache(&pool, 256) else {
-                return self.plain_step_gpu(sessions, id);
-            };
-            let dsess = InferenceSession::new(draft_model.config(), TraceLevel::Off, 0);
-            self.draft_caches.insert(
-                id.to_string(),
-                DraftCache {
-                    session: dsess,
-                    kv: dkv,
+            let dc = self
+                .draft_kv_pool
+                .clone()
+                .and_then(|pool| draft_model.new_session_kv_cache(&pool, 256))
+                .map(|kv| DraftCache {
+                    session: InferenceSession::new(draft_model.config(), TraceLevel::Off, 0),
+                    kv: Some(kv),
                     prefilled: false,
-                },
-            );
+                });
+            let Some(dc) = dc else {
+                return false;
+            };
+            self.draft_caches.insert(id.to_string(), dc);
         }
+        let dc = self.draft_caches.get_mut(id).expect("draft cache");
+        if dc.prefilled {
+            return true;
+        }
+        let entry = sessions.get(id).expect("spec decode session");
+        let prompt_len = entry.prefill_tokens.len();
+        let mut done = true;
         {
-            let dc = self.draft_caches.get_mut(id).expect("draft cache");
-            if !dc.prefilled {
-                let entry = sessions.get(id).expect("spec decode session");
-                let mut done = true;
-                for chunk in entry.prefill_tokens.chunks(PREFILL_CHUNK_SIZE) {
-                    if draft_model
-                        .forward_with_kv(&mut dc.session, chunk, &mut dc.kv)
-                        .is_none()
-                    {
-                        done = false;
-                        break;
-                    }
+            let kv = dc.kv.as_mut().expect("draft kv");
+            for chunk in entry.prefill_tokens.chunks(PREFILL_CHUNK_SIZE) {
+                if draft_model
+                    .forward_with_kv(&mut dc.session, chunk, kv)
+                    .is_none()
+                {
+                    done = false;
+                    break;
                 }
-                if !done || dc.kv.seq_len() != prompt_len {
-                    // Draft prefill failed -- stop speculating on this
-                    // session entirely (fall back to plain decode).
-                    self.draft_caches.remove(id);
-                    return self.plain_step_gpu(sessions, id);
-                }
-                dc.prefilled = true;
             }
+        }
+        if !done || dc.kv.as_ref().unwrap().seq_len() != prompt_len {
+            // Draft prefill failed -- stop speculating on this session
+            // entirely (fall back to plain decode).
+            self.draft_caches.remove(id);
+            return false;
+        }
+        dc.prefilled = true;
+        true
+    }
+
+    /// One BATCHED speculative decode cycle across all spec-eligible
+    /// sessions (v2 -- v1's per-session cycle serialized in the engine
+    /// loop, 0.27x at 6 clients):
+    ///
+    ///   1. (lazy, per session) prefill the draft with the session's
+    ///      prompt;
+    ///   2. the draft proposes K tokens for EVERY session in K batched
+    ///      forwards (m = live sessions, one launch chain per step
+    ///      instead of K per session);
+    ///   3. the target VERIFIES all sessions in ONE batch-decode-shaped
+    ///      forward: session i contributes j_i = K rows over its own run
+    ///      (row r writes K/V at offset base_i + r, attends exactly
+    ///      base_i + r + 1 tokens -- causal), through the same per-row
+    ///      machinery the plain batch path dispatches;
+    ///   4. per session: accept the longest prefix where d_i == row_i's
+    ///      argmax, emit the target's argmax at the first mismatch, roll
+    ///      BOTH KV runs back to base + emitted.
+    ///
+    /// By construction the emitted token sequence per session is
+    /// IDENTICAL to plain greedy decode (the equivalence gate,
+    /// scripts/spec-equivalence.sh); the draft's numerics only influence
+    /// acceptance length.  Returns the ids that finished.  Sessions that
+    /// cannot grow their target run are deferred to a later tick (v1
+    /// semantics); sessions whose draft chain broke early (< 2
+    /// proposals) fall back to one plain m=1 step.
+    #[cfg(feature = "cutile")]
+    fn spec_batch_step_gpu(
+        &mut self,
+        sessions: &mut HashMap<String, ActiveSession>,
+        spec_ids: Vec<String>,
+    ) -> Vec<String> {
+        let Some(draft_model) = self.draft_model.clone() else {
+            return Vec::new();
+        };
+        let mut completed = Vec::new();
+
+        // (0) Still-resident, greedy, decode-ready filter.  A plain-batch
+        // eviction (or this tick's earlier steps) may have swapped a
+        // session out after the decode-ready list was built --
+        // speculating on a swapped run would read freed pages.
+        let mut act: Vec<String> = Vec::with_capacity(spec_ids.len());
+        {
+            let Ok(sched) = self.scheduler.lock() else {
+                return completed;
+            };
+            let decode_ids: std::collections::HashSet<&str> = sched
+                .active_sequences()
+                .iter()
+                .filter(|s| s.state == SequenceState::Decode)
+                .map(|s| s.request_id.as_str())
+                .collect();
+            for id in spec_ids {
+                if decode_ids.contains(id.as_str())
+                    && sessions.get(&id).map(|e| e.params.is_greedy()).unwrap_or(false)
+                    && self.kv_caches.contains_key(&id)
+                {
+                    act.push(id);
+                }
+            }
+        }
+        if act.is_empty() {
+            return completed;
         }
 
-        // (2) Draft K proposals.  The draft's own numerics never affect
-        // the output (only acceptance length), so any path is safe.
-        // Resync first: a previous tick's fallback (plain step after a
-        // failed verify/draft) leaves the draft ahead of the target --
-        // roll it back to the target's base so it re-feeds from the
-        // actually-emitted token (stale K/V rows are overwritten).
-        {
-            let dc = self.draft_caches.get_mut(id).expect("draft cache");
-            if dc.kv.seq_len() > base {
-                dc.kv.rollback(base);
+        // (1) Lazy draft-state materialization + prompt prefill.
+        let mut ready: Vec<String> = Vec::with_capacity(act.len());
+        for id in act {
+            if self.ensure_draft_state(&draft_model, sessions, &id) {
+                ready.push(id);
+            } else if self.plain_step_gpu(sessions, &id) {
+                completed.push(id);
             }
-            debug_assert_eq!(dc.kv.seq_len(), base);
         }
+        if ready.is_empty() {
+            return completed;
+        }
+
+        let k = self.spec_k();
+        let n = ready.len();
+        let dbg_timing = std::env::var("TEMPURA_ENGINE_DEBUG_TICKS").is_ok();
+        let t_prep = std::time::Instant::now();
+
+        // (2) Resync every draft run to its target's base: a previous
+        // tick's fallback (plain step after a failed verify/draft) leaves
+        // the draft ahead of the target -- roll it back so it re-feeds
+        // from the actually-emitted token (stale K/V rows are
+        // overwritten).  Then collect the feeds (each session's last
+        // emitted token) and bases.
+        let mut feeds = vec![0u32; n];
+        for (i, id) in ready.iter().enumerate() {
+            let entry = sessions.get(id).expect("spec decode session");
+            feeds[i] = *entry.generated.last().expect("decode has a last token");
+            let base = self
+                .kv_caches
+                .get(id)
+                .map(|kv| kv.seq_len())
+                .unwrap_or(0);
+            debug_assert_eq!(base, sessions.get(id).unwrap().session.position);
+            let dc = self.draft_caches.get_mut(id).expect("draft cache");
+            let dkv = dc.kv.as_mut().expect("draft kv");
+            if dkv.seq_len() > base {
+                dkv.rollback(base);
+            }
+            debug_assert_eq!(dkv.seq_len(), base);
+        }
+
+        // (3) K BATCHED draft steps.  Live draft runs are held contiguous
+        // in `dkvs[..m]` (owner[s] maps slot -> session); a session that
+        // stops drafting (pool tight, non-token row) is swap-removed to
+        // the tail and keeps whatever proposals it already collected.
+        let mut dkvs: Vec<tempura_engine::cutile_kv_cache::CutileKvCache> =
+            Vec::with_capacity(n);
+        for id in &ready {
+            dkvs.push(
+                self.draft_caches
+                    .get_mut(id)
+                    .expect("draft cache")
+                    .kv
+                    .take()
+                    .expect("draft kv"),
+            );
+        }
+        let mut owner: Vec<usize> = (0..n).collect();
+        let mut drafting: Vec<bool> = vec![true; n];
+        let mut drafts: Vec<Vec<u32>> = vec![Vec::with_capacity(k); n];
         let t_draft = std::time::Instant::now();
-        let mut drafts: Vec<u32> = Vec::with_capacity(k);
-        let mut feed = last;
-        for _ in 0..k {
-            let dc = self.draft_caches.get_mut(id).expect("draft cache");
-            if dc.kv.try_ensure_capacity(dc.kv.seq_len() + 1).is_err() {
-                break; // draft pool tight: fewer proposals this cycle
-            }
-            let pos = dc.kv.seq_len() as u32;
-            let out = draft_model.forward_batch_with_kvs_greedy(
-                &[feed],
-                &[pos],
-                std::slice::from_mut(&mut dc.kv),
-                &[true],
-            );
-            match out.as_ref().and_then(|o| o.first()) {
-                Some(tempura_engine::BatchDecodeOutput::Token(t)) => {
-                    drafts.push(*t);
-                    feed = *t;
+        let mut m = n;
+        'draft: for _step in 0..k {
+            let mut s = 0;
+            while s < m {
+                let next = dkvs[s].seq_len() + 1;
+                if dkvs[s].try_ensure_capacity(next).is_err() {
+                    // draft pool tight: this session keeps fewer proposals
+                    let sess = owner[s];
+                    drafting[sess] = false;
+                    m -= 1;
+                    dkvs.swap(s, m);
+                    owner.swap(s, m);
+                } else {
+                    s += 1;
                 }
-                _ => break,
             }
-        }
-        if drafts.len() < 2 {
-            return self.plain_step_gpu(sessions, id);
-        }
-        let draft_us = t_draft.elapsed().as_micros() as u64;
-
-        // (3) Verify: rows = [last, d1..d_{K-1}] -- row i's argmax is the
-        // plain-decode prediction for d_{i+1}.  Grow the target run for
-        // the whole block first (eviction-aware).
-        if !self.ensure_capacity_with_eviction(id, base + k, &[id.to_string()]) {
-            return false; // deferred to a later tick
-        }
-        let t_verify = std::time::Instant::now();
-        let j = drafts.len();
-        let mut verify_tokens: Vec<u32> = Vec::with_capacity(j);
-        verify_tokens.push(last);
-        verify_tokens.extend_from_slice(&drafts[..j - 1]);
-        let argmaxes = {
-            let kv = self.kv_caches.get_mut(id).expect("target kv");
-            self.model.forward_spec_verify_greedy(&verify_tokens, kv)
-        };
-        let Some(argmaxes) = argmaxes else {
-            return self.plain_step_gpu(sessions, id);
-        };
-        debug_assert_eq!(argmaxes.len(), j);
-
-        // (4) Accept the longest matching prefix; emit the target's
-        // argmax at the first mismatch.
-        let mut a = 0;
-        while a < j && argmaxes[a] == drafts[a] {
-            a += 1;
-        }
-        let emitted: Vec<u32> = if a == j {
-            drafts.clone()
-        } else {
-            let mut v = drafts[..a].to_vec();
-            v.push(argmaxes[a]);
-            v
-        };
-        let n = emitted.len(); // a + 1, capped at j on full acceptance
-        self.spec_stats.add_timing(draft_us, t_verify.elapsed().as_micros() as u64);
-        {
-            let kv = self.kv_caches.get_mut(id).expect("target kv");
-            kv.rollback(base + n);
-        }
-        {
-            let dc = self.draft_caches.get_mut(id).expect("draft cache");
-            dc.kv.rollback(base + n);
-        }
-        let entry = sessions.get_mut(id).expect("spec decode session");
-        entry.session.cache.advance(n);
-        entry.session.position += n;
-        self.spec_stats.note(n, k);
-
-        let mut done = false;
-        for tok in emitted {
-            if entry.emit_token(tok) {
-                done = true;
+            if m == 0 {
                 break;
             }
+            let toks: Vec<u32> = (0..m).map(|s| feeds[owner[s]]).collect();
+            let pos: Vec<u32> = dkvs[..m].iter().map(|kv| kv.seq_len() as u32).collect();
+            let greedy = vec![true; m];
+            let out = draft_model.forward_batch_with_kvs_greedy(
+                &toks,
+                &pos,
+                &mut dkvs[..m],
+                &greedy,
+            );
+            match out {
+                Some(rows) => {
+                    for (s, row) in rows.into_iter().enumerate() {
+                        let sess = owner[s];
+                        match row {
+                            tempura_engine::BatchDecodeOutput::Token(t) => {
+                                drafts[sess].push(t);
+                                feeds[sess] = t;
+                            }
+                            // unreachable with greedy rows; stop drafting
+                            // for this session (keeps its proposals)
+                            tempura_engine::BatchDecodeOutput::Logits(_) => {
+                                drafting[sess] = false;
+                            }
+                        }
+                    }
+                    let mut s = 0;
+                    while s < m {
+                        if !drafting[owner[s]] {
+                            m -= 1;
+                            dkvs.swap(s, m);
+                            owner.swap(s, m);
+                        } else {
+                            s += 1;
+                        }
+                    }
+                    if m == 0 {
+                        break 'draft;
+                    }
+                }
+                // Nothing advanced on None -- every session keeps its
+                // (possibly empty) proposal set; short ones fall back
+                // to a plain step below.
+                None => break 'draft,
+            }
         }
-        if let Ok(mut sched) = self.scheduler.lock() {
-            let tokens = self.kv_caches.get(id).map(|kv| kv.seq_len()).unwrap_or(0);
-            sched.touch(id, tokens);
+        let draft_us = t_draft.elapsed().as_micros() as u64;
+        if dbg_timing {
+            eprintln!(
+                "[spec-timing] m={m}/{n} prep={:?} draft={:?}",
+                t_prep.elapsed(),
+                t_draft.elapsed()
+            );
         }
-        done
+        // Restore every draft run to its DraftCache (slots m..n hold the
+        // retired ones).
+        for (s, kv) in dkvs.into_iter().enumerate() {
+            let id = &ready[owner[s]];
+            self.draft_caches.get_mut(id).expect("draft cache").kv = Some(kv);
+        }
+
+        // (4) Partition: sessions with >= 2 proposals verify; the rest
+        // take one plain m=1 step (deferred to after the verify so the
+        // verify set cannot be evicted by a fallback's growth).
+        let mut verify: Vec<(String, Vec<u32>)> = Vec::with_capacity(n);
+        let mut fallback: Vec<String> = Vec::new();
+        for (i, id) in ready.iter().enumerate() {
+            if drafts[i].len() >= 2 {
+                verify.push((id.clone(), std::mem::take(&mut drafts[i])));
+            } else {
+                fallback.push(id.clone());
+            }
+        }
+
+        // (5) The batched verify.  Pre-grow every target run for its
+        // whole block first (eviction-aware, the whole verify set
+        // protected); growth failures defer to a later tick.
+        let protect: Vec<String> = verify.iter().map(|(id, _)| id.clone()).collect();
+        let t_pregrow = std::time::Instant::now();
+        let mut grown: Vec<(String, Vec<u32>)> = Vec::with_capacity(verify.len());
+        for (id, dr) in verify {
+            let base = self.kv_caches.get(&id).map(|kv| kv.seq_len()).unwrap_or(0);
+            if self.ensure_capacity_with_eviction(&id, base + dr.len(), &protect) {
+                grown.push((id, dr));
+            }
+        }
+        // A retry may have swapped a verify member out -- drop it from
+        // this cycle (it resumes via swap-in; its draft run resyncs next
+        // tick).
+        if !grown.is_empty() {
+            let swapped: Vec<String> = match self.scheduler.lock() {
+                Ok(s) => s
+                    .active_sequences()
+                    .iter()
+                    .filter(|seq| seq.state == SequenceState::Swapped)
+                    .map(|seq| seq.request_id.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            grown.retain(|(id, _)| !swapped.contains(id));
+        }
+
+        let mut verify_us = 0u64;
+        if !grown.is_empty() {
+            let t_verify = std::time::Instant::now();
+            let ids: Vec<String> = grown.iter().map(|(id, _)| id.clone()).collect();
+            let token_lists: Vec<Vec<u32>> = grown
+                .iter()
+                .map(|(id, dr)| {
+                    let entry = sessions.get(id).expect("spec decode session");
+                    let last = *entry.generated.last().expect("decode has a last token");
+                    let j = dr.len();
+                    let mut v = Vec::with_capacity(j);
+                    v.push(last);
+                    v.extend_from_slice(&dr[..j - 1]);
+                    v
+                })
+                .collect();
+            let mut kvs: Vec<tempura_engine::cutile_kv_cache::CutileKvCache> = grown
+                .iter()
+                .map(|(id, _)| self.kv_caches.remove(id).expect("target kv"))
+                .collect();
+            let argmaxes = self
+                .model
+                .forward_spec_verify_greedy_multi(&token_lists, &mut kvs);
+            match argmaxes {
+                Some(per_session) => {
+                    debug_assert_eq!(per_session.len(), kvs.len());
+                    for (((id, dr), kv), argmaxes) in
+                        grown.into_iter().zip(kvs).zip(per_session.into_iter())
+                    {
+                        // accept the longest matching prefix; emit the
+                        // target's argmax at the first mismatch
+                        let j = dr.len();
+                        let base = kv.seq_len() - j; // the verify advanced by j
+                        let mut a = 0;
+                        while a < j && argmaxes[a] == dr[a] {
+                            a += 1;
+                        }
+                        let emitted: Vec<u32> = if a == j {
+                            dr.clone()
+                        } else {
+                            let mut v = dr[..a].to_vec();
+                            v.push(argmaxes[a]);
+                            v
+                        };
+                        let n_em = emitted.len();
+                        let mut kv = kv;
+                        kv.rollback(base + n_em);
+                        self.kv_caches.insert(id.clone(), kv);
+                        if let Some(dc) = self.draft_caches.get_mut(&id) {
+                            if let Some(dkv) = dc.kv.as_mut() {
+                                dkv.rollback(base + n_em);
+                            }
+                        }
+                        let entry = sessions.get_mut(&id).expect("spec decode session");
+                        entry.session.cache.advance(n_em);
+                        entry.session.position += n_em;
+                        self.spec_stats.note(n_em, k);
+                        let mut done = false;
+                        for tok in emitted {
+                            if entry.emit_token(tok) {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            completed.push(id.clone());
+                        }
+                        if let Ok(mut sched) = self.scheduler.lock() {
+                            let tokens =
+                                self.kv_caches.get(&id).map(|kv| kv.seq_len()).unwrap_or(0);
+                            sched.touch(&id, tokens);
+                        }
+                    }
+                }
+                None => {
+                    // Unsupported shape -- plain steps for everyone.
+                    for (id, kv) in ids.into_iter().zip(kvs) {
+                        self.kv_caches.insert(id.clone(), kv);
+                        fallback.push(id);
+                    }
+                }
+            }
+            verify_us = t_verify.elapsed().as_micros() as u64;
+            if dbg_timing {
+                eprintln!(
+                    "[spec-timing] rows={} pregrow={:?} verify={:?}",
+                    token_lists.iter().map(|t| t.len()).sum::<usize>(),
+                    t_pregrow.elapsed(),
+                    t_verify.elapsed()
+                );
+            }
+        }
+        self.spec_stats.add_timing(draft_us, verify_us);
+
+        for id in &fallback {
+            if self.plain_step_gpu(sessions, id) {
+                completed.push(id.clone());
+            }
+        }
+        completed
     }
 
     /// Plain single-session m=1 decode step (the speculation fallback:
@@ -1183,13 +1393,14 @@ impl EngineTask {
                     let s = &self.spec_stats;
                     if s.cycles > 0 {
                         format!(
-                            " | spec: cycles={} mean_emitted={:.2} hist={:?} \
-                             draft={:.1}ms/cyc verify={:.1}ms/cyc",
+                            " | spec: cycles={} (engine={}) mean_emitted={:.2} hist={:?} \
+                             draft={:.1}ms/eng-cyc verify={:.1}ms/eng-cyc",
                             s.cycles,
+                            s.engine_cycles,
                             s.mean(),
                             s.hist,
-                            s.draft_us as f64 / 1000.0 / s.cycles as f64,
-                            s.verify_us as f64 / 1000.0 / s.cycles as f64,
+                            s.draft_us as f64 / 1000.0 / s.engine_cycles as f64,
+                            s.verify_us as f64 / 1000.0 / s.engine_cycles as f64,
                         )
                     } else {
                         String::new()

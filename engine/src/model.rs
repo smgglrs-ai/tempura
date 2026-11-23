@@ -468,6 +468,26 @@ pub trait InferenceModel: Send + Sync {
     ) -> Option<Vec<u32>> {
         None
     }
+    /// Multi-session greedy speculative-decode VERIFICATION (v2): session
+    /// i contributes `tokens[i].len()` rows over `kvs[i]`'s run -- row r of
+    /// session i writes its K/V at offset `kvs[i].seq_len() + r` and
+    /// attends over exactly `kvs[i].seq_len() + r + 1` tokens (causal) --
+    /// all in ONE batch-decode-shaped forward.  Returns per-session argmax
+    /// rows.  Same per-row bit-identity contract as
+    /// [`Self::forward_spec_verify_greedy`]; the batch kernels are
+    /// composition-invariant, so mixing sessions in one call cannot change
+    /// any row's output.  Each caller must pre-grow its run to
+    /// `seq_len + rows` BEFORE calling.  On return each run's host seq_len
+    /// has advanced by its row count; callers roll back to the accepted
+    /// length.  None = unsupported (fall back to plain decode steps).
+    #[cfg(feature = "cutile")]
+    fn forward_spec_verify_greedy_multi(
+        &self,
+        _tokens: &[Vec<u32>],
+        _kvs: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Option<Vec<Vec<u32>>> {
+        None
+    }
 }
 
 /// One decode step's output row: either the already-sampled token (pure
@@ -10695,6 +10715,82 @@ impl CutileInferenceWrapper {
         Some(tokens)
     }
 
+    /// Multi-session greedy speculative verification (the trait's
+    /// `forward_spec_verify_greedy_multi`): session i contributes
+    /// `per_session[i].len()` rows over `kvs[i]`'s run -- row r at KV
+    /// offset `kvs[i].seq_len() + r`, attending exactly the first
+    /// `kvs[i].seq_len() + r + 1` tokens (causal).  All rows run through
+    /// ONE `forward_batch_decode_greedy` call: the batch kernels take
+    /// per-row KV write offsets, kv_lens and run base pointers, so rows of
+    /// different sessions compose exactly like rows of one session --
+    /// per-row bit-identical to plain decode (the same composition-
+    /// invariance the serving batch path is gated on).  The whole batch
+    /// runs as ONE forward (m-loop kernels read the weights once per
+    /// launch regardless of m; rows beyond max_batch_graph route through
+    /// the generic no-graph path, bit-identical to the graph route).
+    ///
+    /// Each owner must already hold `seq_len + rows` capacity (the caller
+    /// pre-grows eviction-aware).  Advances every owner's host seq_len by
+    /// its row count; the CALLER rolls back to the accepted length.
+    #[cfg(feature = "cutile")]
+    pub fn spec_verify_greedy_multi(
+        &self,
+        per_session: &[Vec<u32>],
+        kvs: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Option<Vec<Vec<u32>>> {
+        let gm = self.gpu_model.as_ref()?;
+        let qw = self.model.quantized_weights.as_ref()?;
+        assert_eq!(per_session.len(), kvs.len());
+        let mut views = Vec::new();
+        let mut positions = Vec::new();
+        let mut flat_tokens = Vec::new();
+        let mut owner_rows = Vec::with_capacity(kvs.len());
+        for (tokens, kv) in per_session.iter().zip(kvs.iter()) {
+            let base = kv.seq_len();
+            let m = tokens.len();
+            owner_rows.push(m);
+            let seq_lens: Vec<usize> = (0..m).map(|r| base + r).collect();
+            views.extend(kv.spec_row_views(&seq_lens));
+            positions.extend(seq_lens.iter().map(|&s| s as u32));
+            flat_tokens.extend_from_slice(tokens);
+        }
+        // One unchunked call: the m-loop batch kernels read the weights
+        // ONCE per launch regardless of m, so chunking at max_batch_graph
+        // (to reach the ragged graphs) only duplicates the weight traffic
+        // -- measured 2026-11-22v2: 24 rows unchunked (generic route)
+        // 75.6 ms vs 2x12-row graph chunks 81.4 ms.  Rows beyond
+        // max_batch_graph route through the generic no-graph path,
+        // bit-identical to the graph route (probe-gated).
+        let greedy = vec![true; flat_tokens.len()];
+        let out = gm.forward_batch_decode_greedy(
+            &flat_tokens,
+            &positions,
+            qw,
+            &mut views,
+            &greedy,
+        );
+        for (kv, &m) in kvs.iter_mut().zip(owner_rows.iter()) {
+            kv.advance_host_seq_len(m);
+            kv.mark_host_stale();
+        }
+        let mut tokens = Vec::with_capacity(flat_tokens.len());
+        for row in out {
+            match row {
+                crate::model::BatchDecodeOutput::Token(t) => tokens.push(t),
+                // unreachable with greedy = all-true
+                crate::model::BatchDecodeOutput::Logits(_) => return None,
+            }
+        }
+        debug_assert_eq!(tokens.len(), flat_tokens.len());
+        let mut it = tokens.into_iter();
+        Some(
+            owner_rows
+                .iter()
+                .map(|&m| it.by_ref().take(m).collect())
+                .collect(),
+        )
+    }
+
     /// Current GPU KV sequence length (number of K/V entries written).
     pub fn gpu_kv_seq_len(&self) -> usize {
         self.gpu_kv_cache
@@ -10848,6 +10944,13 @@ impl InferenceModel for CutileInferenceWrapper {
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
     ) -> Option<Vec<u32>> {
         self.spec_verify_greedy(token_ids, kv)
+    }
+    fn forward_spec_verify_greedy_multi(
+        &self,
+        tokens: &[Vec<u32>],
+        kvs: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Option<Vec<Vec<u32>>> {
+        self.spec_verify_greedy_multi(tokens, kvs)
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
         if let (Some(gm), Some(qw), Some(kv_mutex)) = (

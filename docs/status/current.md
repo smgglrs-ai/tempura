@@ -5,6 +5,93 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-23 (speculative decoding v2 — the cross-session BATCHED
+cycle is LANDED and GATE-GREEN, and the throughput verdict is a
+CONFIRMED HONEST NEGATIVE at serving batch scale, with the per-component
+attribution that closes the question for this hardware/model pair; plus
+TWO engine bugs the batched draft flushed out, both fixed): (1) THE
+DESIGN. `spec_batch_step_gpu` (server/src/engine_task.rs) replaces v1's
+per-session cycle: (0) resident/greedy/decode-ready filter, (1) lazy
+draft-state materialization + prompt prefill per session, (2) draft-run
+resync to the target base, (3) K BATCHED draft steps — every live
+session's draft model runs its next proposal in ONE forward per step
+(m = live sessions; a session that stops drafting is swap-removed to the
+tail and keeps its proposals), (4+5) ONE multi-session verify:
+`CutileInferenceWrapper::spec_verify_greedy_multi` (trait
+`forward_spec_verify_greedy_multi`) builds spec_row_views for EVERY
+session — session i contributes j_i rows over its OWN run (row r writes
+K/V at base_i+r, attends exactly base_i+r+1 — the v1 causal pattern
+generalized to MIXED sessions) — and runs ONE forward_batch_decode_
+greedy over the whole set: the batch attention/scatter/rope take
+per-row kv_lens, write offsets and run base pointers, so rows of
+different sessions compose exactly like rows of one; (6) per-session
+accept/rollback/emit (v1 logic verbatim). Fallbacks: <2 proposals ->
+one plain m=1 step; target growth failure -> defer to a later tick;
+unsupported verify shape -> plain steps. DraftCache.kv became an Option
+so the batched draft can take() every live run into a contiguous slice.
+(2) THE GATE (unchanged, PASS on the final tree, 2026-11-23):
+scripts/spec-equivalence.sh — solo 1686 bytes + c1..c6 1277-1444 bytes,
+ALL byte-identical ON vs OFF. Acceptance: mean_emitted 2.80, hist
+[117,90,54,225]/486 session-cycles (46% full acceptance). (3) THE
+NUMBERS (honest): solo 0.72x (71.7 -> 51.9 tok/s), multi-client 0.35x
+(453.1 -> 159.8 tok/s; v1 per-session was 0.27x — batching bought
+1.3x, not the win). The v2 bars (solo 1.3x, multi 1.5x) are NOT met.
+(4) THE ATTRIBUTION (per-ENGINE-cycle telemetry — fixed this round, see
+(6b) — m=6 steady state: draft 38 ms = 4 batched 1B steps x ~9.5 ms,
+verify 75.6 ms for 24 rows = ~3.15 ms/row). THE WALL: a verify row
+costs the same as a plain decode row (~3.5 ms at m=6 / ~250-token
+contexts) and does NOT amortize with batch size — the weight traffic
+amortizes (m-loop kernels read weights once per launch) but the per-row
+work (attention, activation quant, row compute) is per accepted-token,
+and the DRAFT adds K full model passes on top. Plain batched decode at
+m=6 ALREADY amortizes the target's weights across sessions (3.15
+ms/tok) — the classic speculation win condition (memory-bound solo
+decode) simply does not exist at serving batch sizes on a 5090.
+Measured-and-reverted along the way: chunking the verify at
+max_batch_graph to reach the ragged graphs is WORSE (81.4 vs 75.6 ms —
+each chunk re-reads all the weights); the single unchunked call is the
+default. Floor math for the record: K=4 draft passes (4 x 2.3 GB for
+the 1B incl. its f32 lm_head) + verify weight traffic ~= 9.7 GB/cycle
+vs plain's 4.9 GB/tick — a theoretical ceiling of ~1.1x at zero per-row
+cost. (5) THE NEXT LEVERS (recorded, in order of leverage): (a) a
+CHEAPER DRAFT — the 1B is too big relative to the 8B (2.3 GB effective
+per pass: 1.2 GB weights + the 1.05 GB f32 lm_head read per row);
+quantizing the draft's f32 lm_head to Q6K at load (0.26 GB, routed
+through the pooled Q6K batch kernel) and/or a 0.5B draft caps the
+draft phase near ~1 ms/step; (b) EAGLE/Medusa-style draft heads on the
+TARGET's hidden state — removes the K-separate-model-passes floor
+entirely (the only structural route to a win at batch scale); (c)
+bigger K only pays after (a)/(b). Speculation stays OPT-IN
+(--draft-model unset = off). (6) THE TWO BUGS THE BATCHED DRAFT FOUND:
+(a) f32 weights at m>1 on the batch path took gemm_d2d_slot's
+ALLOCATING tiled prefill GEMM — eager-legal, but a DriverError 900
+PANIC inside a CUDA-graph capture ("operation not permitted when
+stream is capturing", engine thread dead, HTTP 503s). The 1B draft's
+f32 lm_head (in its m>=2 ragged-graph capture) was the first model to
+hit it. Fixed in gemm_any_d2d_batch: m>1 f32 weights now route through
+a POOLED tiled GEMM (forward_bt_d2d_into, weight matrix read ONCE for
+all m rows — the per-row fallback re-read it m times, ~5 GB of
+avoidable traffic at m=6) with the pooled per-row GEMV loop as
+fallback; the a_row pool scratch is now rank-2 ([1, row_stride] —
+cutile_gemv_coalesced expects a rank-2 x; the old rank-1 buffer
+panicked the GEMV). Numerics note: the tiled arm is a different
+sum-order class than the m=1 slot GEMV — acceptable because the only
+current m>1 f32 batch consumer is the SPEC DRAFT (draft numerics
+influence acceptance length, never the emitted tokens; no target model
+has an f32 weight on the batch path). (b) v1's spec telemetry divided
+draft/verify micros by the per-SESSION cycle count — the per-engine-
+cycle costs were understated ~4x (the "draft 3.6ms, verify 20.7ms"
+v1 attribution was per session-note, not per engine cycle); SpecStats
+now counts engine_cycles separately. (7) GATES ON THE FINAL TREE:
+spec-equivalence PASS (solo + 6 clients byte-identical); kv-swap-ab-
+mini PASS (A1==A2==B + eviction); nonstream-route-smoke PASS;
+kv-restart-var PASS (no cross-restart variance); sanitizer-gate PASS
+(memcheck over bench-probe-q4k-batch / bench-probe-q6k-batch /
+bench-decode-ops + racecheck/initcheck on the probes, 0 errors);
+local cargo test 931 passed / 0 failed (--exclude tempura-bench-gpu,
+CPU-only laptop). NOT rerun (no kernel/PTX change; the 2026-11-22
+battery stands): MMLU, pooled ppl, ab-repro.**
+
 **STATUS 2026-11-22b (speculative decoding wired into the serving stack:
 the equivalence property is LANDED and GATE-GREEN — greedy spec decoding
 is byte-identical to plain greedy decode, solo AND 6-client, made
