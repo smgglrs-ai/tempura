@@ -1444,9 +1444,16 @@ impl EngineTask {
         // Head-state invariant: head rows 0..base-2 + carry at base-1.
         {
             let Some(es) = self.eagle_states.get(id) else {
+                eprintln!("[eagle-step] {id}: no state");
                 return false;
             };
             if es.failed || !es.prefilled || es.kv.seq_len() + 1 != base {
+                eprintln!(
+                    "[eagle-step] {id}: bad state prefilled={} failed={} head_len={} base={base}",
+                    es.prefilled,
+                    es.failed,
+                    es.kv.seq_len()
+                );
                 if !es.failed && es.kv.seq_len() + 1 != base {
                     // Stale (swap/re-admission lost the run alignment) --
                     // latch failed; plain decode for the rest.
@@ -1480,6 +1487,7 @@ impl EngineTask {
             {
                 Some(p) => p,
                 None => {
+                    eprintln!("[eagle-step] {id}: draft cycle returned None");
                     es.failed = true;
                     return false;
                 }
