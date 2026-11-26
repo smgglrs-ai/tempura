@@ -17,7 +17,7 @@
 /// CPU operations that still require a host round-trip per layer: two residual
 /// adds (O-proj and down-proj outputs) and one K download for the KV-cache host
 /// mirror.  RMSNorm, RoPE, and SiLU-gated MLP all run entirely on device.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -14424,8 +14424,8 @@ impl CutileGpuModel {
         }
         self.eagle_teacher_rows(eg, &tokens, &sources, &positions, kv)?;
         // New carry = verify tap row n_em-1 (target hidden at base+n_em-1).
-        unsafe {
-            for li in 0..3 {
+        for li in 0..3 {
+            unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(
                     carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
                     tap_ptr(li, n_em - 1),
@@ -14472,8 +14472,8 @@ impl CutileGpuModel {
         self.eagle_teacher_rows(eg, prompt_after, &sources, &positions, kv)?;
         // Carry = the chunk's LAST tap row (the target hidden at the last
         // prefilled position -- for the final chunk, h_{L-1}).
-        unsafe {
-            for li in 0..3 {
+        for li in 0..3 {
+            unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(
                     carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
                     tap_ptr(li, chunk_tap_rows - 1),
