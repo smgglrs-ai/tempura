@@ -55,6 +55,19 @@ struct DraftCache {
     prefilled: bool,
 }
 
+/// Per-request EAGLE-3 head state: the head's own 1-layer pooled KV run,
+/// the raw 3-layer carry (target hidden at position head_len), and the
+/// prefill/failed bookkeeping.  `failed` latches: a session whose head
+/// state could not be maintained (stale taps, unsupported forward path)
+/// stops speculating for the rest of the request -- plain decode.
+#[cfg(feature = "cutile")]
+struct EagleSessionState {
+    kv: tempura_engine::cutile_kv_cache::CutileKvCache,
+    carry: std::sync::Arc<cutile::tensor::Tensor<f32>>,
+    prefilled: bool,
+    failed: bool,
+}
+
 /// Acceptance-length telemetry for the speculative path: how many tokens
 /// each verify cycle actually emitted (index 0 = rejection at the first
 /// draft token, index k = full acceptance).  TEMPURA_ENGINE_DEBUG_TICKS
@@ -223,6 +236,14 @@ pub struct EngineTask {
     /// decode-ready tick).
     #[cfg(feature = "cutile")]
     draft_caches: HashMap<String, DraftCache>,
+    /// EAGLE-3 head sessions (see eagle.rs; solo decode path only).
+    #[cfg(feature = "cutile")]
+    eagle_states: HashMap<String, EagleSessionState>,
+    /// The head's shared 1-layer KV pool.
+    #[cfg(feature = "cutile")]
+    eagle_kv_pool: Option<Arc<Mutex<tempura_engine::cutile_kv_cache::GpuKvPagePool>>>,
+    #[cfg(feature = "cutile")]
+    eagle_kv_pool_tried: bool,
     #[cfg(feature = "cutile")]
     spec_stats: SpecStats,
 }
@@ -260,6 +281,12 @@ impl EngineTask {
             draft_kv_pool_tried: false,
             #[cfg(feature = "cutile")]
             draft_caches: HashMap::new(),
+            #[cfg(feature = "cutile")]
+            eagle_states: HashMap::new(),
+            #[cfg(feature = "cutile")]
+            eagle_kv_pool: None,
+            #[cfg(feature = "cutile")]
+            eagle_kv_pool_tried: false,
             #[cfg(feature = "cutile")]
             spec_stats: SpecStats::default(),
         }
@@ -501,6 +528,12 @@ impl EngineTask {
             }
         };
         entry.prefill_done = done_prefill;
+        // EAGLE head prefill for this chunk (consumes the chunk's taps
+        // immediately -- the next forward overwrites them).
+        #[cfg(feature = "cutile")]
+        if done_prefill || chunk_len > 0 {
+            self.eagle_prefill_hook(sessions, id, start, chunk_len, done_prefill);
+        }
         if done_prefill {
             if let Ok(mut sched) = self.scheduler.lock() {
                 sched.mark_decoding(id);
@@ -606,11 +639,76 @@ impl EngineTask {
         };
 
         let mut completed = Vec::new();
+        // -- EAGLE-3 solo cycle split ---------------------------------------
+        // The structural accounting (docs/status 2026-11-23): a verify row
+        // costs ~a plain decode row and does not amortize at serving batch
+        // sizes, so speculation cannot win there.  The SOLO case is
+        // different (the m=1 graph reads the full weights once per token)
+        // -- EAGLE's nearly-free drafting plus one k-row verify reading
+        // the weights ONCE is a genuine win there.  Solo only: exactly
+        // one greedy decode-ready session with a live head state runs the
+        // EAGLE cycle; multi-client batches keep plain decode (with head
+        // resync maintenance so a session re-enters speculation when it
+        // becomes solo again).
+        #[cfg(feature = "cutile")]
+        let mut eagle_id: Option<String> = None;
+        #[cfg(feature = "cutile")]
+        {
+            if self.draft_model.is_none()
+                && self.model.eagle_active()
+                && std::env::var("TEMPURA_NO_EAGLE").as_deref() != Ok("1")
+            {
+                let greedy_solo = stepped
+                    .iter()
+                    .filter(|id| {
+                        sessions
+                            .get(*id)
+                            .map(|e| e.params.is_greedy())
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if greedy_solo == 1 {
+                    let id = stepped
+                        .iter()
+                        .find(|id| {
+                            sessions
+                                .get(*id)
+                                .map(|e| e.params.is_greedy())
+                                .unwrap_or(false)
+                        })
+                        .unwrap()
+                        .clone();
+                    if self
+                        .eagle_states
+                        .get(&id)
+                        .map(|e| e.prefilled && !e.failed)
+                        .unwrap_or(false)
+                    {
+                        eagle_id = Some(id);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "cutile")]
+        let stepped: Vec<String> = match &eagle_id {
+            Some(id) => stepped.into_iter().filter(|s| s != id).collect(),
+            None => stepped,
+        };
         if !stepped.is_empty() {
             completed.extend(self.plain_batch_step_gpu(sessions, stepped));
         }
         if !spec_ids.is_empty() {
             completed.extend(self.spec_batch_step_gpu(sessions, spec_ids));
+        }
+        #[cfg(feature = "cutile")]
+        if let Some(id) = eagle_id {
+            if self.eagle_step_gpu(sessions, &id) {
+                completed.push(id);
+            } else if self.plain_step_gpu(sessions, &id) {
+                // The cycle could not run (deferred/capacity); plain step
+                // + head resync keep the session alive and in sync.
+                completed.push(id);
+            }
         }
         completed
     }
@@ -671,6 +769,33 @@ impl EngineTask {
         };
         if dbg_timing {
             eprintln!("[tick-timing] forward={:?}", t_fwd.elapsed());
+        }
+        // EAGLE head maintenance: every eagle session in this plain batch
+        // resyncs its head row from its tap row (the head must track every
+        // target position to stay speculation-eligible when it next
+        // becomes solo).  Tap rows are valid for exactly this batch's m.
+        #[cfg(feature = "cutile")]
+        {
+            let tap_rows = self.model.eagle_tap_rows();
+            for (i, id) in stepped.iter().enumerate() {
+                let Some(es) = self.eagle_states.get_mut(id) else {
+                    continue;
+                };
+                if es.failed || !es.prefilled {
+                    continue;
+                }
+                if tap_rows <= i
+                    || !self.model.eagle_resync_plain(
+                        &mut es.kv,
+                        &es.carry,
+                        toks[i],
+                        i,
+                        pos[i] as usize,
+                    )
+                {
+                    es.failed = true;
+                }
+            }
         }
         let t_sample = std::time::Instant::now();
 
@@ -1163,6 +1288,22 @@ impl EngineTask {
         let entry = sessions.get_mut(id).expect("decode session");
         entry.session.cache.advance(1);
         entry.session.position += 1;
+        // EAGLE head maintenance for the fallback step (m=1: tap row 0).
+        #[cfg(feature = "cutile")]
+        {
+            let tap_rows = self.model.eagle_tap_rows();
+            if let Some(es) = self.eagle_states.get_mut(id) {
+                if !es.failed && es.prefilled {
+                    if tap_rows < 1
+                        || !self
+                            .model
+                            .eagle_resync_plain(&mut es.kv, &es.carry, last, 0, base)
+                    {
+                        es.failed = true;
+                    }
+                }
+            }
+        }
         match rows.into_iter().next() {
             Some(tempura_engine::BatchDecodeOutput::Token(t)) => entry.emit_token(t),
             Some(tempura_engine::BatchDecodeOutput::Logits(logits)) => {
@@ -1170,6 +1311,224 @@ impl EngineTask {
             }
             None => false,
         }
+    }
+
+    // -- EAGLE-3 solo speculative cycle -----------------------------------
+
+    /// Lazily materialize the head's shared KV pool + a session's head
+    /// state.  False = the session cannot speculate (head state missing
+    /// or latched-failed).
+    #[cfg(feature = "cutile")]
+    fn ensure_eagle_state(&mut self, id: &str, initial_tokens: usize) -> bool {
+        if let Some(es) = self.eagle_states.get(id) {
+            return !es.failed;
+        }
+        if !self.eagle_kv_pool_tried {
+            self.eagle_kv_pool_tried = true;
+            self.eagle_kv_pool = self.model.eagle_new_kv_pool();
+            if self.eagle_kv_pool.is_none() {
+                eprintln!("[eagle] head KV pool unavailable; speculation disabled");
+            }
+        }
+        let Some(pool) = self.eagle_kv_pool.clone() else {
+            return false;
+        };
+        let Some((kv, carry)) = self.model.eagle_new_session(&pool, initial_tokens) else {
+            return false;
+        };
+        self.eagle_states.insert(
+            id.to_string(),
+            EagleSessionState {
+                kv,
+                carry,
+                prefilled: false,
+                failed: false,
+            },
+        );
+        true
+    }
+
+    /// Head prefill for one target-prefill chunk: consumes the chunk's
+    /// taps right after the target forward wrote them.  The final chunk
+    /// processes one row fewer (row L-1 becomes the first draft step,
+    /// conditioned on the carry).
+    #[cfg(feature = "cutile")]
+    fn eagle_prefill_hook(
+        &mut self,
+        sessions: &HashMap<String, ActiveSession>,
+        id: &str,
+        chunk_start: usize,
+        chunk_len: usize,
+        done: bool,
+    ) {
+        if !self.model.eagle_active()
+            || std::env::var("TEMPURA_NO_EAGLE").as_deref() == Ok("1")
+        {
+            return;
+        }
+        let prompt: Vec<u32> = {
+            let entry = sessions.get(id).expect("prefill session");
+            entry.prefill_tokens.clone()
+        };
+        if !self.ensure_eagle_state(id, prompt.len() + 16) {
+            return;
+        }
+        let rows = if done { chunk_len.saturating_sub(1) } else { chunk_len };
+        let prompt_after: Vec<u32> = if rows > 0 {
+            prompt[chunk_start + 1..chunk_start + 1 + rows].to_vec()
+        } else {
+            Vec::new()
+        };
+        let es = self.eagle_states.get_mut(id).expect("eagle state");
+        if !self.model.eagle_prefill_chunk(
+            &mut es.kv,
+            &es.carry,
+            &prompt_after,
+            chunk_start,
+            chunk_len,
+        ) {
+            // Taps stale (CPU-fallback prefill, oversized chunk) -- the
+            // head cannot be prefilled; this session never speculates.
+            es.failed = true;
+            return;
+        }
+        if done {
+            es.prefilled = true;
+        }
+    }
+
+    /// One EAGLE-3 speculative decode cycle for the SOLO session `id`:
+    /// K head draft steps, ONE k-row target verify over the session's run
+    /// (the v1 `forward_spec_verify_greedy` machinery), longest-prefix
+    /// acceptance, head resync + carry refresh.  By construction the
+    /// emitted sequence is IDENTICAL to plain greedy decode (the
+    /// spec-equivalence gate); the head's numerics only influence the
+    /// acceptance length.  Returns true when the request finished.
+    /// False = the cycle could not run (caller falls back to a plain
+    /// step) OR ran but the request continues.
+    #[cfg(feature = "cutile")]
+    fn eagle_step_gpu(&mut self, sessions: &mut HashMap<String, ActiveSession>, id: &str) -> bool {
+        let Some(base) = self.kv_caches.get(id).map(|kv| kv.seq_len()) else {
+            return false;
+        };
+        if base == 0 {
+            return false;
+        }
+        // Head-state invariant: head rows 0..base-2 + carry at base-1.
+        {
+            let Some(es) = self.eagle_states.get(id) else {
+                return false;
+            };
+            if es.failed || !es.prefilled || es.kv.seq_len() + 1 != base {
+                if !es.failed && es.kv.seq_len() + 1 != base {
+                    // Stale (swap/re-admission lost the run alignment) --
+                    // latch failed; plain decode for the rest.
+                    self.eagle_states.get_mut(id).unwrap().failed = true;
+                }
+                return false;
+            }
+        }
+        let last = {
+            let entry = sessions.get(id).expect("eagle session");
+            *entry.generated.last().expect("decode has a last token")
+        };
+        let k = self.spec_k();
+        // Pre-grow the target run for the whole verify block (eviction
+        // protects this session) and the head run for K draft rows.
+        if !self.ensure_capacity_with_eviction(id, base + k, &[id.to_string()]) {
+            return false;
+        }
+        {
+            let es = self.eagle_states.get_mut(id).expect("eagle state");
+            if es.kv.try_ensure_capacity(base - 1 + k).is_err() {
+                return false;
+            }
+        }
+        let t_draft = std::time::Instant::now();
+        let proposals = {
+            let es = self.eagle_states.get_mut(id).expect("eagle state");
+            match self
+                .model
+                .eagle_draft_cycle(&mut es.kv, &es.carry, last, base, k)
+            {
+                Some(p) => p,
+                None => {
+                    es.failed = true;
+                    return false;
+                }
+            }
+        };
+        let draft_us = t_draft.elapsed().as_micros() as u64;
+        if proposals.len() < 2 {
+            // Not enough proposals to be worth a verify -- plain step.
+            return false;
+        }
+        let j = proposals.len();
+        let mut token_list = Vec::with_capacity(j);
+        token_list.push(last);
+        token_list.extend_from_slice(&proposals[..j - 1]);
+        let mut kv = self.kv_caches.remove(id).expect("target kv");
+        let t_verify = std::time::Instant::now();
+        let argmaxes = self.model.forward_spec_verify_greedy(&token_list, &mut kv);
+        let argmaxes = match argmaxes {
+            Some(a) => a,
+            None => {
+                self.kv_caches.insert(id.to_string(), kv);
+                return false;
+            }
+        };
+        let verify_us = t_verify.elapsed().as_micros() as u64;
+        self.spec_stats.add_timing(draft_us, verify_us);
+
+        // Accept the longest prefix; emit the target's argmax at the
+        // first mismatch (no bonus token on full acceptance -- K proposals
+        // from K draft feeds, both KV runs roll back to base + emitted,
+        // uniform).
+        let mut a = 0;
+        while a < j && argmaxes[a] == proposals[a] {
+            a += 1;
+        }
+        let emitted: Vec<u32> = if a == j {
+            proposals.clone()
+        } else {
+            let mut v = proposals[..a].to_vec();
+            v.push(argmaxes[a]);
+            v
+        };
+        let n_em = emitted.len();
+        kv.rollback(base + n_em);
+        self.kv_caches.insert(id.to_string(), kv);
+        // Head resync (rows base-1..base+n_em-2 with the TRUE
+        // conditioning) + carry refresh (verify tap row n_em-1).
+        {
+            let es = self.eagle_states.get_mut(id).expect("eagle state");
+            if !self.model.eagle_post_verify(
+                &mut es.kv,
+                &es.carry,
+                last,
+                &emitted,
+                base,
+                j,
+            ) {
+                es.failed = true;
+            }
+        }
+        let entry = sessions.get_mut(id).expect("eagle session");
+        entry.session.cache.advance(n_em);
+        entry.session.position += n_em;
+        self.spec_stats.note(n_em, k);
+        let mut done = false;
+        for tok in emitted {
+            if entry.emit_token(tok) {
+                done = true;
+                break;
+            }
+        }
+        if let Ok(mut sched) = self.scheduler.lock() {
+            let tokens = self.kv_caches.get(id).map(|kv| kv.seq_len()).unwrap_or(0);
+            sched.touch(id, tokens);
+        }
+        done
     }
 
     pub fn run(mut self) {
@@ -1443,6 +1802,7 @@ impl EngineTask {
                 {
                     self.kv_caches.remove(id); // Drop frees the run
                     self.draft_caches.remove(id); // Drop frees the draft run
+                    self.eagle_states.remove(id); // Drop frees the head run
                 }
                 self.payloads.remove(id);
                 if let Ok(mut sched) = self.scheduler.lock() {

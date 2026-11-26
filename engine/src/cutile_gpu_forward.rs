@@ -334,7 +334,86 @@ enum PrefillEpilogue<'a> {
 const SLOT_UP: usize = 5;
 const SLOT_DOWN: usize = 6;
 const SLOT_LOGITS: usize = 7;
-const NUM_SLOTS: usize = 8;
+// EAGLE-3 head slots (see eagle.rs / the `eagle_*` methods): dedicated so
+// the head's eager GEMVs never contend with slot tensors the captured
+// decode graphs hold references to (a shared slot would fail
+// Arc::try_unwrap and silently fall to the allocating sync GEMM).
+const SLOT_EAGLE_FC: usize = 8;
+const SLOT_EAGLE_Q: usize = 9;
+const SLOT_EAGLE_K: usize = 10;
+const SLOT_EAGLE_V: usize = 11;
+const SLOT_EAGLE_O: usize = 12;
+const SLOT_EAGLE_GATE: usize = 13;
+const SLOT_EAGLE_UP: usize = 14;
+const SLOT_EAGLE_DOWN: usize = 15;
+const SLOT_EAGLE_LOGITS: usize = 16;
+const SLOT_EAGLE_FC_OUT: usize = 17;
+const NUM_SLOTS: usize = 18;
+
+/// Decode-class tap capacity: rows of the largest batch whose taps stay
+/// valid (a plain multi-client batch decode at m larger than this leaves
+/// the taps stale and eagle sessions in it stop speculating).
+pub(crate) const EAGLE_TAP_MAX_ROWS: usize = 32;
+/// Prefill tap capacity: one 512-token chunk.
+pub(crate) const EAGLE_PREFILL_TAP_MAX_ROWS: usize = 512;
+
+/// GPU-resident EAGLE-3 head state: weights uploaded under `eagle.*`
+/// names into the model's Q6K / norm maps, host-side embed table + vocab
+/// mapping, the hidden-state taps, and the per-row draft scratch.
+pub(crate) struct EagleGpuState {
+    pub cfg: crate::eagle::Eagle3Config,
+    pub h: usize,
+    pub h_pad: usize,
+    pub q_dim: usize,
+    pub q_pad: usize,
+    pub kv_dim: usize,
+    pub kv_pad: usize,
+    pub inter: usize,
+    pub inter_pad: usize,
+    pub embed_bf16: Vec<u8>,
+    pub d2t: Vec<i64>,
+    /// [3][EAGLE_TAP_MAX_ROWS * h] -- row r of tap layer li holds the
+    /// target's hidden state entering tap_layers[li] for batch row r.
+    pub tap_decode: [Arc<Tensor<f32>>; 3],
+    /// [3][EAGLE_PREFILL_TAP_MAX_ROWS * h]
+    pub tap_prefill: [Arc<Tensor<f32>>; 3],
+    pub tap_layers: [usize; 3],
+    /// Bumped on every tap write; rows == 0 marks a skipped (too large)
+    /// write so the engine can detect staleness.
+    pub tap_rows: Cell<usize>,
+    // -- per-row (m=1) head scratch, all stable buffers --
+    pub s_embed: Arc<Tensor<f32>>,
+    /// qkv input cat [2 * h_pad]
+    pub s_cat: Arc<Tensor<f32>>,
+    pub s_q: Arc<Tensor<f32>>,
+    pub s_k: Arc<Tensor<f32>>,
+    pub s_v: Arc<Tensor<f32>>,
+    pub s_attn_out: Arc<Tensor<f32>>,
+    /// hidden-half staging + the two ping-pong carried hiddens
+    pub s_hidden: [Arc<Tensor<f32>>; 2],
+    /// residual staging [h_pad]
+    pub s_res: Arc<Tensor<f32>>,
+    /// fused fc input staging [3 * h]
+    pub s_fc_in: Arc<Tensor<f32>>,
+    /// teacher-row fused-hidden staging [h_pad]
+    pub s_t_hidden_row: Arc<Tensor<f32>>,
+    pub d_kv_len: Arc<Tensor<f32>>,
+    pub argmax_out: Arc<Tensor<u32>>,
+    /// m-row staging: [m * h_pad] embeds, [m * 2h_pad] cat, [m * h]
+    /// fused-hidden, [m * h] residual keeps.
+    pub t_embed: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    pub t_cat: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    pub t_fc_in: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    pub t_hidden: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    pub t_res: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    pub t_o_pad: RefCell<HashMap<usize, Arc<Tensor<f32>>>>,
+    /// m-row RMSNorm + silu + add scratch (keyed by m like NoGraphBatchScratch).
+    pub t_norm_scratch: RefCell<HashMap<usize, RmsnormScratch>>,
+    pub t_norm2_scratch: RefCell<HashMap<usize, RmsnormScratch>>,
+    pub t_silu: RefCell<HashMap<usize, Option<Arc<Tensor<f32>>>>>,
+    pub t_add1: RefCell<HashMap<usize, Option<Arc<Tensor<f32>>>>>,
+    pub t_add2: RefCell<HashMap<usize, Option<Arc<Tensor<f32>>>>>,
+}
 
 /// Prefill precision fork (DEFAULT DECISION 2026-11-21: the default is
 /// EXACT). `TEMPURA_PREFILL_PRECISION=mxfp4` opts back into the MXFP4
@@ -619,6 +698,9 @@ pub struct CutileGpuModel {
     /// when the next layer begins, so `Arc::try_unwrap` can reclaim the Tensor
     /// without re-allocating device memory.
     scratch: RefCell<[Option<Arc<Tensor<f32>>>; NUM_SLOTS]>,
+    /// EAGLE-3 speculative head (None until `eagle_upload` -- see eagle.rs).
+    /// Taps are written by the decode/prefill paths ONLY when this is Some.
+    eagle: Option<EagleGpuState>,
     /// Pre-allocated RoPE scratch for Q (sized for min(max_seq_len, 4096) x n_heads).
     q_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) x n_kv_heads).
@@ -1257,7 +1339,21 @@ impl CutileGpuModel {
             Some(b) => b,
             None => return Ok(false),
         };
+        Self::upload_q6k_bytes(stream, device_weights_q6k, name, bytes, n, k)?;
+        Ok(true)
+    }
 
+    /// Pack raw GGUF Q6_K block bytes (210 per block) into the GPU's
+    /// 53-u32-per-block layout and upload.  Shared by the GGUF loader and
+    /// the EAGLE head's host quantizer.
+    fn upload_q6k_bytes(
+        stream: &std::sync::Arc<cuda_core::Stream>,
+        device_weights_q6k: &mut HashMap<String, DeviceWeightQ6K>,
+        name: &str,
+        bytes: &[u8],
+        n: usize,
+        k: usize,
+    ) -> Result<(), tempura_kernels::KernelError> {
         debug_assert!(
             k % Q6K_QK == 0,
             "k={k} must be a multiple of Q6K_QK={Q6K_QK}"
@@ -1334,7 +1430,7 @@ impl CutileGpuModel {
                 k_blocks,
             },
         );
-        Ok(true)
+        Ok(())
     }
 
     /// Upload a Q4_K weight in packed GPU format (no f32 dequantization on the host).
@@ -2765,6 +2861,7 @@ impl CutileGpuModel {
             cutile_rope,
             cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
+            eagle: None,
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
             prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
@@ -3227,6 +3324,7 @@ impl CutileGpuModel {
             cutile_rope,
             cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
+            eagle: None,
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
             prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
@@ -7609,6 +7707,13 @@ impl CutileGpuModel {
                 ref down_w_name,
             ) = layer_names[layer];
 
+            // EAGLE taps: hidden_dev here is the residual stream ENTERING
+            // this layer == HF hidden_states[layer] -- the official EAGLE-3
+            // stash point.  Capture-safe (stable src/dst pointers).
+            self.eagle_tap_layer(0, layer, &hidden_dev, 1, self.h_pad, false);
+            self.eagle_tap_layer(1, layer, &hidden_dev, 1, self.h_pad, false);
+            self.eagle_tap_layer(2, layer, &hidden_dev, 1, self.h_pad, false);
+
             // Pre-attention RMSNorm (GPU, pre-allocated scratch).
             let input_ln_w_dev = self
                 .norm_weights
@@ -8545,6 +8650,11 @@ impl CutileGpuModel {
                     ref down_w_name,
                 ) = layer_names[layer];
 
+                // EAGLE taps (prefill): the chunk's rows entering this layer.
+                self.eagle_tap_layer(0, layer, &hidden_dev, seq_len, self.h_pad, true);
+                self.eagle_tap_layer(1, layer, &hidden_dev, seq_len, self.h_pad, true);
+                self.eagle_tap_layer(2, layer, &hidden_dev, seq_len, self.h_pad, true);
+
                 // -- 2a. Pre-attention RMSNorm (GPU) -------------------------------
                 // hidden_dev is already on device -- no upload needed.
                 // For decode (seq_len=1) use scratch buffers to avoid 3 api::zeros.sync_on
@@ -9448,6 +9558,11 @@ impl CutileGpuModel {
                 ref up_w,
                 ref down_w,
             ) = layer_names[layer];
+
+            // EAGLE taps (equal-position batch graph body; captured).
+            self.eagle_tap_layer(0, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(1, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(2, layer, &hidden_dev, m, self.h_pad, false);
 
             // -- Pre-attention RMSNorm -----------------------------------------
             let input_ln_dev = self.norm_weights.get(input_ln).expect("input_layernorm");
@@ -11408,6 +11523,12 @@ impl CutileGpuModel {
                 ref down_w_name,
             ) = layer_names[layer];
 
+            // EAGLE taps (ragged graph body: same rows/op order as the
+            // generic path; captured in-graph, pointers stable).
+            self.eagle_tap_layer(0, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(1, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(2, layer, &hidden_dev, m, self.h_pad, false);
+
             // Pre-attention RMSNorm (same per-(site, m) scratch as the
             // generic path).
             let input_ln_w_dev = self
@@ -12488,6 +12609,11 @@ impl CutileGpuModel {
                 .norm_weights
                 .get(input_ln_name)
                 .expect("input_layernorm weight missing");
+            // EAGLE taps (generic batch decode / spec verify rows).
+            self.eagle_tap_layer(0, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(1, layer, &hidden_dev, m, self.h_pad, false);
+            self.eagle_tap_layer(2, layer, &hidden_dev, m, self.h_pad, false);
+
             // Scratch variant (cached per (site, m) buffers): the plain
             // forward_device_fused does 3 api::zeros.sync_on + a trailing
             // stream.synchronize per call = 4 full pipeline drains x 2 norms
@@ -13437,4 +13563,949 @@ impl CutileGpuModel {
         // (extracted verbatim -- same kernels, same semantics).
         self.finish_batch_outputs(&logits_dev, m, greedy)
     }
+}
+// ============================================================================
+// EAGLE-3 speculative head (see engine/src/eagle.rs for the checkpoint side)
+// ============================================================================
+//
+// The head's weights live in the SAME weight maps as the target's, under
+// `eagle.*` names (Q6K matrices + f32 norms), so every GEMV/GEMM dispatch
+// (`gemm_any_d2d_slot` / `gemm_any_d2d_batch`) and every kernel (oxide Q6K
+// kpar GEMV, fused RMSNorm, table RoPE, oxide kpar decode attention, greedy
+// argmax) is the production one.  The head's numerics are draft-only: they
+// influence ACCEPTANCE LENGTH, never the emitted tokens (the verify is the
+// target's own argmax -- the spec-equivalence gate).
+//
+// Alignment invariants (derived from the official SafeAILab EAGLE-3 loop):
+//   * head KV row p has input (token at target position p+1, fused(h_p))
+//     where h_p is the target's 3-layer hidden concat at position p;
+//   * the fusion fc runs ONLY on target-provided hidden (rows sourced from
+//     the taps); draft steps beyond the first feed the head's OWN pre-norm
+//     layer output forward (no fc);
+//   * after every cycle the head KV length is target_len - 1, and the
+//     "carry" (raw 3-layer tap at position target_len - 1) seeds the next
+//     cycle's first draft step and resync row 0.
+impl CutileGpuModel {
+    /// Write the rows of `src` (row stride `row_stride`, `m` rows, `h`
+    /// valid elements per row) into tap layer `li` when `layer` is one of
+    /// the configured tap layers.  No-op (single Option check) when the
+    /// eagle head is not loaded.  Called at the TOP of the layer loop:
+    /// `src` is the residual stream entering `layer` == HF
+    /// hidden_states[layer] -- the official EAGLE-3 stash point.
+    fn eagle_tap_layer(
+        &self,
+        li: usize,
+        layer: usize,
+        src: &Arc<Tensor<f32>>,
+        m: usize,
+        row_stride: usize,
+        prefill: bool,
+    ) {
+        let Some(eg) = &self.eagle else { return };
+        if eg.tap_layers.get(li).copied() != Some(layer) {
+            return;
+        }
+        let max_rows = if prefill {
+            EAGLE_PREFILL_TAP_MAX_ROWS
+        } else {
+            EAGLE_TAP_MAX_ROWS
+        };
+        if m == 0 || m > max_rows {
+            eg.tap_rows.set(0);
+            return;
+        }
+        let bufs = if prefill {
+            &eg.tap_prefill
+        } else {
+            &eg.tap_decode
+        };
+        let dst = &bufs[li];
+        let h = eg.h;
+        let stream = self.matmul.stream();
+        let src_base = src.device_pointer().cu_deviceptr();
+        let dst_base = dst.device_pointer().cu_deviceptr();
+        for r in 0..m {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    dst_base + (r * h * 4) as u64,
+                    src_base + (r * row_stride * 4) as u64,
+                    h,
+                    stream,
+                )
+            }
+            .expect("eagle tap D->D copy failed");
+        }
+        eg.tap_rows.set(m);
+    }
+
+    /// Upload an EAGLE-3 head (host weights from `eagle.rs`) under the
+    /// `eagle.*` weight namespace.  Matrices are quantized to Q6K on the
+    /// host (draft-only numerics) so the decode GEMVs ride the oxide kpar
+    /// kernel; the embed table stays bf16 on the host for per-row gathers.
+    /// Must be called BEFORE serving (allocates the tap buffers the decode
+    /// graphs capture references to).
+    pub fn eagle_upload(&mut self, w: crate::eagle::Eagle3Weights) -> Result<(), String> {
+        if self.eagle.is_some() {
+            return Err("eagle: head already loaded".into());
+        }
+        let cfg = w.cfg;
+        let h = cfg.hidden_size;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let inter = cfg.intermediate_size;
+        if h != self.config.hidden_size
+            || q_dim != self.config.num_attention_heads * self.config.head_dim
+            || self.h_pad != h
+            || self.q_pad != q_dim
+        {
+            return Err(format!(
+                "eagle: head/target geometry mismatch (h {} vs {}, q_dim {} vs {})",
+                h,
+                self.config.hidden_size,
+                q_dim,
+                self.config.num_attention_heads * self.config.head_dim
+            ));
+        }
+        if (cfg.rope_theta - self.config.rope_theta).abs() > 1.0 {
+            return Err(format!(
+                "eagle: head rope_theta {} != target {} (the head shares the target's RoPE table)",
+                cfg.rope_theta, self.config.rope_theta
+            ));
+        }
+        if !cfg.norm_before_residual {
+            return Err("eagle: only norm_before_residual=true heads are supported".into());
+        }
+
+        let stream = self.matmul.stream();
+        let mut up_q6k = |name: &str, data: &[f32], n: usize, k: usize| -> Result<(), String> {
+            let bytes = crate::eagle::quantize_q6k_host(data, n, k);
+            Self::upload_q6k_bytes(stream, &mut self.device_weights_q6k, name, &bytes, n, k)
+                .map_err(|e| format!("eagle: upload {name}: {e}"))
+        };
+        up_q6k("eagle.fc.weight", &w.fc, h, 3 * h)?;
+        up_q6k("eagle.q.weight", &w.q_proj, q_dim, 2 * h)?;
+        up_q6k("eagle.k.weight", &w.k_proj, kv_dim, 2 * h)?;
+        up_q6k("eagle.v.weight", &w.v_proj, kv_dim, 2 * h)?;
+        up_q6k("eagle.o.weight", &w.o_proj, h, q_dim)?;
+        up_q6k("eagle.gate.weight", &w.gate_proj, inter, h)?;
+        up_q6k("eagle.up.weight", &w.up_proj, inter, h)?;
+        up_q6k("eagle.down.weight", &w.down_proj, h, inter)?;
+        up_q6k("eagle.lm_head.weight", &w.lm_head, cfg.draft_vocab_size, h)?;
+        for (field, data) in &w.norms {
+            Self::upload_norm_weight(
+                stream,
+                &mut self.norm_weights,
+                &format!("eagle.{field}.weight"),
+                data,
+                h,
+                self.h_pad,
+            )
+            .map_err(|e| format!("eagle: norm upload: {e}"))?;
+        }
+
+        let alloc_f32 = |n: usize| -> Arc<Tensor<f32>> {
+            Arc::new(
+                api::zeros::<f32>(&[n])
+                    .sync_on(stream)
+                    .expect("eagle scratch alloc"),
+            )
+        };
+        let h_pad = self.h_pad;
+        let kv_pad = next_pow2(kv_dim.div_ceil(BK) * BK);
+        let tap_decode = [
+            alloc_f32(EAGLE_TAP_MAX_ROWS * h),
+            alloc_f32(EAGLE_TAP_MAX_ROWS * h),
+            alloc_f32(EAGLE_TAP_MAX_ROWS * h),
+        ];
+        let tap_prefill = [
+            alloc_f32(EAGLE_PREFILL_TAP_MAX_ROWS * h),
+            alloc_f32(EAGLE_PREFILL_TAP_MAX_ROWS * h),
+            alloc_f32(EAGLE_PREFILL_TAP_MAX_ROWS * h),
+        ];
+        let argmax_out = Arc::new(
+            api::zeros::<u32>(&[2])
+                .sync_on(stream)
+                .expect("eagle argmax out alloc"),
+        );
+        self.eagle = Some(EagleGpuState {
+            cfg,
+            h,
+            h_pad,
+            q_dim,
+            q_pad: self.q_pad,
+            kv_dim,
+            kv_pad,
+            inter,
+            inter_pad: self.inter_pad,
+            embed_bf16: w.embed_bf16,
+            d2t: w.d2t,
+            tap_decode,
+            tap_prefill,
+            tap_layers: crate::eagle::Eagle3Config::tap_layers(self.config.num_layers),
+            tap_rows: Cell::new(0),
+            s_embed: alloc_f32(h_pad),
+            s_cat: alloc_f32(2 * h_pad),
+            s_q: alloc_f32(self.q_pad),
+            s_k: alloc_f32(kv_pad),
+            s_v: alloc_f32(kv_pad),
+            s_attn_out: alloc_f32(q_dim),
+            s_hidden: [alloc_f32(h_pad), alloc_f32(h_pad)],
+            s_res: alloc_f32(h_pad),
+            s_fc_in: alloc_f32(3 * h),
+            s_t_hidden_row: alloc_f32(h_pad),
+            d_kv_len: alloc_f32(1),
+            argmax_out,
+            t_embed: RefCell::new(HashMap::new()),
+            t_cat: RefCell::new(HashMap::new()),
+            t_fc_in: RefCell::new(HashMap::new()),
+            t_hidden: RefCell::new(HashMap::new()),
+            t_res: RefCell::new(HashMap::new()),
+            t_o_pad: RefCell::new(HashMap::new()),
+            t_norm_scratch: RefCell::new(HashMap::new()),
+            t_norm2_scratch: RefCell::new(HashMap::new()),
+            t_silu: RefCell::new(HashMap::new()),
+            t_add1: RefCell::new(HashMap::new()),
+            t_add2: RefCell::new(HashMap::new()),
+        });
+        eprintln!(
+            "[eagle] head loaded: {} layer, h={h}, draft vocab {}, taps at layers {:?} \
+             (Q6K host-quantized, ~{} MB device)",
+            1,
+            cfg.draft_vocab_size,
+            crate::eagle::Eagle3Config::tap_layers(self.config.num_layers),
+            (w.fc.len() + w.q_proj.len() + w.k_proj.len() + w.v_proj.len() + w.o_proj.len()
+                + w.gate_proj.len()
+                + w.up_proj.len()
+                + w.down_proj.len()
+                + w.lm_head.len())
+                * 210
+                / 256
+                / (1024 * 1024),
+        );
+        Ok(())
+    }
+
+    pub fn eagle_loaded(&self) -> bool {
+        self.eagle.is_some()
+    }
+
+    /// Rows held by the most recent decode-class tap write (0 = skipped /
+    /// stale -- the batch was too large).
+    pub fn eagle_tap_rows(&self) -> usize {
+        self.eagle.as_ref().map(|e| e.tap_rows.get()).unwrap_or(0)
+    }
+
+    /// One head row: input (token embedding, fused-or-carried hidden) at
+    /// head-KV position `pos`, appending one K/V row.  Returns the layer's
+    /// pre-norm output hidden (`hidden_buf` index to alternate callers).
+    /// With `logits`, also runs final norm + lm_head + device argmax and
+    /// returns the mapped TARGET-vocab token.
+    ///
+    /// All ops are enqueued async on the shared stream (eager -- the head
+    /// never runs inside a CUDA graph capture); the caller syncs before
+    /// reading host results.
+    fn eagle_head_row(
+        &self,
+        eg: &EagleGpuState,
+        token: u32,
+        hidden_in: &Arc<Tensor<f32>>,
+        pos: u32,
+        kv: &mut CutileKvCache,
+        hidden_buf: usize,
+        logits: bool,
+    ) -> Option<u32> {
+        let stream = self.matmul.stream();
+        let h = eg.h;
+        let h_pad = eg.h_pad;
+        let n_heads = eg.cfg.num_attention_heads;
+        let n_kv_heads = eg.cfg.num_key_value_heads;
+        let head_dim = eg.cfg.head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let eps = eg.cfg.rms_norm_eps;
+
+        // Embed row (host bf16 gather -> staging [h_pad]).
+        {
+            let row = crate::eagle::Eagle3Weights::embed_row_raw(&eg.embed_bf16, token, h);
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    eg.s_embed.device_pointer().cu_deviceptr(),
+                    row.as_ptr(),
+                    h_pad,
+                    stream,
+                )
+            }
+            .expect("eagle embed H2D");
+        }
+
+        // hidden_norm(hidden_in) -- norm_before_residual: the residual IS
+        // the normed hidden.
+        let hidden_n = self
+            .cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                hidden_in.clone(),
+                self.norm_weights.get("eagle.hidden_norm.weight")?,
+                1,
+                h,
+                h_pad,
+                eps,
+                &mut self.pre_attn_norm_scratch.borrow_mut(),
+            )
+            .expect("eagle hidden_norm failed");
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(
+                eg.s_res.device_pointer().cu_deviceptr(),
+                hidden_n.device_pointer().cu_deviceptr(),
+                h_pad,
+                stream,
+            )
+            .expect("eagle residual copy");
+        }
+
+        // embeds = input_layernorm(embed); cat = [embeds | hidden_n].
+        let embeds_n = self
+            .cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                eg.s_embed.clone(),
+                self.norm_weights.get("eagle.input_layernorm.weight")?,
+                1,
+                h,
+                h_pad,
+                eps,
+                &mut self.attn_post_norm_scratch.borrow_mut(),
+            )
+            .expect("eagle input_layernorm failed");
+        {
+            let cat_base = eg.s_cat.device_pointer().cu_deviceptr();
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    cat_base,
+                    embeds_n.device_pointer().cu_deviceptr(),
+                    h_pad,
+                    stream,
+                )
+                .expect("eagle cat embed half");
+                cuda_core::memcpy_dtod_async::<f32>(
+                    cat_base + (h_pad * 4) as u64,
+                    hidden_n.device_pointer().cu_deviceptr(),
+                    h_pad,
+                    stream,
+                )
+                .expect("eagle cat hidden half");
+            }
+        }
+        let cat_r2: Arc<Tensor<f32>> = eg
+            .s_cat
+            .clone()
+            .reshape(&[1, 2 * h_pad])
+            .expect("eagle cat reshape")
+            .into();
+
+        // q / k / v GEMVs ([1, 2h] -> q_dim / kv_dim).
+        let q_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.q.weight", 1, SLOT_EAGLE_Q);
+        let k_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.k.weight", 1, SLOT_EAGLE_K);
+        let v_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.v.weight", 1, SLOT_EAGLE_V);
+        // Copy into the stable row buffers (q_pad/kv_pad strides; the pad
+        // tails stay zero from allocation).
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(
+                eg.s_q.device_pointer().cu_deviceptr(),
+                q_dev.device_pointer().cu_deviceptr(),
+                eg.q_dim,
+                stream,
+            )
+            .expect("eagle q row copy");
+            cuda_core::memcpy_dtod_async::<f32>(
+                eg.s_k.device_pointer().cu_deviceptr(),
+                k_dev.device_pointer().cu_deviceptr(),
+                eg.kv_dim,
+                stream,
+            )
+            .expect("eagle k row copy");
+            cuda_core::memcpy_dtod_async::<f32>(
+                eg.s_v.device_pointer().cu_deviceptr(),
+                v_dev.device_pointer().cu_deviceptr(),
+                eg.kv_dim,
+                stream,
+            )
+            .expect("eagle v row copy");
+        }
+
+        // RoPE (table-gather graph-stable path, like the decode inner).
+        let rope_graph = self.rope_rows_graph_ready(pos);
+        let q_rot = if rope_graph {
+            self.cutile_rope
+                .forward_device_scratch_graph(
+                    &eg.s_q,
+                    n_heads,
+                    head_dim,
+                    &self.d_rope_cos_row,
+                    &self.d_rope_sin_row,
+                    &mut self.q_rope_scratch.borrow_mut(),
+                    stream,
+                )
+                .expect("eagle Q RoPE failed")
+        } else {
+            self.cutile_rope
+                .forward_device_scratch(
+                    &eg.s_q,
+                    &[pos],
+                    1,
+                    n_heads,
+                    head_dim,
+                    self.config.rope_theta,
+                    &mut self.q_rope_scratch.borrow_mut(),
+                    stream,
+                )
+                .expect("eagle Q RoPE failed")
+        };
+        let k_rot = if rope_graph {
+            self.cutile_rope
+                .forward_device_scratch_graph(
+                    &eg.s_k,
+                    n_kv_heads,
+                    head_dim,
+                    &self.d_rope_cos_row,
+                    &self.d_rope_sin_row,
+                    &mut self.k_rope_scratch.borrow_mut(),
+                    stream,
+                )
+                .expect("eagle K RoPE failed")
+        } else {
+            self.cutile_rope
+                .forward_device_scratch(
+                    &eg.s_k,
+                    &[pos],
+                    1,
+                    n_kv_heads,
+                    head_dim,
+                    self.config.rope_theta,
+                    &mut self.k_rope_scratch.borrow_mut(),
+                    stream,
+                )
+                .expect("eagle K RoPE failed")
+        };
+
+        // KV append + attention (kpar over the head's own run).
+        kv.append_device_gpu_only(0, &k_rot, &eg.s_v, 1)
+            .expect("eagle KV append failed");
+        let oda = self.oxide_decode_attn.as_ref()?;
+        let kv_len = kv.seq_len();
+        {
+            // Model-owned staging slot for the pageable async H2D (the
+            // kv_len_stage lesson: a stack-local source can be overwritten
+            // before the copy executes).
+            let bits = f32::from_bits(kv_len as u32);
+            {
+                let mut stage = self.kv_len_stage.borrow_mut();
+                stage.clear();
+                stage.push(bits);
+                unsafe {
+                    cuda_core::memcpy_htod_async::<f32>(
+                        eg.d_kv_len.device_pointer().cu_deviceptr(),
+                        stage.as_ptr(),
+                        1,
+                        stream,
+                    )
+                }
+                .expect("eagle d_kv_len H2D");
+            }
+        }
+        let (k_base, v_base) = kv.kv_device_base_ptrs(0);
+        if kv.kv_f16() {
+            oda.forward_kpar_d2d_ptrs_f16(
+                &eg.s_attn_out,
+                &q_rot,
+                k_base,
+                v_base,
+                &eg.d_kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale,
+            )
+        } else if kv.kv_dtype() == crate::cutile_kv_cache::KvDtype::E4M3 {
+            oda.forward_kpar_d2d_ptrs_e4m3(
+                &eg.s_attn_out,
+                &q_rot,
+                k_base,
+                v_base,
+                &eg.d_kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale,
+            )
+        } else {
+            oda.forward_kpar_d2d_ptrs(
+                &eg.s_attn_out,
+                &q_rot,
+                k_base,
+                v_base,
+                &eg.d_kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale,
+            )
+        }
+        .expect("eagle decode attention failed");
+
+        // o-proj ([1, q_pad] -> h), pad to h_pad, residual add.
+        let attn_r2: Arc<Tensor<f32>> = eg
+            .s_attn_out
+            .clone()
+            .reshape(&[1, eg.q_pad])
+            .expect("eagle attn reshape")
+            .into();
+        let o_dev = self.gemm_any_d2d_slot(&attn_r2, "eagle.o.weight", 1, SLOT_EAGLE_O);
+        let o_padded = self.pad_rows_device(&o_dev, h, h_pad, 1, &self.oproj_pad_scratch);
+        let o_flat: Arc<Tensor<f32>> = if o_padded.size() == h_pad {
+            o_padded
+                .clone()
+                .reshape(&[h_pad])
+                .expect("eagle o reshape")
+                .into()
+        } else {
+            o_padded.clone()
+        };
+        let hidden1 = self.add_device_scratch(
+            &eg.s_res,
+            &o_flat,
+            h_pad,
+            &mut self.post_attn_add_scratch.borrow_mut(),
+        );
+
+        // post_attention_layernorm + FFN.
+        let normed2 = self
+            .cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                hidden1.clone(),
+                self.norm_weights.get("eagle.post_attention_layernorm.weight")?,
+                1,
+                h,
+                h_pad,
+                eps,
+                &mut self.post_attn_norm_scratch.borrow_mut(),
+            )
+            .expect("eagle post_attention_layernorm failed");
+        let gate_dev = self.gemm_any_d2d_slot(&normed2, "eagle.gate.weight", 1, SLOT_EAGLE_GATE);
+        let up_dev = self.gemm_any_d2d_slot(&normed2, "eagle.up.weight", 1, SLOT_EAGLE_UP);
+        let gs_dev = self
+            .cutile_elementwise
+            .silu_mul_device_scratch(
+                &gate_dev,
+                &up_dev,
+                1,
+                eg.inter,
+                &mut self.silu_out_scratch.borrow_mut(),
+                &stream,
+            )
+            .expect("eagle silu_mul failed");
+        let gs_padded = if eg.inter_pad == eg.inter {
+            gs_dev
+        } else {
+            let padded: Arc<Tensor<f32>> = {
+                let mut bufs = eg.t_o_pad.borrow_mut();
+                match bufs.get(&0usize) {
+                    Some(b) => b.clone(),
+                    None => {
+                        let b = Arc::new(
+                            api::zeros::<f32>(&[eg.inter_pad])
+                                .sync_on(stream)
+                                .expect("eagle inter pad alloc"),
+                        );
+                        bufs.insert(0, b.clone());
+                        b
+                    }
+                }
+            };
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    padded.device_pointer().cu_deviceptr(),
+                    gs_dev.device_pointer().cu_deviceptr(),
+                    eg.inter,
+                    stream,
+                )
+            }
+            .expect("eagle inter pad copy");
+            padded
+        };
+        let gs_r2: Arc<Tensor<f32>> = gs_padded
+            .clone()
+            .reshape(&[1, eg.inter_pad])
+            .expect("eagle gs reshape")
+            .into();
+        let down_dev = self.gemm_any_d2d_slot(&gs_r2, "eagle.down.weight", 1, SLOT_EAGLE_DOWN);
+        let down_flat: Arc<Tensor<f32>> = if down_dev.size() == h_pad {
+            down_dev
+                .clone()
+                .reshape(&[h_pad])
+                .expect("eagle down reshape")
+                .into()
+        } else {
+            // Oversized shared kpar scratch: the add reads only h_pad.
+            down_dev.clone()
+        };
+        let hidden_out = &eg.s_hidden[hidden_buf];
+        {
+            // hidden_out = hidden1 + down, into the caller's ping-pong buf.
+            let mut scr = eg.t_add2.borrow_mut();
+            let s = scr.entry(0usize).or_insert(None);
+            let added =
+                self.add_device_scratch(&hidden1, &down_flat, h_pad, s);
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    hidden_out.device_pointer().cu_deviceptr(),
+                    added.device_pointer().cu_deviceptr(),
+                    h_pad,
+                    stream,
+                )
+            }
+            .expect("eagle hidden_out copy");
+        }
+
+        if !logits {
+            return None;
+        }
+        // Final norm + lm_head over the DRAFT vocab + device argmax.
+        let normed_final = self
+            .cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                hidden_out.clone(),
+                self.norm_weights.get("eagle.norm.weight")?,
+                1,
+                h,
+                h_pad,
+                eps,
+                &mut self.final_norm_scratch.borrow_mut(),
+            )
+            .expect("eagle final norm failed");
+        let logits_dev =
+            self.gemm_any_d2d_slot(&normed_final, "eagle.lm_head.weight", 1, SLOT_EAGLE_LOGITS);
+        let ga = self.greedy_argmax.as_ref()?;
+        unsafe {
+            cuda_core::sys::cuMemsetD32Async(
+                eg.argmax_out.device_pointer().cu_deviceptr(),
+                0,
+                2,
+                stream.cu_stream(),
+            );
+        }
+        ga.launch_ptr(
+            logits_dev.device_pointer().cu_deviceptr(),
+            eg.argmax_out.device_pointer().cu_deviceptr(),
+            eg.cfg.draft_vocab_size,
+        )
+        .expect("eagle argmax launch");
+        let tokens = eg
+            .argmax_out
+            .to_host_vec()
+            .sync_on(stream)
+            .expect("eagle argmax download");
+        let d = tokens[0] as usize;
+        if d >= eg.d2t.len() {
+            return None;
+        }
+        Some((d as i64 + eg.d2t[d]) as u32)
+    }
+
+    /// Fuse `m` raw 3-layer tap rows into the hidden inputs: fc input
+    /// [m, 3h] assembled from `sources` (row r: 3 device pointers of h
+    /// elements each), then ONE batched fc pass via the per-row GEMV loop.
+    /// Returns [m, h] fused hidden (row stride h -- the cat assembly pads).
+    fn eagle_fc_rows(
+        &self,
+        eg: &EagleGpuState,
+        m: usize,
+        sources: &[[u64; 3]],
+    ) -> Option<Arc<Tensor<f32>>> {
+        let stream = self.matmul.stream();
+        let h = eg.h;
+        let fc_in = {
+            let mut t = eg.t_fc_in.borrow_mut();
+            match t.get(&m) {
+                Some(b) => b.clone(),
+                None => {
+                    let b = Arc::new(
+                        api::zeros::<f32>(&[m * 3 * h])
+                            .sync_on(stream)
+                            .expect("eagle fc_in alloc"),
+                    );
+                    t.insert(m, b.clone());
+                    b
+                }
+            }
+        };
+        let dst = fc_in.device_pointer().cu_deviceptr();
+        for r in 0..m {
+            for li in 0..3 {
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        dst + ((r * 3 + li) * h * 4) as u64,
+                        sources[r][li],
+                        h,
+                        stream,
+                    )
+                }
+                .expect("eagle fc_in assembly");
+            }
+        }
+        let fc_r2: Arc<Tensor<f32>> = fc_r2_helper(&fc_in, m, 3 * h);
+        let fused = self.gemm_any_d2d_batch(&fc_r2, "eagle.fc.weight", m, 3 * h, SLOT_EAGLE_FC);
+        Some(fused)
+    }
+
+    /// Teacher-forced batch of head rows (head prefill chunk / post-verify
+    /// resync): row r inputs (tokens[r], fused(sources[r])) at head-KV
+    /// position positions[r]; rows append to `kv`.  No logits (the outputs
+    /// are never needed -- the next cycle re-conditions on target taps).
+    fn eagle_teacher_rows(
+        &self,
+        eg: &EagleGpuState,
+        tokens: &[u32],
+        sources: &[[u64; 3]],
+        positions: &[u32],
+        kv: &mut CutileKvCache,
+    ) -> Option<()> {
+        let m = tokens.len();
+        if m == 0 {
+            return Some(());
+        }
+        let stream = self.matmul.stream();
+        let h = eg.h;
+        let h_pad = eg.h_pad;
+        // Embeds [m, h_pad].
+        let mut embeds = vec![0.0f32; m * h_pad];
+        for (r, &tok) in tokens.iter().enumerate() {
+            let row = crate::eagle::Eagle3Weights::embed_row_raw(&eg.embed_bf16, tok, h);
+            embeds[r * h_pad..r * h_pad + h].copy_from_slice(&row);
+        }
+        let embed_dev = {
+            let mut t = eg.t_embed.borrow_mut();
+            match t.get(&m) {
+                Some(b) => b.clone(),
+                None => {
+                    let b = Arc::new(
+                        api::zeros::<f32>(&[m * h_pad])
+                            .sync_on(stream)
+                            .expect("eagle t_embed alloc"),
+                    );
+                    t.insert(m, b.clone());
+                    b
+                }
+            }
+        };
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                embed_dev.device_pointer().cu_deviceptr(),
+                embeds.as_ptr(),
+                m * h_pad,
+                stream,
+            )
+        }
+        .expect("eagle t_embed H2D");
+
+        let fused = self.eagle_fc_rows(eg, m, sources)?;
+
+        // Per-row head forwards (per-row ops keep the m=1 scratch and the
+        // exact per-row kernels; the m-row GEMM batching is not worth the
+        // composition risk for a once-per-cycle cost).
+        for r in 0..m {
+            // Stage row r's fused hidden ([h] of the [m, h] fused output)
+            // into the dedicated row buffer; the pad tail stays zero.
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    eg.s_t_hidden_row.device_pointer().cu_deviceptr(),
+                    fused.device_pointer().cu_deviceptr() + (r * h * 4) as u64,
+                    h,
+                    stream,
+                )
+            }
+            .expect("eagle t_hidden row stage");
+            let hidden_r2: Arc<Tensor<f32>> = eg
+                .s_t_hidden_row
+                .clone()
+                .reshape(&[1, h_pad])
+                .expect("eagle hidden_r2 reshape")
+                .into();
+            self.eagle_head_row(eg, tokens[r], &hidden_r2, positions[r], kv, 0, false)?;
+        }
+        Some(())
+    }
+
+    /// The K-step draft cycle for one solo session.  `carry` holds the raw
+    /// 3-layer tap at position `base - 1`; step 0 fuses it through the fc,
+    /// steps 1.. feed the head's own pre-norm output forward.  Returns the
+    /// mapped (target-vocab) proposals.
+    pub fn eagle_draft_cycle(
+        &self,
+        kv: &mut CutileKvCache,
+        carry: &Arc<Tensor<f32>>,
+        first_token: u32,
+        base: usize,
+        k: usize,
+    ) -> Option<Vec<u32>> {
+        let eg = self.eagle.as_ref()?;
+        let h = eg.h;
+        let stream = self.matmul.stream();
+        // Step 0's hidden input: fc([carry]).
+        let carry_ptrs: [[u64; 3]; 1] = [[
+            carry.device_pointer().cu_deviceptr(),
+            carry.device_pointer().cu_deviceptr() + (h * 4) as u64,
+            carry.device_pointer().cu_deviceptr() + (2 * h * 4) as u64,
+        ]];
+        let fused0 = self.eagle_fc_rows(eg, 1, &carry_ptrs)?;
+        let hidden0: Arc<Tensor<f32>> = fused0_r2(&fused0, h);
+
+        let mut proposals = Vec::with_capacity(k);
+        let mut token = first_token;
+        let mut hidden = hidden0;
+        for j in 0..k {
+            let pos = (base - 1 + j) as u32;
+            let mapped = self.eagle_head_row(eg, token, &hidden, pos, kv, j & 1, true)?;
+            proposals.push(mapped);
+            token = mapped;
+            // Next step's hidden: this step's pre-norm output (ping-pong).
+            hidden = r2_of(&eg.s_hidden[j & 1], h);
+        }
+        // The draft steps advanced the head KV by k; the caller rolls it
+        // back to base-1 before the resync rewrites the accepted prefix.
+        stream.synchronize().ok()?;
+        Some(proposals)
+    }
+
+    /// Post-verify head maintenance for one solo session: resync rows
+    /// base-1 .. base+n_em-2 with the TRUE conditioning (tokens
+    /// [prev_last, emitted[0..n_em-2]], hiddens [carry, verify tap rows
+    /// 0..n_em-2]) and refresh the carry to verify tap row n_em-1.
+    /// `emitted` is the full emitted token list of this cycle (len n_em).
+    pub fn eagle_post_verify(
+        &self,
+        kv: &mut CutileKvCache,
+        carry: &Arc<Tensor<f32>>,
+        prev_last: u32,
+        emitted: &[u32],
+        base: usize,
+        verify_tap_rows: usize,
+    ) -> Option<()> {
+        let eg = self.eagle.as_ref()?;
+        let h = eg.h;
+        let n_em = emitted.len();
+        if n_em == 0 || verify_tap_rows < n_em {
+            return None;
+        }
+        let stream = self.matmul.stream();
+        // Sources: row 0 = carry, rows 1.. = decode tap rows (the verify
+        // forward's rows, in verify order).
+        let tap_ptr = |li: usize, row: usize| -> u64 {
+            eg.tap_decode[li].device_pointer().cu_deviceptr() + (row * h * 4) as u64
+        };
+        let mut sources: Vec<[u64; 3]> = Vec::with_capacity(n_em);
+        sources.push([
+            carry.device_pointer().cu_deviceptr(),
+            carry.device_pointer().cu_deviceptr() + (h * 4) as u64,
+            carry.device_pointer().cu_deviceptr() + (2 * h * 4) as u64,
+        ]);
+        for i in 1..n_em {
+            sources.push([tap_ptr(0, i - 1), tap_ptr(1, i - 1), tap_ptr(2, i - 1)]);
+        }
+        let mut tokens = Vec::with_capacity(n_em);
+        tokens.push(prev_last);
+        tokens.extend_from_slice(&emitted[..n_em - 1]);
+        let positions: Vec<u32> = (0..n_em).map(|i| (base - 1 + i) as u32).collect();
+        // The draft cycle left the head KV at base-1+k; rewrite the n_em
+        // rows from base-1 (rollback then append overwrites).
+        if kv.seq_len() > base - 1 {
+            kv.rollback(base - 1);
+        }
+        self.eagle_teacher_rows(eg, &tokens, &sources, &positions, kv)?;
+        // New carry = verify tap row n_em-1 (target hidden at base+n_em-1).
+        unsafe {
+            for li in 0..3 {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
+                    tap_ptr(li, n_em - 1),
+                    h,
+                    stream,
+                )
+            }
+            .expect("eagle carry refresh");
+        }
+        stream.synchronize().ok()?;
+        Some(())
+    }
+
+    /// Head prefill for one target-prefill chunk: the chunk wrote
+    /// `chunk_tap_rows` tap rows (target positions pos_base..); head rows
+    /// pos_base..pos_base+prompt_after.len()-1 input
+    /// (prompt[pos_base+1..], those taps) -- the official shift: head row
+    /// p inputs (token_{p+1}, h_p).  The FINAL chunk processes one row
+    /// fewer (row L-1 becomes the first draft step, conditioned on the
+    /// carry = the chunk's LAST tap row, h_{L-1}).
+    pub fn eagle_prefill_chunk(
+        &self,
+        kv: &mut CutileKvCache,
+        prompt_after: &[u32],
+        pos_base: usize,
+        chunk_tap_rows: usize,
+        carry: &Arc<Tensor<f32>>,
+    ) -> Option<()> {
+        let eg = self.eagle.as_ref()?;
+        let m = prompt_after.len();
+        let rows = eg.tap_rows.get();
+        if rows < chunk_tap_rows || chunk_tap_rows == 0 || m > chunk_tap_rows {
+            return None;
+        }
+        let h = eg.h;
+        let stream = self.matmul.stream();
+        let tap_ptr = |li: usize, row: usize| -> u64 {
+            eg.tap_prefill[li].device_pointer().cu_deviceptr() + (row * h * 4) as u64
+        };
+        let sources: Vec<[u64; 3]> = (0..m)
+            .map(|r| [tap_ptr(0, r), tap_ptr(1, r), tap_ptr(2, r)])
+            .collect();
+        let positions: Vec<u32> = (0..m).map(|r| (pos_base + r) as u32).collect();
+        self.eagle_teacher_rows(eg, prompt_after, &sources, &positions, kv)?;
+        // Carry = the chunk's LAST tap row (the target hidden at the last
+        // prefilled position -- for the final chunk, h_{L-1}).
+        unsafe {
+            for li in 0..3 {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
+                    tap_ptr(li, chunk_tap_rows - 1),
+                    h,
+                    stream,
+                )
+            }
+            .expect("eagle prefill carry refresh");
+        }
+        stream.synchronize().ok()?;
+        Some(())
+    }}
+
+/// Rank-2 reshape helpers (the head's staging buffers are rank-1; the
+/// GEMV dispatchers take [1, stride] / [m, stride] operands).
+fn fc_r2_helper(t: &Arc<Tensor<f32>>, m: usize, k: usize) -> Arc<Tensor<f32>> {
+    t.clone()
+        .reshape(&[m, k])
+        .expect("eagle fc rank-2 reshape")
+        .into()
+}
+
+fn fused0_r2(t: &Arc<Tensor<f32>>, h: usize) -> Arc<Tensor<f32>> {
+    t.clone()
+        .reshape(&[1, h])
+        .expect("eagle fused0 reshape")
+        .into()
+}
+
+fn r2_of(t: &Arc<Tensor<f32>>, h: usize) -> Arc<Tensor<f32>> {
+    t.clone()
+        .reshape(&[1, h])
+        .expect("eagle r2 reshape")
+        .into()
 }

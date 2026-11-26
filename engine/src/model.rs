@@ -499,6 +499,93 @@ pub trait InferenceModel: Send + Sync {
     ) -> Option<Vec<Vec<u32>>> {
         None
     }
+    // -- EAGLE-3 head (solo-path speculation; see eagle.rs) ---------------
+    /// Whether an EAGLE-3 head is loaded on this model.
+    #[cfg(feature = "cutile")]
+    fn eagle_active(&self) -> bool {
+        false
+    }
+    /// Rows held by the most recent decode-class tap write (0 = stale).
+    #[cfg(feature = "cutile")]
+    fn eagle_tap_rows(&self) -> usize {
+        0
+    }
+    /// Shared 1-layer KV page pool for head runs.
+    #[cfg(feature = "cutile")]
+    fn eagle_new_kv_pool(
+        &self,
+    ) -> Option<
+        std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+    > {
+        None
+    }
+    /// New head session: (KV run, raw-3-layer carry buffer [3*h]).
+    #[cfg(feature = "cutile")]
+    fn eagle_new_session(
+        &self,
+        _pool: &std::sync::Arc<
+            std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>,
+        >,
+        _initial_tokens: usize,
+    ) -> Option<(
+        crate::cutile_kv_cache::CutileKvCache,
+        std::sync::Arc<cutile::tensor::Tensor<f32>>,
+    )> {
+        None
+    }
+    /// Head prefill for one target-prefill chunk (see
+    /// `CutileGpuModel::eagle_prefill_chunk`).  False = taps stale /
+    /// head unsupported -- the session stops speculating.
+    #[cfg(feature = "cutile")]
+    fn eagle_prefill_chunk(
+        &self,
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _prompt_after: &[u32],
+        _pos_base: usize,
+        _chunk_tap_rows: usize,
+    ) -> bool {
+        false
+    }
+    /// K-step draft cycle (see `CutileGpuModel::eagle_draft_cycle`).
+    #[cfg(feature = "cutile")]
+    fn eagle_draft_cycle(
+        &self,
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _first_token: u32,
+        _base: usize,
+        _k: usize,
+    ) -> Option<Vec<u32>> {
+        None
+    }
+    /// Post-verify resync + carry refresh (see
+    /// `CutileGpuModel::eagle_post_verify`).
+    #[cfg(feature = "cutile")]
+    fn eagle_post_verify(
+        &self,
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _prev_last: u32,
+        _emitted: &[u32],
+        _base: usize,
+        _verify_tap_rows: usize,
+    ) -> bool {
+        false
+    }
+    /// One-row resync after a plain decode step (see
+    /// `CutileGpuModel::eagle_resync_plain`).
+    #[cfg(feature = "cutile")]
+    fn eagle_resync_plain(
+        &self,
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _token: u32,
+        _tap_row: usize,
+        _base: usize,
+    ) -> bool {
+        false
+    }
 }
 
 /// One decode step's output row: either the already-sampled token (pure
@@ -10847,7 +10934,76 @@ impl CutileInferenceWrapper {
                 .iter()
                 .map(|&m| it.by_ref().take(m).collect())
                 .collect(),
+        )    }
+
+    /// Load an EAGLE-3 head (speculators safetensors checkpoint) onto the
+    /// GPU model.  Must run BEFORE serving (allocates the tap buffers the
+    /// decode graphs capture).
+    pub fn load_eagle_head(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let w = crate::eagle::Eagle3Weights::load(dir)?;
+        let gm = self
+            .gpu_model
+            .as_mut()
+            .ok_or("eagle: GPU model not loaded")?;
+        gm.eagle_upload(w)
+    }
+
+    pub fn eagle_head_active(&self) -> bool {
+        self.gpu_model
+            .as_ref()
+            .map(|g| g.eagle_loaded())
+            .unwrap_or(false)
+    }
+
+    /// Shared 1-layer f32 KV page pool for EAGLE head runs (the head's
+    /// kv_dim equals the target's -- enforced at upload).
+    pub fn new_eagle_kv_pool(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>> {
+        let gm = self.gpu_model.as_ref()?;
+        let cfg = &self.model.config;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let tokens = 4096usize.min(cfg.max_seq_len.max(4096));
+        let pool_pages = tokens.div_ceil(block_size);
+        let pool = crate::cutile_kv_cache::GpuKvPagePool::new_with_dims(
+            1,
+            kv_dim,
+            pool_pages,
+            gm.stream(),
         )
+        .map_err(|e| eprintln!("[eagle] head KV pool creation failed ({e})"))
+        .ok()?;
+        Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
+    }
+
+    /// New head session: a 1-layer pooled KV run + the raw 3-layer carry
+    /// buffer ([3 * hidden] f32, device-resident).
+    pub fn new_eagle_session(
+        &self,
+        pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+        initial_tokens: usize,
+    ) -> Option<(
+        crate::cutile_kv_cache::CutileKvCache,
+        std::sync::Arc<cutile::tensor::Tensor<f32>>,
+    )> {
+        let gm = self.gpu_model.as_ref()?;
+        let mut cfg = self.model.config.clone();
+        cfg.num_layers = 1;
+        let kv = crate::cutile_kv_cache::CutileKvCache::new_pooled(
+            &cfg,
+            pool.clone(),
+            initial_tokens,
+            gm.stream(),
+        )
+        .ok()?;
+        let h = self.model.config.hidden_size;
+        let carry = std::sync::Arc::new(
+            cutile::api::zeros::<f32>(&[3 * h])
+                .sync_on(gm.stream())
+                .expect("eagle carry alloc"),
+        );
+        Some((kv, carry))
     }
 
     /// Current GPU KV sequence length (number of K/V entries written).
@@ -11010,6 +11166,85 @@ impl InferenceModel for CutileInferenceWrapper {
         kvs: &mut [crate::cutile_kv_cache::CutileKvCache],
     ) -> Option<Vec<Vec<u32>>> {
         self.spec_verify_greedy_multi(tokens, kvs)
+    }
+    fn eagle_active(&self) -> bool {
+        self.eagle_head_active()
+    }
+    fn eagle_tap_rows(&self) -> usize {
+        self.gpu_model
+            .as_ref()
+            .map(|g| g.eagle_tap_rows())
+            .unwrap_or(0)
+    }
+    fn eagle_new_kv_pool(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>> {
+        self.new_eagle_kv_pool()
+    }
+    fn eagle_new_session(
+        &self,
+        pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+        initial_tokens: usize,
+    ) -> Option<(
+        crate::cutile_kv_cache::CutileKvCache,
+        std::sync::Arc<cutile::tensor::Tensor<f32>>,
+    )> {
+        self.new_eagle_session(pool, initial_tokens)
+    }
+    fn eagle_prefill_chunk(
+        &self,
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        prompt_after: &[u32],
+        pos_base: usize,
+        chunk_tap_rows: usize,
+    ) -> bool {
+        let Some(gm) = self.gpu_model.as_ref() else {
+            return false;
+        };
+        gm.eagle_prefill_chunk(kv, prompt_after, pos_base, chunk_tap_rows, carry)
+            .is_some()
+    }
+    fn eagle_draft_cycle(
+        &self,
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        first_token: u32,
+        base: usize,
+        k: usize,
+    ) -> Option<Vec<u32>> {
+        self.gpu_model
+            .as_ref()?
+            .eagle_draft_cycle(kv, carry, first_token, base, k)
+    }
+    fn eagle_post_verify(
+        &self,
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        prev_last: u32,
+        emitted: &[u32],
+        base: usize,
+        verify_tap_rows: usize,
+    ) -> bool {
+        let Some(gm) = self.gpu_model.as_ref() else {
+            return false;
+        };
+        gm.eagle_post_verify(kv, carry, prev_last, emitted, base, verify_tap_rows)
+            .is_some()
+    }
+    fn eagle_resync_plain(
+        &self,
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        token: u32,
+        tap_row: usize,
+        base: usize,
+    ) -> bool {
+        let Some(gm) = self.gpu_model.as_ref() else {
+            return false;
+        };
+        gm.eagle_resync_plain(kv, carry, token, tap_row, base)
+            .is_some()
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
         if let (Some(gm), Some(qw), Some(kv_mutex)) = (

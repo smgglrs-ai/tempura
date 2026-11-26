@@ -116,6 +116,16 @@ pub struct ServeArgs {
                 Greedy requests only (v1); sampled requests decode normally."
     )]
     draft_model: Option<String>,
+
+    #[arg(
+        long,
+        help = "Path to an EAGLE-3 head checkpoint directory (speculators \
+                format: config.json + model.safetensors, e.g. RedHatAI/\
+                Llama-3.1-8B-Instruct-speculator.eagle3). Rides the target's \
+                hidden states for nearly-free drafting; SOLO decode path only \
+                (multi-client batches keep plain decode). Unset = off."
+    )]
+    eagle_head: Option<String>,
 }
 
 pub async fn run_server(args: ServeArgs) {
@@ -297,6 +307,25 @@ pub async fn run_server(args: ServeArgs) {
                 None
             }
         };
+
+        // -- EAGLE-3 head (--eagle-head) ------------------------------------
+        // Rides the TARGET model's kernel machinery (weights under the
+        // eagle.* namespace) -- loaded right after the target's GPU
+        // upload, before serving (the decode graphs capture the tap
+        // buffers at first use).
+        #[cfg(feature = "cutile")]
+        if let Some(eh) = args.eagle_head.as_deref() {
+            if use_gpu {
+                let wrapper = Arc::get_mut(&mut model)
+                    .expect("--eagle-head must be the first/only GPU model consumer");
+                wrapper
+                    .load_eagle_head(std::path::Path::new(eh))
+                    .unwrap_or_else(|e| panic!("failed to load EAGLE head {eh}: {e}"));
+                tracing::info!("EAGLE-3 head loaded ({eh})");
+            } else {
+                eprintln!("warning: --eagle-head requires --device cuda; ignored");
+            }
+        }
 
         let scheduler =
             batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
