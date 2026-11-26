@@ -14201,8 +14201,7 @@ impl CutileGpuModel {
             eg.cfg.draft_vocab_size,
         )
         .expect("eagle argmax launch");
-        let tokens = eg
-            .argmax_out
+        let tokens = Arc::clone(&eg.argmax_out)
             .to_host_vec()
             .sync_on(stream)
             .expect("eagle argmax download");
@@ -14485,7 +14484,50 @@ impl CutileGpuModel {
         }
         stream.synchronize().ok()?;
         Some(())
-    }}
+    }
+
+    /// Resync one head row after a PLAIN decode step: the session's step
+    /// was batch row `tap_row` of the last decode forward (taps hold its
+    /// hidden at position base-1); head row base-1 inputs (token, that
+    /// tap).  Refreshes the carry from the same row.
+    pub fn eagle_resync_plain(
+        &self,
+        kv: &mut CutileKvCache,
+        carry: &Arc<Tensor<f32>>,
+        token: u32,
+        tap_row: usize,
+        base: usize,
+    ) -> Option<()> {
+        let eg = self.eagle.as_ref()?;
+        let rows = eg.tap_rows.get();
+        if rows <= tap_row || base == 0 {
+            return None;
+        }
+        let h = eg.h;
+        let stream = self.matmul.stream();
+        let tap_ptr = |li: usize| -> u64 {
+            eg.tap_decode[li].device_pointer().cu_deviceptr() + (tap_row * h * 4) as u64
+        };
+        let sources: Vec<[u64; 3]> = vec![[tap_ptr(0), tap_ptr(1), tap_ptr(2)]];
+        if kv.seq_len() > base - 1 {
+            kv.rollback(base - 1);
+        }
+        self.eagle_teacher_rows(eg, &[token], &sources, &[(base - 1) as u32], kv)?;
+        for li in 0..3 {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
+                    tap_ptr(li),
+                    h,
+                    stream,
+                )
+            }
+            .expect("eagle resync carry refresh");
+        }
+        stream.synchronize().ok()?;
+        Some(())
+    }
+}
 
 /// Rank-2 reshape helpers (the head's staging buffers are rank-1; the
 /// GEMV dispatchers take [1, stride] / [m, stride] operands).

@@ -10998,6 +10998,7 @@ impl CutileInferenceWrapper {
         )
         .ok()?;
         let h = self.model.config.hidden_size;
+        use cutile::prelude::DeviceOp as _;
         let carry = std::sync::Arc::new(
             cutile::api::zeros::<f32>(&[3 * h])
                 .sync_on(gm.stream())
