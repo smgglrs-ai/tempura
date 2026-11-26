@@ -656,21 +656,6 @@ impl EngineTask {
         let mut eagle_id: Option<String> = None;
         #[cfg(feature = "cutile")]
         {
-            if std::env::var("TEMPURA_EAGLE_DEBUG").is_ok() {
-                let greedy = stepped
-                    .iter()
-                    .filter(|id| {
-                        sessions.get(*id).map(|e| e.params.is_greedy()).unwrap_or(false)
-                    })
-                    .count();
-                eprintln!(
-                    "[eagle-split] stepped={} greedy={} active={} draft={}",
-                    stepped.len(),
-                    greedy,
-                    self.model.eagle_active(),
-                    self.draft_model.is_some()
-                );
-            }
             if self.draft_model.is_none()
                 && self.model.eagle_active()
                 && std::env::var("TEMPURA_NO_EAGLE").as_deref() != Ok("1")
@@ -695,18 +680,13 @@ impl EngineTask {
                         })
                         .unwrap()
                         .clone();
-                    match self.eagle_states.get(&id) {
-                        Some(es) if es.prefilled && !es.failed => {
-                            eagle_id = Some(id);
-                        }
-                        other => {
-                            if std::env::var("TEMPURA_EAGLE_DEBUG").is_ok() {
-                                eprintln!(
-                                    "[eagle] solo session {id} not eligible: {:?}",
-                                    other.map(|e| (e.prefilled, e.failed, e.kv.seq_len()))
-                                );
-                            }
-                        }
+                    if self
+                        .eagle_states
+                        .get(&id)
+                        .map(|e| e.prefilled && !e.failed)
+                        .unwrap_or(false)
+                    {
+                        eagle_id = Some(id);
                     }
                 }
             }
@@ -1409,11 +1389,6 @@ impl EngineTask {
         ) {
             // Taps stale (CPU-fallback prefill, oversized chunk) -- the
             // head cannot be prefilled; this session never speculates.
-            eprintln!(
-                "[eagle] prefill hook FAILED for {id}: chunk_start={chunk_start} chunk_len={chunk_len} rows={} tap_rows={}",
-                prompt_tokens.len(),
-                self.model.eagle_tap_rows()
-            );
             es.failed = true;
             return;
         }
@@ -1443,16 +1418,9 @@ impl EngineTask {
         // h_p)); the anchor holds row base-1's output hidden.
         {
             let Some(es) = self.eagle_states.get(id) else {
-                eprintln!("[eagle-step] {id}: no state");
                 return false;
             };
             if es.failed || !es.prefilled || es.kv.seq_len() != base {
-                eprintln!(
-                    "[eagle-step] {id}: bad state prefilled={} failed={} head_len={} base={base}",
-                    es.prefilled,
-                    es.failed,
-                    es.kv.seq_len()
-                );
                 if !es.failed && es.kv.seq_len() != base {
                     // Stale (swap/re-admission lost the run alignment) --
                     // latch failed; plain decode for the rest.
@@ -1486,7 +1454,6 @@ impl EngineTask {
             {
                 Some(p) => p,
                 None => {
-                    eprintln!("[eagle-step] {id}: draft cycle returned None");
                     es.failed = true;
                     return false;
                 }
@@ -1513,9 +1480,6 @@ impl EngineTask {
         };
         let verify_us = t_verify.elapsed().as_micros() as u64;
         self.spec_stats.add_timing(draft_us, verify_us);
-        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
-            eprintln!("[eagle] verify base={base}: argmaxes={:?} proposals={:?}", &argmaxes[..j.min(4)], &proposals[..j.min(4)]);
-        }
 
         // Accept the longest prefix; emit the target's argmax at the
         // first mismatch (no bonus token on full acceptance -- K proposals

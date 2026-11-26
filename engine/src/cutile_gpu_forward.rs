@@ -381,9 +381,6 @@ pub(crate) struct EagleGpuState {
     /// Bumped on every tap write; rows == 0 marks a skipped (too large)
     /// write so the engine can detect staleness.
     pub tap_rows: Cell<usize>,
-    /// TEMPURA_EAGLE_DUMP: dump row-0 intermediates for the CPU reference
-    /// diff (set for exactly one head_row call).
-    pub dump_row0: Cell<bool>,
     // -- per-row (m=1) head scratch, all stable buffers --
     pub s_embed: Arc<Tensor<f32>>,
     /// qkv input cat [2 * h_pad]
@@ -13763,7 +13760,6 @@ impl CutileGpuModel {
             tap_prefill,
             tap_layers: crate::eagle::Eagle3Config::tap_layers(self.config.num_layers),
             tap_rows: Cell::new(0),
-            dump_row0: Cell::new(false),
             s_embed: alloc_f32(h_pad),
             s_cat: alloc_f32(2 * h_pad),
             s_q: alloc_f32(self.q_pad),
@@ -13861,11 +13857,7 @@ impl CutileGpuModel {
 
         // hidden_norm(hidden_in) -- norm_before_residual: the residual IS
         // the normed hidden.
-        let hidden_w = self.norm_weights.get("eagle.hidden_norm.weight");
-        if hidden_w.is_none() {
-            eprintln!("[eagle] head_row: hidden_norm weight missing");
-        }
-        let hidden_w = hidden_w?;
+        let hidden_w = self.norm_weights.get("eagle.hidden_norm.weight")?;
         let hidden_n = self
             .cutile_rmsnorm
             .forward_device_fused_scratch(
@@ -13890,11 +13882,7 @@ impl CutileGpuModel {
         }
 
         // embeds = input_layernorm(embed); cat = [embeds | hidden_n].
-        let input_ln_w = self.norm_weights.get("eagle.input_layernorm.weight");
-        if input_ln_w.is_none() {
-            eprintln!("[eagle] head_row: input_layernorm weight missing");
-        }
-        let input_ln_w = input_ln_w?;
+        let input_ln_w = self.norm_weights.get("eagle.input_layernorm.weight")?;
         if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() {
             eprintln!("[eagle] head_row tok={token} pos={pos} logits={logits}");
         }
@@ -13942,19 +13930,6 @@ impl CutileGpuModel {
         // copied into its stable row buffer BEFORE the next GEMV runs
         // (running all three first handed every copy the LAST result:
         // q == k == v, attention garbage -- found via the stage dump).
-        let dump = std::env::var("TEMPURA_EAGLE_DUMP").is_ok() && eg.dump_row0.get();
-        if dump {
-            eg.dump_row0.set(false);
-            let dl = |name: &str, t: &Arc<Tensor<f32>>| {
-                let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
-                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
-            };
-            dl("hidden_in", hidden_in);
-            dl("hidden_n", &hidden_n);
-            dl("embeds_n", &embeds_n);
-            dl("cat", &eg.s_cat);
-        }
         unsafe {
             let q_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.q.weight", 1, SLOT_EAGLE_Q);
             cuda_core::memcpy_dtod_async::<f32>(
@@ -14067,10 +14042,7 @@ impl CutileGpuModel {
             .expect("eagle KV append failed");
         kv.advance_host_seq_len(1);
         kv.mark_host_stale();
-        let Some(oda) = self.oxide_decode_attn.as_ref() else {
-            eprintln!("[eagle] head_row: no oxide_decode_attn");
-            return None;
-        };
+        let oda = self.oxide_decode_attn.as_ref()?;
         let kv_len = kv.seq_len();
         {
             // Model-owned staging slot for the pageable async H2D (the
@@ -14132,17 +14104,6 @@ impl CutileGpuModel {
         }
         .expect("eagle decode attention failed");
 
-        if dump {
-            let dl = |name: &str, t: &Arc<Tensor<f32>>| {
-                let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
-                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
-            };
-            dl("q", &eg.s_q);
-            dl("k", &eg.s_k);
-            dl("v", &eg.s_v);
-            dl("attn_out", &eg.s_attn_out);
-        }
         // o-proj ([1, q_pad] -> h), pad to h_pad, residual add.
         let attn_r2: Arc<Tensor<f32>> = eg
             .s_attn_out
@@ -14270,14 +14231,6 @@ impl CutileGpuModel {
         }
 
         if !logits {
-            if dump {
-                let dl = |name: &str, t: &Arc<Tensor<f32>>| {
-                    let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
-                    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
-                };
-                dl("hidden_out", hidden_out);
-            }
             return None;
         }
         // Final norm + lm_head over the DRAFT vocab + device argmax.
@@ -14429,28 +14382,6 @@ impl CutileGpuModel {
         .expect("eagle t_embed H2D");
 
         let fused = self.eagle_fc_rows(eg, m, sources)?;
-        if std::env::var("TEMPURA_EAGLE_DUMP").is_ok() && positions[0] == 0 {
-            eg.dump_row0.set(true);
-            let v = Arc::clone(&fused).to_host_vec().sync_on(stream).unwrap_or_default();
-            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!("[eagle-dump] fused: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
-            for li in 0..3 {
-                let mut tap = vec![0.0f32; eg.h];
-                unsafe {
-                    cuda_core::memcpy_dtod_async::<f32>(
-                        eg.s_fc_in.device_pointer().cu_deviceptr(),
-                        sources[0][li],
-                        eg.h,
-                        stream,
-                    )
-                }
-                .expect("dump tap stage");
-                let t = Arc::clone(&eg.s_fc_in).to_host_vec().sync_on(stream).unwrap_or_default();
-                let n: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[eagle-dump] tap{li}: |v|={n:.4} [0..4]={:?}", &t[0..4.min(t.len())]);
-                let _ = tap;
-            }
-        }
 
         // Per-row head forwards (per-row ops keep the m=1 scratch and the
         // exact per-row kernels; the m-row GEMM batching is not worth the
@@ -14468,39 +14399,15 @@ impl CutileGpuModel {
             }
             .expect("eagle t_hidden row stage");
             let hidden_row: Arc<Tensor<f32>> = eg.s_t_hidden_row.clone();
-            // Teacher-forced accuracy probe (TEMPURA_EAGLE_TRACE): row r's
-            // logits should predict tokens[r+1] (the input token of row
-            // r+1).  Splits "head forward broken" from "draft chaining
-            // broken".
-            let logits = std::env::var("TEMPURA_EAGLE_TRACE").is_ok()
-                && r + 1 < m
-                && r < 24;
-            let got = self.eagle_head_row(
+            let _ = self.eagle_head_row(
                 eg,
                 tokens[r],
                 &hidden_row,
                 positions[r],
                 kv,
                 0,
-                logits,
+                false,
             );
-            if let (Some(got), true) = (got, r + 1 < m) {
-                static MATCHES: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                static TOTAL: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let want = tokens[r + 1];
-                TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if got == want {
-                    MATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                eprintln!(
-                    "[eagle] tf row={r} pos={} got={got} want={want} acc={}/{}",
-                    positions[r],
-                    MATCHES.load(std::sync::atomic::Ordering::Relaxed),
-                    TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-                );
-            }
         }
         // (per-row host seq_len advancement happens inside head_row)
         // Anchor: the LAST row's pre-norm output hidden -- the next draft
@@ -14550,9 +14457,6 @@ impl CutileGpuModel {
         // caller rolls the run back to base before the resync rewrites
         // the accepted prefix)
         self.matmul.stream().synchronize().ok()?;
-        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
-            eprintln!("[eagle] draft base={base}: proposals={:?}", &proposals);
-        }
         Some(proposals)
     }
 

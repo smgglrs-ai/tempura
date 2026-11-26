@@ -72,7 +72,7 @@ run_solo() {
         "$SOLO_PROMPT" "$RUN/$tag/solo.txt" "$SOLO_TOKENS" \
         > "$RUN/$tag/solo.stderr" 2>&1
     t1=$(date +%s.%N)
-    echo "$SOLO_TOKENS $(echo "$t1 - t0" | bc)" > "$RUN/$tag/solo.time"
+    echo "$SOLO_TOKENS $(echo "$t1 - $t0" | bc)" > "$RUN/$tag/solo.time"
     cat "$RUN/$tag/solo.stderr"
 }
 
