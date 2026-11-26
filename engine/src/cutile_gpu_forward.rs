@@ -14015,9 +14015,16 @@ impl CutileGpuModel {
                 .expect("eagle K RoPE failed")
         };
 
-        // KV append + attention (kpar over the head's own run).
+        // KV append + attention (kpar over the head's own run).  The
+        // append is device-only; advance the host counter PER ROW so this
+        // row's attention (and the next row's) sees the true length --
+        // batching the advance at the end left every row attending a
+        // stale kv_len (0 during the whole prefill -- the head never saw
+        // its KV; found via the teacher-forced accuracy probe).
         kv.append_device_gpu_only(0, &k_rot, &eg.s_v, 1)
             .expect("eagle KV append failed");
+        kv.advance_host_seq_len(1);
+        kv.mark_host_stale();
         let Some(oda) = self.oxide_decode_attn.as_ref() else {
             eprintln!("[eagle] head_row: no oxide_decode_attn");
             return None;
@@ -14402,8 +14409,7 @@ impl CutileGpuModel {
                 );
             }
         }
-        kv.advance_host_seq_len(m);
-        kv.mark_host_stale();
+        // (per-row host seq_len advancement happens inside head_row)
         // Anchor: the LAST row's pre-norm output hidden -- the next draft
         // step's conditioning (feature-level autoregression).
         unsafe {
@@ -14447,11 +14453,9 @@ impl CutileGpuModel {
             // Next step's hidden: this step's pre-norm output (ping-pong).
             hidden = eg.s_hidden[j & 1].clone();
         }
-        // The draft steps advanced the head KV by k (device-side); advance
-        // the host counter to match.  The caller rolls it back to base-1
-        // before the resync rewrites the accepted prefix.
-        kv.advance_host_seq_len(k);
-        kv.mark_host_stale();
+        // (per-row host seq_len advancement happens inside head_row; the
+        // caller rolls the run back to base before the resync rewrites
+        // the accepted prefix)
         self.matmul.stream().synchronize().ok()?;
         if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
             eprintln!("[eagle] draft base={base}: proposals={:?}", &proposals);
