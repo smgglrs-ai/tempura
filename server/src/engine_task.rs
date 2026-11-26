@@ -528,12 +528,6 @@ impl EngineTask {
             }
         };
         entry.prefill_done = done_prefill;
-        // EAGLE head prefill for this chunk (consumes the chunk's taps
-        // immediately -- the next forward overwrites them).
-        #[cfg(feature = "cutile")]
-        if done_prefill || chunk_len > 0 {
-            self.eagle_prefill_hook(sessions, id, start, chunk_len, done_prefill);
-        }
         if done_prefill {
             if let Ok(mut sched) = self.scheduler.lock() {
                 sched.mark_decoding(id);
@@ -545,11 +539,19 @@ impl EngineTask {
             let tokens = self.kv_caches.get(id).map(|kv| kv.seq_len()).unwrap_or(0);
             sched.touch(id, tokens);
         }
-        if done_prefill {
+        let finished = if done_prefill {
             entry.sample_and_emit(self.model.as_ref(), logits)
         } else {
             false
+        };
+        // EAGLE head prefill for this chunk (consumes the chunk's taps
+        // immediately -- the next forward overwrites them).  Runs after
+        // the entry borrow ends (the hook takes sessions immutably).
+        #[cfg(feature = "cutile")]
+        {
+            self.eagle_prefill_hook(sessions, id, start, chunk_len, done_prefill);
         }
+        finished
     }
 
     /// One batched decode step over the decode-ready resident sessions

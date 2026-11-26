@@ -500,6 +500,11 @@ pub trait InferenceModel: Send + Sync {
         None
     }
     // -- EAGLE-3 head (solo-path speculation; see eagle.rs) ---------------
+    /// Load an EAGLE-3 head checkpoint onto this model (GPU models only).
+    #[cfg(feature = "cutile")]
+    fn load_eagle_head(&mut self, _dir: &std::path::Path) -> Result<(), String> {
+        Err("eagle: not a GPU model".into())
+    }
     /// Whether an EAGLE-3 head is loaded on this model.
     #[cfg(feature = "cutile")]
     fn eagle_active(&self) -> bool {
@@ -10939,7 +10944,7 @@ impl CutileInferenceWrapper {
     /// Load an EAGLE-3 head (speculators safetensors checkpoint) onto the
     /// GPU model.  Must run BEFORE serving (allocates the tap buffers the
     /// decode graphs capture).
-    pub fn load_eagle_head(&mut self, dir: &std::path::Path) -> Result<(), String> {
+    fn load_eagle_head_impl(&mut self, dir: &std::path::Path) -> Result<(), String> {
         let w = crate::eagle::Eagle3Weights::load(dir)?;
         let gm = self
             .gpu_model
@@ -11167,6 +11172,9 @@ impl InferenceModel for CutileInferenceWrapper {
         kvs: &mut [crate::cutile_kv_cache::CutileKvCache],
     ) -> Option<Vec<Vec<u32>>> {
         self.spec_verify_greedy_multi(tokens, kvs)
+    }
+    fn load_eagle_head(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        self.load_eagle_head_impl(dir)
     }
     fn eagle_active(&self) -> bool {
         self.eagle_head_active()

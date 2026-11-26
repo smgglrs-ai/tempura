@@ -26,6 +26,8 @@ opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.28", optional = true }
+cutile = { path = "../../../NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
+cuda-core = { path = "../../../NVLabs/cuda-oxide/cuda-core", optional = true }
 
 [features]
 default = []
@@ -36,7 +38,7 @@ default = []
 # oxide kernels.  The kernels' build.rs falls back to the crate-root PTX
 # or an empty file, so this stays buildable on hosts without cargo oxide.
 cuda = ["tempura-engine/cutile", "tempura-engine/oxide-gemv", "cutile"]
-cutile = ["tempura-engine/cutile", "tempura-engine/oxide-gemv"]
+cutile = ["tempura-engine/cutile", "tempura-engine/oxide-gemv", "dep:cutile"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 openmp = ["tempura-engine/openmp"]
 
