@@ -14385,6 +14385,15 @@ impl CutileGpuModel {
         ]];
         let fused0 = self.eagle_fc_rows(eg, 1, &carry_ptrs)?;
         let hidden0: Arc<Tensor<f32>> = fused0;
+        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() {
+            let carry_host = Arc::clone(carry).to_host_vec().sync_on(stream).ok();
+            let fused_host = Arc::clone(&hidden0).to_host_vec().sync_on(stream).ok();
+            if let (Some(c), Some(f)) = (carry_host, fused_host) {
+                let cn: f32 = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let fnn: f32 = f.iter().map(|v| v * v).sum::<f32>().sqrt();
+                eprintln!("[eagle] draft base={base}: |carry|={cn:.3} |fused|={fnn:.3} carry[0..4]={:?}", &c[0..4]);
+            }
+        }
 
         let mut proposals = Vec::with_capacity(k);
         let mut token = first_token;
@@ -14403,6 +14412,9 @@ impl CutileGpuModel {
         kv.advance_host_seq_len(k);
         kv.mark_host_stale();
         stream.synchronize().ok()?;
+        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
+            eprintln!("[eagle] draft base={base}: proposals={:?}", &proposals);
+        }
         Some(proposals)
     }
 
