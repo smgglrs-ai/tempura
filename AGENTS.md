@@ -397,6 +397,15 @@ Qwen3.6-27B weights** — see open work.
       2026-11-15: f16/f32 ratio 1.0003 on WikiText-2; TEMPURA_KV_F32=1
       restores f32).  e4m3 (FP8, 64 KiB/token, vLLM's production density)
       opt-in via TEMPURA_KV_DTYPE=e4m3 (ppl-gated: e4m3/f16 ratio 0.995;
+      THE DENSITY FLOOR — the 2026-11-26 TurboQuant polar-quant ladder
+      (CpuPolarQuant min/max + b-bit codes, bits {2,3,4} x group
+      {32,64,128} simulated at the KV storage boundary, tools/fp8-sim
+      TEMPURA_KV_SIM_SWEEP) found NO passing config: best 4:32 hits only
+      1.33x e4m3 density at 90.8% MMLU agreement / ppl ratio 1.0194
+      (250q confirmation: 89.6% agreement, same 1.0194 ratio) --
+      both gates failed; 2-3 bits collapse outright — do not revisit
+      min/max polar KV below 1 B/elem without a new scheme (outlier-aware
+      scales, not per-group min/max);
       shared e4m3 bit-math helpers in tempura-kernels used by the cutile
       cast/prefill kernels, the oxide decode twins, and the mirror syncs.
       NOTE (2026-11-22, found via the spec-decode draft model — the first

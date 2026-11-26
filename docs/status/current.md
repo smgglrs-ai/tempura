@@ -5,6 +5,68 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-26 (TurboQuant KV-density round — stage-1 go/no-go:
+NEGATIVE RESULT, simulation-first per the FP8-round precedent; the
+CpuPolarQuant class does NOT pass the KV quality gates at any useful
+density, so e4m3 REMAINS THE KV DENSITY FLOOR and no GPU pool/kernel
+work was done; the simulation harness landed as the durable output,
+all gates green): (1) THE HYPOTHESIS UNDER TEST (the Bonsai density
+thesis — KV cache is the memory bottleneck on edge): group-wise
+min/max polar quant (turboquant.rs CpuPolarQuant: per-group min/max
+f32 scales + b-bit uniform codes) at 2-4 bits/elem + group scales
+lands between e4m3 (1 B/elem, ppl ratio 0.995 PASS) and nothing —
+the ladder rung below e4m3. (2) THE METHOD — quantify BEFORE kernel
+work: kernels/src/kv_quant_sim.rs injects the EXACT CpuPolarQuant
+round-trip at the KV storage boundary (quantize-on-write,
+dequantize-on-read — the exact serving semantics of a polar-quant
+pool) inside the real CPU quantized forward, default-off via a single
+atomic load. Unit-gated: bit-IDENTICAL to the real compressor's
+compress+decompress (all sweep configs), and the round-trip is
+IDEMPOTENT (quantize->dequantize->quantize is a fixed point — the
+swap/mirror requantization requirement). tools/fp8-sim gained
+TEMPURA_KV_SIM_SWEEP mode: reference pass (sim off) + per-config
+(bits x group) passes, reporting MMLU accuracy / choice agreement /
+logit band / WikiText-2 ppl ratio + the pool density (B/elem,
+KiB/token for the 32-layer x 2 x 1024 GQA pool). (3) THE LADDER
+(fishtank CPU, Llama-3.1-8B-Instruct Q4_K_M, 120q MMLU + 8x512-ctx
+ppl legs, gates: agreement >= 95% and/or ppl ratio <= 1.01):
+b2g32 32 KiB/tok agr 28.3% ppl 3.53 | b2g64 24 KiB/tok 24.2% 10.58 |
+b2g128 20 KiB/tok 18.3% 58.12 | b3g32 40 KiB/tok 81.7% 1.060 |
+b3g64 32 KiB/tok 74.2% 1.147 | b3g128 28 KiB/tok 70.0% 1.231 |
+b4g32 48 KiB/tok 90.8% 1.0194 | b4g64 40 KiB/tok 88.3% 1.0207 |
+b4g128 36 KiB/tok 85.0% 1.0357. NO CONFIG PASSES. (4) THE VERDICT
+and why it is structural, not tunable: the best config (4:32) fails
+BOTH gates (90.8% agreement vs 95%; ppl ratio 1.0194 vs 1.01 — the
+same 90.8% agreement the e4m3-ACTIVATION negative measured, a
+coincidence of cliffs) AND buys only 1.33x density over e4m3 (48 vs
+64 KiB/token); matching e4m3's 1 B/elem would need 4:16, strictly
+worse than e4m3 at the same bytes. Quality scales monotonically
+with B/elem across the whole ladder and the min/max polar class is
+dominated by e4m3's floating exponent at every density — the
+per-group min/max fold is outlier-sensitive exactly where K/V
+distributions (post-RoPE K, V) have heavy tails. The floor stands:
+f16 (128 KiB/tok, default) -> e4m3 (64, opt-in) -> nothing passing
+below. A future rung requires a different scheme (outlier-aware or
+non-uniform scales — e.g. per-group f16 scale+offset with clipping,
+or KV-aware rotation as in KIVI/NoPE-style analyses), not this one.
+(5) WHAT LANDED: the harness (kv_quant_sim.rs + the model.rs storage-
+boundary hooks on every CPU attention path — decode, prefill paged +
+plain, BitNet persistent-thread, multi-token, eval — each a no-op
+atomic load when off) + the fp8-sim sweep mode; committed 2a7ef71.
+(6) GATES: local cargo test --workspace (bench-gpu excluded, CPU
+laptop) ALL PASS incl. the 3 new kv_quant_sim tests (bit-identity,
+idempotence, off-identity); the sweep ran single-instance-per-core-
+set (3 parallel processes pinned via taskset, ~6 GB quantized
+weights each — no f32 weight cache, unlike the e4m3 sim, so the
+no-parallel-instances OOM rule does not bind). 250q confirmation of
+the best config: agr 89.6%, ppl ratio 1.0194 (ppl 8.2624 vs the
+exact-prefill f16-KV 8.1048 baseline; logit band max |d| 2.0361,
+rel-to-peak 0.0984) — verdict unchanged, both gates fail. (7) FOLLOW-UPS RECORDED: if KV density below
+64 KiB/token ever matters (Bonsai-class edge), the candidate schemes
+are outlier-aware scales or per-head format selection (e4m3 for
+outlier-heavy heads, polar for flat ones) — both need this same
+stage-1 harness first (it is config-agnostic: swap roundtrip_group).**
+
 **STATUS 2026-11-26 (zeolite — the Intel NPU stack spun off from tempura is
 COMPLETE through its 7-stage 1:1 translation plan: a DROP-IN
 libze_intel_npu.so.1 replacement for Lunar Lake NPU 4000 where the only
