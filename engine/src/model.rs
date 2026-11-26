@@ -11001,7 +11001,7 @@ impl CutileInferenceWrapper {
         use cutile::prelude::DeviceOp as _;
         let carry = std::sync::Arc::new(
             cutile::api::zeros::<f32>(&[3 * h])
-                .sync_on(gm.stream())
+                .sync_on(&gm.stream())
                 .expect("eagle carry alloc"),
         );
         Some((kv, carry))
