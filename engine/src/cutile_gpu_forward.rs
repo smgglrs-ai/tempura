@@ -381,6 +381,9 @@ pub(crate) struct EagleGpuState {
     /// Bumped on every tap write; rows == 0 marks a skipped (too large)
     /// write so the engine can detect staleness.
     pub tap_rows: Cell<usize>,
+    /// TEMPURA_EAGLE_DUMP: dump row-0 intermediates for the CPU reference
+    /// diff (set for exactly one head_row call).
+    pub dump_row0: Cell<bool>,
     // -- per-row (m=1) head scratch, all stable buffers --
     pub s_embed: Arc<Tensor<f32>>,
     /// qkv input cat [2 * h_pad]
@@ -13758,6 +13761,7 @@ impl CutileGpuModel {
             tap_prefill,
             tap_layers: crate::eagle::Eagle3Config::tap_layers(self.config.num_layers),
             tap_rows: Cell::new(0),
+            dump_row0: Cell::new(false),
             s_embed: alloc_f32(h_pad),
             s_cat: alloc_f32(2 * h_pad),
             s_q: alloc_f32(self.q_pad),
@@ -13932,6 +13936,19 @@ impl CutileGpuModel {
 
         // q / k / v GEMVs ([1, 2h] -> q_dim / kv_dim).
         let q_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.q.weight", 1, SLOT_EAGLE_Q);
+        let dump = std::env::var("TEMPURA_EAGLE_DUMP").is_ok() && eg.dump_row0.get();
+        if dump {
+            eg.dump_row0.set(false);
+            let dl = |name: &str, t: &Arc<Tensor<f32>>| {
+                let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
+            };
+            dl("hidden_in", hidden_in);
+            dl("hidden_n", &hidden_n);
+            dl("embeds_n", &embeds_n);
+            dl("cat", &eg.s_cat);
+        }
         let k_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.k.weight", 1, SLOT_EAGLE_K);
         let v_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.v.weight", 1, SLOT_EAGLE_V);
         // Copy into the stable row buffers (q_pad/kv_pad strides; the pad
@@ -14110,6 +14127,17 @@ impl CutileGpuModel {
         }
         .expect("eagle decode attention failed");
 
+        if dump {
+            let dl = |name: &str, t: &Arc<Tensor<f32>>| {
+                let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
+            };
+            dl("q", &eg.s_q);
+            dl("k", &eg.s_k);
+            dl("v", &eg.s_v);
+            dl("attn_out", &eg.s_attn_out);
+        }
         // o-proj ([1, q_pad] -> h), pad to h_pad, residual add.
         let attn_r2: Arc<Tensor<f32>> = eg
             .s_attn_out
@@ -14226,6 +14254,14 @@ impl CutileGpuModel {
         }
 
         if !logits {
+            if dump {
+                let dl = |name: &str, t: &Arc<Tensor<f32>>| {
+                    let v = Arc::clone(t).to_host_vec().sync_on(stream).unwrap_or_default();
+                    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!("[eagle-dump] {name}: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
+                };
+                dl("hidden_out", hidden_out);
+            }
             return None;
         }
         // Final norm + lm_head over the DRAFT vocab + device argmax.
@@ -14377,7 +14413,28 @@ impl CutileGpuModel {
         .expect("eagle t_embed H2D");
 
         let fused = self.eagle_fc_rows(eg, m, sources)?;
-        eprintln!("[eagle] teacher_rows: m={m} fc done");
+        if std::env::var("TEMPURA_EAGLE_DUMP").is_ok() && positions[0] == 0 {
+            eg.dump_row0.set(true);
+            let v = Arc::clone(&fused).to_host_vec().sync_on(stream).unwrap_or_default();
+            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("[eagle-dump] fused: |v|={n:.4} [0..4]={:?}", &v[0..4.min(v.len())]);
+            for li in 0..3 {
+                let mut tap = vec![0.0f32; eg.h];
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        eg.s_fc_in.device_pointer().cu_deviceptr(),
+                        sources[0][li],
+                        eg.h,
+                        stream,
+                    )
+                }
+                .expect("dump tap stage");
+                let t = Arc::clone(&eg.s_fc_in).to_host_vec().sync_on(stream).unwrap_or_default();
+                let n: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("[eagle-dump] tap{li}: |v|={n:.4} [0..4]={:?}", &t[0..4.min(t.len())]);
+                let _ = tap;
+            }
+        }
 
         // Per-row head forwards (per-row ops keep the m=1 scratch and the
         // exact per-row kernels; the m-row GEMM batching is not worth the
