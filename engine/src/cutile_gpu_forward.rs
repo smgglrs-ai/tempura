@@ -13677,7 +13677,22 @@ impl CutileGpuModel {
         }
 
         let stream = self.matmul.stream();
+        // TEMPURA_EAGLE_F32=1: upload the head UNQUANTIZED (f32 GEMV path)
+        // -- the structure-vs-quantization bisect for draft-quality bugs.
+        let f32_mode = std::env::var("TEMPURA_EAGLE_F32").as_deref() == Ok("1");
         let mut up_q6k = |name: &str, data: &[f32], n: usize, k: usize| -> Result<(), String> {
+            if f32_mode {
+                Self::upload(
+                    &self.matmul,
+                    &mut self.device_weights,
+                    name,
+                    data,
+                    n,
+                    k,
+                )
+                .map_err(|e| format!("eagle: upload {name}: {e}"))?;
+                return Ok(());
+            }
             let bytes = crate::eagle::quantize_q6k_host(data, n, k);
             Self::upload_q6k_bytes(stream, &mut self.device_weights_q6k, name, &bytes, n, k)
                 .map_err(|e| format!("eagle: upload {name}: {e}"))
