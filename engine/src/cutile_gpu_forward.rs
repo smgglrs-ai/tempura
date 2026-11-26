@@ -14343,7 +14343,10 @@ impl CutileGpuModel {
             }
             .expect("eagle t_hidden row stage");
             let hidden_row: Arc<Tensor<f32>> = eg.s_t_hidden_row.clone();
-            self.eagle_head_row(eg, tokens[r], &hidden_row, positions[r], kv, 0, false)?;
+            // head_row returns None when logits=false (by design -- the
+            // teacher rows never need logits); only a real failure breaks
+            // the chain, and head_row reports those via eprintln/panic.
+            let _ = self.eagle_head_row(eg, tokens[r], &hidden_row, positions[r], kv, 0, false);
         }
         Some(())
     }
