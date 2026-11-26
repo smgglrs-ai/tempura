@@ -856,6 +856,14 @@ add it to the main workspace.
   (also advertised as the `status` reference). This is where session status
   updates go.
 - `docs/history/` — archived status entries for completed work.
+- `../zeolite` (SEPARATE repo, not a workspace crate; nothing in tempura
+  depends on it) — Rust-native Intel NPU stack: 1:1 translation of the Intel
+  UMD, drop-in `libze_intel_npu.so.1` (Lunar Lake NPU 4000; only trusted
+  binaries are firmware + kernel driver, validated by the l0diff
+  differential harness). Started as tempura's NPU investigation; prospective
+  future `npu-intel` backend for edge inference. Its TRANSLATION_PLAN.md
+  hard rules (no stand-ins, line citations, pinned layouts, byte-diff gates)
+  are load-bearing for any work there.
 - `kernels/AGENTS.md` — cuda-oxide build recipes, backend `.so` caching, PTX
   copy loops, the mxf4-gemv cubin rebuild procedure and the stale-cubin
   warning. Loaded automatically when working under `kernels/`.

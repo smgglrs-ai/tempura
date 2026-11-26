@@ -5,6 +5,50 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-26 (zeolite — the Intel NPU stack spun off from tempura is
+COMPLETE through its 7-stage 1:1 translation plan: a DROP-IN
+libze_intel_npu.so.1 replacement for Lunar Lake NPU 4000 where the only
+trusted binaries are the firmware and the kernel driver, both l0diff
+differential gates GREEN, Definition of Done checked — ~33k lines of cited
+Rust, 160 tests, 14 commits in the SIBLING repo ../zeolite; recorded here
+because the arc started as tempura's NPU investigation): (1) THE ARC. The
+NPU stubs (npu-intel/npu-qualcomm features) needed ground truth: recon of
+intel/linux-npu-driver (UMD C++) + openvinotoolkit/npu_compiler_elf
+(vpux_elf core, hpi_component, loader) — the UMD is the entire user-space
+stack below the Level-Zero API. Phase A proved PURE-RUST /dev/accel
+submission: hand-built ioctls + firmware commands drove DMA workloads on
+the real NPU with no Intel code linked. (2) THE BLOB EMITTER + FIRMWARE
+CONTRACTS discovered on hardware: DMA_MEM user buffers (not
+DMA_MEM_IMPORT), the WLM structure requirement (descriptor->buffers->tasks
+layout), queue-destroy-before-wait ABORTS jobs (the KMD call order is
+load-bearing), 1D width/dim_size_1 aliasing in DMA descriptors,
+task-storage classes, TILE_CONFIG fuse-mask INVERSION, and the MI note
+11.4.10 contract. (3) THE DIFFERENTIAL METHOD: the real Intel driver as
+ORACLE — l0diff runs the same workload against both drivers and
+byte-compares; gdb byte-dumps of driver-internal buffers anchored the
+emitter when no source was trusted. (4) THE 7-STAGE PLAN (TRANSLATION_PLAN.
+md, hard rules: NO STAND-INS — if a 1:1 translation exists, use it; LINE
+CITATIONS on every function; PIN EVERY LAYOUT (static_assert -> Rust
+size/offset test); NO KMD-CALL REORDERING; BYTE-DIFF GATES at every
+boundary where C++ produces bytes; GREEN AT EVERY COMMIT; judgment calls
+reported, never hidden). Stage results: (1) vpu_driver leaf (ioctls,
+device, BO) 1:1; (2) command/cmdbuf/job 1:1; (3) context + command queues
+1:1; (4) stand-ins DELETED — vpux_hpi/vpux_loader/elf_parser wired into
+the exec path; (5) vpux_elf writer/reader 1:1 (blob flows through
+elf::writer); (6) tracing 1:1; (7) full Level-Zero API surface + cdylib
+(tools/zeolite-l0). (5) THE FINAL STATE: drop-in driver — l0diff gate 1
+(copy workload) VERIFIED field-identical on a hand-emitted WLM blob; gate
+2 (golden profiling blob) EXECUTES with profiling; 160 tests green.
+Naming: ze = Level Zero prefix; the cuda-oxide parallel holds exactly —
+trusted infrastructure below (firmware + KMD, like rustc/CPU), everything
+above it translated and gated. NOTHING in tempura depends on zeolite;
+the relationship is prospective (a future npu-intel backend for edge
+inference — Bonsai-class ternary on Lunar Lake). OPEN ITEMS (in flight,
+in ../zeolite): DPU compute tasks (the emitter authors DMA tasks today;
+DPU work is in another worktree) and a Kani/Verus pass over the
+translation (same verification-first discipline as tempura — index
+safety, struct-layout proofs, the packing/bitmap roundtrips).**
+
 **STATUS 2026-11-23 (speculative decoding v2 — the cross-session BATCHED
 cycle is LANDED and GATE-GREEN, and the throughput verdict is a
 CONFIRMED HONEST NEGATIVE at serving batch scale, with the per-component
