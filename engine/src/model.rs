@@ -11205,7 +11205,7 @@ impl InferenceModel for CutileInferenceWrapper {
         &self,
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
         anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
-        prompt_after: &[u32],
+        prompt_tokens: &[u32],
         pos_base: usize,
         chunk_tap_rows: usize,
     ) -> bool {

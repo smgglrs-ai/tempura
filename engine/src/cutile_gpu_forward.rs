@@ -14452,7 +14452,7 @@ impl CutileGpuModel {
         // before the resync rewrites the accepted prefix.
         kv.advance_host_seq_len(k);
         kv.mark_host_stale();
-        stream.synchronize().ok()?;
+        self.matmul.stream().synchronize().ok()?;
         if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
             eprintln!("[eagle] draft base={base}: proposals={:?}", &proposals);
         }
