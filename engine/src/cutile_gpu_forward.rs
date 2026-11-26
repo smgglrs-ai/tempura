@@ -14240,13 +14240,17 @@ impl CutileGpuModel {
     ) -> Option<Arc<Tensor<f32>>> {
         let stream = self.matmul.stream();
         let h = eg.h;
+        // The Q6K GEMV requires K padded to a power of two (12288 ->
+        // 16384); the zero tail is never read by the kernel's k_blocks
+        // range but satisfies the reshape extent check.
+        let k_pad = next_pow2(3 * h);
         let fc_in = {
             let mut t = eg.t_fc_in.borrow_mut();
             match t.get(&m) {
                 Some(b) => b.clone(),
                 None => {
                     let b = Arc::new(
-                        api::zeros::<f32>(&[m * 3 * h])
+                        api::zeros::<f32>(&[m * k_pad])
                             .sync_on(stream)
                             .expect("eagle fc_in alloc"),
                     );
@@ -14260,7 +14264,7 @@ impl CutileGpuModel {
             for li in 0..3 {
                 unsafe {
                     cuda_core::memcpy_dtod_async::<f32>(
-                        dst + ((r * 3 + li) * h * 4) as u64,
+                        dst + (r * k_pad + li * h) as u64 * 4,
                         sources[r][li],
                         h,
                         stream,
@@ -14269,8 +14273,8 @@ impl CutileGpuModel {
                 .expect("eagle fc_in assembly");
             }
         }
-        let fc_r2: Arc<Tensor<f32>> = fc_r2_helper(&fc_in, m, 3 * h);
-        let fused = self.gemm_any_d2d_batch(&fc_r2, "eagle.fc.weight", m, 3 * h, SLOT_EAGLE_FC);
+        let fc_r2: Arc<Tensor<f32>> = fc_r2_helper(&fc_in, m, k_pad);
+        let fused = self.gemm_any_d2d_batch(&fc_r2, "eagle.fc.weight", m, k_pad, SLOT_EAGLE_FC);
         Some(fused)
     }
 
