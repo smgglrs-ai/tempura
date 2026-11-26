@@ -13873,6 +13873,9 @@ impl CutileGpuModel {
             eprintln!("[eagle] head_row: input_layernorm weight missing");
         }
         let input_ln_w = input_ln_w?;
+        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() {
+            eprintln!("[eagle] head_row tok={token} pos={pos} logits={logits}");
+        }
         let embeds_n = self
             .cutile_rmsnorm
             .forward_device_fused_scratch(
@@ -14322,6 +14325,7 @@ impl CutileGpuModel {
         .expect("eagle t_embed H2D");
 
         let fused = self.eagle_fc_rows(eg, m, sources)?;
+        eprintln!("[eagle] teacher_rows: m={m} fc done");
 
         // Per-row head forwards (per-row ops keep the m=1 scratch and the
         // exact per-row kernels; the m-row GEMM batching is not worth the
@@ -14476,7 +14480,11 @@ impl CutileGpuModel {
             .map(|r| [tap_ptr(0, r), tap_ptr(1, r), tap_ptr(2, r)])
             .collect();
         let positions: Vec<u32> = (0..m).map(|r| (pos_base + r) as u32).collect();
-        self.eagle_teacher_rows(eg, prompt_after, &sources, &positions, kv)?;
+        let tr = self.eagle_teacher_rows(eg, prompt_after, &sources, &positions, kv);
+        if tr.is_none() {
+            eprintln!("[eagle] prefill_chunk: teacher_rows returned None (m={m})");
+        }
+        tr?;
         // Carry = the chunk's LAST tap row (the target hidden at the last
         // prefilled position -- for the final chunk, h_{L-1}).
         for li in 0..3 {
