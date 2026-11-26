@@ -809,7 +809,7 @@ impl EngineTask {
                 if tap_rows <= i
                     || !self.model.eagle_resync_plain(
                         &mut es.kv,
-                        &es.carry,
+                        &es.anchor,
                         toks[i],
                         i,
                         pos[i] as usize,
@@ -1411,7 +1411,7 @@ impl EngineTask {
             // head cannot be prefilled; this session never speculates.
             eprintln!(
                 "[eagle] prefill hook FAILED for {id}: chunk_start={chunk_start} chunk_len={chunk_len} rows={} tap_rows={}",
-                prompt_after.len(),
+                prompt_tokens.len(),
                 self.model.eagle_tap_rows()
             );
             es.failed = true;

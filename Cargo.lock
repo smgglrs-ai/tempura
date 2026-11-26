@@ -3656,6 +3656,8 @@ dependencies = [
  "axum 0.8.9",
  "clap",
  "core_affinity",
+ "cuda-core",
+ "cutile",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
