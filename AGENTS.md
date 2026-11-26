@@ -692,7 +692,22 @@ quantized draft lm_head at load, a 0.5B draft) and EAGLE/Medusa-style
 draft heads on the target's hidden state (removes the K-draft-passes
 floor). Speculation stays OPT-IN (--draft-model unset = off).
 Sampled speculation (stochastic acceptance) is the other follow-up;
-greedy-only, non-greedy requests decode normally), Medusa multi-token,
+greedy-only, non-greedy requests decode normally; EAGLE-3 HEAD
+(2026-11-26b, the recorded lever, SOLO path only): `--eagle-head <dir>`
+loads a speculators-format EAGLE-3 checkpoint
+(RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3) onto the target's
+GPU model — one decoder layer + fc(3H) fusion conditioned on the
+target's hidden states entering layers {2,16,29} (hidden-state TAPS in
+five forward paths incl. the m=1 graph capture), host-Q6K weights
+under an eagle.* namespace riding the oxide kpar GEMVs, own 1-layer KV
+pool; drafts K tokens at ~0.4 ms/step (nearly-free drafting ACHIEVED),
+verifies through the v1 spec_row_views machinery, teacher-forced
+post-verify re-anchoring — gate `scripts/eagle-equivalence.sh`
+(byte-identical solo, PASS) + acceptance telemetry; measured solo
+0.87x (mean_emitted 1.88, K=4) — the verify's small-m batch-path fixed
+cost (~13+2m ms) and the linear-chain acceptance are the recorded
+walls; TEMPURA_NO_EAGLE bisects, multi-client batches keep plain
+decode), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
 typical-p/repeat/presence/frequency; decode path uses the fused top-k-heap
 sampler -- O(n log k), token-identical to the full chain)

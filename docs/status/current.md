@@ -5,6 +5,101 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-26b (EAGLE-3 speculative decoding on the SOLO path — the
+recorded lever from the speculation arc's honest negative: stage-0
+availability GO, the head implemented end-to-end and GATE-GREEN
+(byte-identical solo outputs), drafting IS nearly-free as hypothesized
+(1.5 ms/cycle), but the solo throughput verdict is an HONEST NEGATIVE at
+0.87x — the verify's batch-path fixed cost (~13+2m ms, not the m=1
+graph's 5.2 ms) plus a linear-chain acceptance of 1.88/token (vs the 1B
+draft's 2.79 on the same gate) leave the cycle above the plain step; the
+correctness machinery + two gates ship): (1) STAGE 0 (availability): a
+pretrained EAGLE-3 head for Llama-3.1-8B-Instruct EXISTS and is open —
+RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3 (speculators format:
+config.json + 1.9 GB model.safetensors BF16, Apache-2.0-licensed base);
+architecture fully documented in-repo (eagle3.py) and cross-checked
+against the official SafeAILab code (modeling_llama_kv.py): fc(3H->H)
+over the CONCAT of the target's hidden states entering layers {2, 16,
+29}, ONE decoder layer with 2x-width q/k/v on [embed, fused], own
+embed_tokens (128256x4096), lm_head over a 32000 draft vocab with
+d2t/t2d mapping tensors, norm_before_residual=true, rope_theta 500000.
+The official yuhuili/EAGLE3-LLaMA3.1-Instruct-8B also exists but ships
+only a pickle .bin (the RedHat safetensors one is loadable directly).
+Checkpoint pulled to the fishtank model cache
+(~/.cache/tempura/models/eagle3-llama3.1-8b).  (2) THE IMPLEMENTATION
+(all landed, cutile-gated): engine/src/eagle.rs (config parse, raw
+safetensors reader that keeps the embed table bf16 on the host and the
+I64/BOOL vocab maps native, and a host f32->Q6_K quantizer that is the
+byte-exact inverse of the kernels crate's q6k_dot_block layout —
+roundtrip-test-gated); the head rides the TARGET's CutileGpuModel kernel
+machinery under an eagle.* weight namespace (Q6K matrices through the
+oxide kpar GEMV + batch GEMM dispatch, f32 norms, shared cutile
+rmsnorm/rope/argmax), so zero new GPU kernels were needed; hidden-state
+TAPS (3 device buffers) written at the top of the layer loop in FIVE
+forward paths (prefill layer loop, m=1 decode inner — captured in the
+m1 CUDA graph, generic batch tail, ragged graph body, equal-position
+batch graph body) — a no-op when no head is loaded (the DEFAULT path is
+unchanged, single Option check); the solo cycle in server
+(engine_task.rs): head prefill per target-prefill chunk (teacher-forced
+batched rows), K draft steps (the head's own pre-norm output chains
+forward — NO fc on drafted rows, per the official
+shape[-1]!=embed_dim bypass), ONE verify through the existing v1
+forward_spec_verify_greedy/spec_row_views machinery, longest-prefix
+acceptance, post-verify teacher resync over the verify's tap rows (the
+feature re-anchoring), plain-step resyncs keep head state alive through
+multi-client phases; TEMPURA_NO_EAGLE bisects off, TEMPURA_SPEC_K,
+TEMPURA_EAGLE_TAP_LAYERS, TEMPURA_EAGLE_POS_SHIFT, TEMPURA_EAGLE_F32
+(quantization bisect) are the knobs.  Flag: --eagle-head <dir>.  (3)
+THE BRING-UP BUGS (all found by the teacher-forced accuracy probe —
+row r's logits vs prompt[r+1] — which is the debug tool that mattered):
+(a) the m=1 kpar GEMV returns the SHARED kpar output scratch — running
+q/k/v (and gate/up) before copying results out handed every consumer
+the LAST GEMV's values (q==k==v, attention garbage; fixed with
+interleaved copy-out staging); (b) append_device_gpu_only does not
+advance the host seq_len — batching the advance left every head row
+attending a STALE kv_len (0 during the whole prefill: the head never
+saw its own KV); (c) rope_rows_graph_ready gathers the cos/sin row for
+the position in d_positions (NOT its hint argument) — the head now
+uploads its own position first; (d) the initial alignment (token
+shifted by one, fc-on-carry) was wrong — the correct EAGLE alignment is
+head row p = (token_p, h_p) predicting token_{p+1}, anchor-conditioned
+drafting, post-verify re-anchoring; (e) the fc input needs pow2 K
+padding (12288->16384) for the Q6K GEMV reshape.  (4) THE NUMBERS
+(fishtank, RTX 5090, Llama-3.1-8B Q4_K_M, the eagle-equivalence gate's
+solo 400-token leg): OFF 75.8 tok/s client-side vs ON 66.0 (0.87x);
+engine telemetry: draft 1.5 ms/cycle (the EAGLE structural goal —
+nearly-free drafting — ACHIEVED: ~0.4 ms/head-step at Q6K), verify
+19.6 ms for 5 rows, mean_emitted 1.88 (hist [51,24,9,15]/99, K=4).
+Acceptance sweep: K=3 1.71 (69.1 tok/s — best wall), K=6 1.81 (worse —
+verify rows dominate), f32 head 1.81 acceptance == Q6K 1.88
+(quantization is NOT the limiter), tap layers {3,17,30} 1.83 /
+{1,15,28} 1.69 / reversed order 1.69 (the {2,16,29} entering-layer
+convention is best), pos_shift 0/1 identical.  (5) THE ATTRIBUTION
+(where the cycle goes, and why it loses): the verify's ~13+2m ms fixed
++ per-row cost matches v1's solo measurements exactly — the m>=2
+ragged/generic batch path (launch-bound at small m, per-row attention
+at ~450-token contexts) is ~4x the m=1 CUDA graph's 5.2 ms plain step,
+so a cycle emitting 1.88 tokens at 21.1 ms loses to plain's ~13.2
+ms/token client-side.  The acceptance gap vs the 1B draft (1.88 vs
+2.79 on the same prompt) is unexplained after exhausting the
+alignment/quantization/tap-layer matrix — the remaining suspects are
+the linear-chain (no draft TREE — EAGLE-3's published 4-5 accepted
+lengths use 60-node trees) and a residual conditioning difference;
+follow-ups recorded: draft trees, a dedicated small-m verify CUDA graph
+(the m1-graph analog for the verify shape, collapsing the 13 ms fixed
+cost), re-testing the V1 token-shift alignment now that the head
+forward is fixed.  (6) GATES: scripts/eagle-equivalence.sh (NEW, the
+permanent EAGLE gate): solo OFF vs ON byte-identical 1686/1686 bytes
+PASS; scripts/spec-equivalence.sh (the v1/v2 standing gate on the final
+tree): solo + c1..c6 ALL byte-identical PASS (multi OFF 488.7 tok/s);
+local cargo test --workspace (bench-gpu excluded, CPU laptop) 936
+passed / 0 failed (931 + the eagle q6k-roundtrip + tap-layers tests).
+NOT rerun (no kernel/PTX change; the default path is untouched — the
+taps are dead code without --eagle-head): MMLU, pooled ppl, probes,
+sanitizer-gate, ab-repro.  (7) VRAM: the head is ~332 MB Q6K on device
++ a 33 MB 1-layer KV pool + 1.5 MB taps — trivial against the 8B's
+budget.**
+
 **STATUS 2026-11-26 (TurboQuant KV-density round — stage-1 go/no-go:
 NEGATIVE RESULT, simulation-first per the FP8-round precedent; the
 CpuPolarQuant class does NOT pass the KV quality gates at any useful
