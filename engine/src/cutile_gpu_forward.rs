@@ -14325,13 +14325,8 @@ impl CutileGpuModel {
                 )
             }
             .expect("eagle t_hidden row stage");
-            let hidden_r2: Arc<Tensor<f32>> = eg
-                .s_t_hidden_row
-                .clone()
-                .reshape(&[1, h_pad])
-                .expect("eagle hidden_r2 reshape")
-                .into();
-            self.eagle_head_row(eg, tokens[r], &hidden_r2, positions[r], kv, 0, false)?;
+            let hidden_row: Arc<Tensor<f32>> = eg.s_t_hidden_row.clone();
+            self.eagle_head_row(eg, tokens[r], &hidden_row, positions[r], kv, 0, false)?;
         }
         Some(())
     }
@@ -14358,7 +14353,7 @@ impl CutileGpuModel {
             carry.device_pointer().cu_deviceptr() + (2 * h * 4) as u64,
         ]];
         let fused0 = self.eagle_fc_rows(eg, 1, &carry_ptrs)?;
-        let hidden0: Arc<Tensor<f32>> = fused0_r2(&fused0, h);
+        let hidden0: Arc<Tensor<f32>> = fused0;
 
         let mut proposals = Vec::with_capacity(k);
         let mut token = first_token;
@@ -14369,7 +14364,7 @@ impl CutileGpuModel {
             proposals.push(mapped);
             token = mapped;
             // Next step's hidden: this step's pre-norm output (ping-pong).
-            hidden = r2_of(&eg.s_hidden[j & 1], h);
+            hidden = eg.s_hidden[j & 1].clone();
         }
         // The draft steps advanced the head KV by k; the caller rolls it
         // back to base-1 before the resync rewrites the accepted prefix.
@@ -14538,16 +14533,3 @@ fn fc_r2_helper(t: &Arc<Tensor<f32>>, m: usize, k: usize) -> Arc<Tensor<f32>> {
         .into()
 }
 
-fn fused0_r2(t: &Arc<Tensor<f32>>, h: usize) -> Arc<Tensor<f32>> {
-    t.clone()
-        .reshape(&[1, h])
-        .expect("eagle fused0 reshape")
-        .into()
-}
-
-fn r2_of(t: &Arc<Tensor<f32>>, h: usize) -> Arc<Tensor<f32>> {
-    t.clone()
-        .reshape(&[1, h])
-        .expect("eagle r2 reshape")
-        .into()
-}
