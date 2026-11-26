@@ -545,7 +545,7 @@ pub trait InferenceModel: Send + Sync {
     fn eagle_prefill_chunk(
         &self,
         _kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         _prompt_after: &[u32],
         _pos_base: usize,
         _chunk_tap_rows: usize,
@@ -557,7 +557,7 @@ pub trait InferenceModel: Send + Sync {
     fn eagle_draft_cycle(
         &self,
         _kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         _first_token: u32,
         _base: usize,
         _k: usize,
@@ -570,7 +570,7 @@ pub trait InferenceModel: Send + Sync {
     fn eagle_post_verify(
         &self,
         _kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         _prev_last: u32,
         _emitted: &[u32],
         _base: usize,
@@ -584,7 +584,7 @@ pub trait InferenceModel: Send + Sync {
     fn eagle_resync_plain(
         &self,
         _kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        _carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        _anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         _token: u32,
         _tap_row: usize,
         _base: usize,
@@ -10982,8 +10982,9 @@ impl CutileInferenceWrapper {
         Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
     }
 
-    /// New head session: a 1-layer pooled KV run + the raw 3-layer carry
-    /// buffer ([3 * hidden] f32, device-resident).
+    /// New head session: a 1-layer pooled KV run + the anchor buffer
+    /// (the head's own last row-output hidden, [hidden] f32 padded to
+    /// h_pad, device-resident).
     pub fn new_eagle_session(
         &self,
         pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
@@ -11203,7 +11204,7 @@ impl InferenceModel for CutileInferenceWrapper {
     fn eagle_prefill_chunk(
         &self,
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         prompt_after: &[u32],
         pos_base: usize,
         chunk_tap_rows: usize,
@@ -11211,25 +11212,25 @@ impl InferenceModel for CutileInferenceWrapper {
         let Some(gm) = self.gpu_model.as_ref() else {
             return false;
         };
-        gm.eagle_prefill_chunk(kv, prompt_after, pos_base, chunk_tap_rows, carry)
+        gm.eagle_prefill_chunk(kv, prompt_tokens, pos_base, chunk_tap_rows, anchor)
             .is_some()
     }
     fn eagle_draft_cycle(
         &self,
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         first_token: u32,
         base: usize,
         k: usize,
     ) -> Option<Vec<u32>> {
         self.gpu_model
             .as_ref()?
-            .eagle_draft_cycle(kv, carry, first_token, base, k)
+            .eagle_draft_cycle(kv, anchor, first_token, base, k)
     }
     fn eagle_post_verify(
         &self,
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         prev_last: u32,
         emitted: &[u32],
         base: usize,
@@ -11238,13 +11239,13 @@ impl InferenceModel for CutileInferenceWrapper {
         let Some(gm) = self.gpu_model.as_ref() else {
             return false;
         };
-        gm.eagle_post_verify(kv, carry, prev_last, emitted, base, verify_tap_rows)
+        gm.eagle_post_verify(kv, anchor, prev_last, emitted, base, verify_tap_rows)
             .is_some()
     }
     fn eagle_resync_plain(
         &self,
         kv: &mut crate::cutile_kv_cache::CutileKvCache,
-        carry: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
+        anchor: &std::sync::Arc<cutile::tensor::Tensor<f32>>,
         token: u32,
         tap_row: usize,
         base: usize,
@@ -11252,7 +11253,7 @@ impl InferenceModel for CutileInferenceWrapper {
         let Some(gm) = self.gpu_model.as_ref() else {
             return false;
         };
-        gm.eagle_resync_plain(kv, carry, token, tap_row, base)
+        gm.eagle_resync_plain(kv, anchor, token, tap_row, base)
             .is_some()
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {

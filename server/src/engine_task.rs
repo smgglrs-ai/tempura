@@ -63,7 +63,7 @@ struct DraftCache {
 #[cfg(feature = "cutile")]
 struct EagleSessionState {
     kv: tempura_engine::cutile_kv_cache::CutileKvCache,
-    carry: std::sync::Arc<cutile::tensor::Tensor<f32>>,
+    anchor: std::sync::Arc<cutile::tensor::Tensor<f32>>,
     prefilled: bool,
     failed: bool,
 }
@@ -1319,7 +1319,7 @@ impl EngineTask {
                     if tap_rows < 1
                         || !self
                             .model
-                            .eagle_resync_plain(&mut es.kv, &es.carry, last, 0, base)
+                            .eagle_resync_plain(&mut es.kv, &es.anchor, last, 0, base)
                     {
                         es.failed = true;
                     }
@@ -1355,14 +1355,14 @@ impl EngineTask {
         let Some(pool) = self.eagle_kv_pool.clone() else {
             return false;
         };
-        let Some((kv, carry)) = self.model.eagle_new_session(&pool, initial_tokens) else {
+        let Some((kv, anchor)) = self.model.eagle_new_session(&pool, initial_tokens) else {
             return false;
         };
         self.eagle_states.insert(
             id.to_string(),
             EagleSessionState {
                 kv,
-                carry,
+                anchor,
                 prefilled: false,
                 failed: false,
             },
@@ -1395,17 +1395,15 @@ impl EngineTask {
         if !self.ensure_eagle_state(id, prompt.len() + 16) {
             return;
         }
-        let rows = if done { chunk_len.saturating_sub(1) } else { chunk_len };
-        let prompt_after: Vec<u32> = if rows > 0 {
-            prompt[chunk_start + 1..chunk_start + 1 + rows].to_vec()
-        } else {
-            Vec::new()
-        };
+        // Head rows for this chunk: rows chunk_start..chunk_start+chunk_len,
+        // row p input (prompt[p], h_p) -- NO token shift under the V2
+        // alignment (the head's row p predicts token_{p+1}).
+        let prompt_tokens: Vec<u32> = prompt[chunk_start..chunk_start + chunk_len].to_vec();
         let es = self.eagle_states.get_mut(id).expect("eagle state");
         if !self.model.eagle_prefill_chunk(
             &mut es.kv,
-            &es.carry,
-            &prompt_after,
+            &es.anchor,
+            &prompt_tokens,
             chunk_start,
             chunk_len,
         ) {
@@ -1441,20 +1439,21 @@ impl EngineTask {
         if base == 0 {
             return false;
         }
-        // Head-state invariant: head rows 0..base-2 + carry at base-1.
+        // Head-state invariant: head rows 0..base-1 (row p = (token_p,
+        // h_p)); the anchor holds row base-1's output hidden.
         {
             let Some(es) = self.eagle_states.get(id) else {
                 eprintln!("[eagle-step] {id}: no state");
                 return false;
             };
-            if es.failed || !es.prefilled || es.kv.seq_len() + 1 != base {
+            if es.failed || !es.prefilled || es.kv.seq_len() != base {
                 eprintln!(
                     "[eagle-step] {id}: bad state prefilled={} failed={} head_len={} base={base}",
                     es.prefilled,
                     es.failed,
                     es.kv.seq_len()
                 );
-                if !es.failed && es.kv.seq_len() + 1 != base {
+                if !es.failed && es.kv.seq_len() != base {
                     // Stale (swap/re-admission lost the run alignment) --
                     // latch failed; plain decode for the rest.
                     self.eagle_states.get_mut(id).unwrap().failed = true;
@@ -1474,7 +1473,7 @@ impl EngineTask {
         }
         {
             let es = self.eagle_states.get_mut(id).expect("eagle state");
-            if es.kv.try_ensure_capacity(base - 1 + k).is_err() {
+            if es.kv.try_ensure_capacity(base + k).is_err() {
                 return false;
             }
         }
@@ -1483,7 +1482,7 @@ impl EngineTask {
             let es = self.eagle_states.get_mut(id).expect("eagle state");
             match self
                 .model
-                .eagle_draft_cycle(&mut es.kv, &es.carry, last, base, k)
+                .eagle_draft_cycle(&mut es.kv, &es.anchor, last, base, k)
             {
                 Some(p) => p,
                 None => {
@@ -1542,7 +1541,7 @@ impl EngineTask {
             let es = self.eagle_states.get_mut(id).expect("eagle state");
             if !self.model.eagle_post_verify(
                 &mut es.kv,
-                &es.carry,
+                &es.anchor,
                 last,
                 &emitted,
                 base,

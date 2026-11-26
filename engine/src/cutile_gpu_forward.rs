@@ -14304,6 +14304,7 @@ impl CutileGpuModel {
         sources: &[[u64; 3]],
         positions: &[u32],
         kv: &mut CutileKvCache,
+        anchor: &Arc<Tensor<f32>>,
     ) -> Option<()> {
         let m = tokens.len();
         if m == 0 {
@@ -14403,6 +14404,17 @@ impl CutileGpuModel {
         }
         kv.advance_host_seq_len(m);
         kv.mark_host_stale();
+        // Anchor: the LAST row's pre-norm output hidden -- the next draft
+        // step's conditioning (feature-level autoregression).
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(
+                anchor.device_pointer().cu_deviceptr(),
+                eg.s_hidden[0].device_pointer().cu_deviceptr(),
+                eg.h,
+                stream,
+            )
+        }
+        .expect("eagle anchor write");
         Some(())
     }
 
@@ -14413,37 +14425,22 @@ impl CutileGpuModel {
     pub fn eagle_draft_cycle(
         &self,
         kv: &mut CutileKvCache,
-        carry: &Arc<Tensor<f32>>,
+        anchor: &Arc<Tensor<f32>>,
         first_token: u32,
         base: usize,
         k: usize,
     ) -> Option<Vec<u32>> {
         let eg = self.eagle.as_ref()?;
-        let h = eg.h;
-        let stream = self.matmul.stream();
-        // Step 0's hidden input: fc([carry]).
-        let carry_ptrs: [[u64; 3]; 1] = [[
-            carry.device_pointer().cu_deviceptr(),
-            carry.device_pointer().cu_deviceptr() + (h * 4) as u64,
-            carry.device_pointer().cu_deviceptr() + (2 * h * 4) as u64,
-        ]];
-        let fused0 = self.eagle_fc_rows(eg, 1, &carry_ptrs)?;
-        let hidden0: Arc<Tensor<f32>> = fused0;
-        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() {
-            let carry_host = Arc::clone(carry).to_host_vec().sync_on(stream).ok();
-            let fused_host = Arc::clone(&hidden0).to_host_vec().sync_on(stream).ok();
-            if let (Some(c), Some(f)) = (carry_host, fused_host) {
-                let cn: f32 = c.iter().map(|v| v * v).sum::<f32>().sqrt();
-                let fnn: f32 = f.iter().map(|v| v * v).sum::<f32>().sqrt();
-                eprintln!("[eagle] draft base={base}: |carry|={cn:.3} |fused|={fnn:.3} carry[0..4]={:?}", &c[0..4]);
-            }
-        }
-
+        // Draft step j sits at head row base+j (input token_{base+j}, the
+        // anchor/own hidden), predicting token_{base+j+1}.  NO fc: the
+        // fusion runs only on target-provided hidden states; drafting
+        // feeds the head's own pre-norm output forward.
+        let shift = eagle_pos_shift();
         let mut proposals = Vec::with_capacity(k);
         let mut token = first_token;
-        let mut hidden = hidden0;
+        let mut hidden: Arc<Tensor<f32>> = anchor.clone();
         for j in 0..k {
-            let pos = (base - 1 + j) as u32;
+            let pos = (base + j + shift) as u32;
             let mapped = self.eagle_head_row(eg, token, &hidden, pos, kv, j & 1, true)?;
             proposals.push(mapped);
             token = mapped;
@@ -14470,7 +14467,7 @@ impl CutileGpuModel {
     pub fn eagle_post_verify(
         &self,
         kv: &mut CutileKvCache,
-        carry: &Arc<Tensor<f32>>,
+        anchor: &Arc<Tensor<f32>>,
         prev_last: u32,
         emitted: &[u32],
         base: usize,
@@ -14482,44 +14479,27 @@ impl CutileGpuModel {
         if n_em == 0 || verify_tap_rows < n_em {
             return None;
         }
-        let stream = self.matmul.stream();
-        // Sources: row 0 = carry, rows 1.. = decode tap rows (the verify
-        // forward's rows, in verify order).
+        let shift = eagle_pos_shift();
+        // Resync rows base..base+n_em-1, teacher-forced with the verify's
+        // target hiddens (tap rows 0..n_em-1 = h at positions base..):
+        // row base+i inputs (token_{base+i}, h_{base+i}).
         let tap_ptr = |li: usize, row: usize| -> u64 {
             eg.tap_decode[li].device_pointer().cu_deviceptr() + (row * h * 4) as u64
         };
-        let mut sources: Vec<[u64; 3]> = Vec::with_capacity(n_em);
-        sources.push([
-            carry.device_pointer().cu_deviceptr(),
-            carry.device_pointer().cu_deviceptr() + (h * 4) as u64,
-            carry.device_pointer().cu_deviceptr() + (2 * h * 4) as u64,
-        ]);
-        for i in 1..n_em {
-            sources.push([tap_ptr(0, i - 1), tap_ptr(1, i - 1), tap_ptr(2, i - 1)]);
-        }
+        let sources: Vec<[u64; 3]> = (0..n_em)
+            .map(|i| [tap_ptr(0, i), tap_ptr(1, i), tap_ptr(2, i)])
+            .collect();
         let mut tokens = Vec::with_capacity(n_em);
         tokens.push(prev_last);
         tokens.extend_from_slice(&emitted[..n_em - 1]);
-        let positions: Vec<u32> = (0..n_em).map(|i| (base - 1 + i) as u32).collect();
-        // The draft cycle left the head KV at base-1+k; rewrite the n_em
-        // rows from base-1 (rollback then append overwrites).
-        if kv.seq_len() > base - 1 {
-            kv.rollback(base - 1);
+        let positions: Vec<u32> = (0..n_em).map(|i| (base + i + shift) as u32).collect();
+        // The draft cycle left the head KV at base+k; rewrite the n_em
+        // rows from base (rollback then append overwrites).
+        if kv.seq_len() > base {
+            kv.rollback(base);
         }
-        self.eagle_teacher_rows(eg, &tokens, &sources, &positions, kv)?;
-        // New carry = verify tap row n_em-1 (target hidden at base+n_em-1).
-        for li in 0..3 {
-            unsafe {
-                cuda_core::memcpy_dtod_async::<f32>(
-                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
-                    tap_ptr(li, n_em - 1),
-                    h,
-                    stream,
-                )
-            }
-            .expect("eagle carry refresh");
-        }
-        stream.synchronize().ok()?;
+        self.eagle_teacher_rows(eg, &tokens, &sources, &positions, kv, anchor)?;
+        self.matmul.stream().synchronize().ok()?;
         Some(())
     }
 
@@ -14533,45 +14513,28 @@ impl CutileGpuModel {
     pub fn eagle_prefill_chunk(
         &self,
         kv: &mut CutileKvCache,
-        prompt_after: &[u32],
+        prompt_tokens: &[u32],
         pos_base: usize,
         chunk_tap_rows: usize,
-        carry: &Arc<Tensor<f32>>,
+        anchor: &Arc<Tensor<f32>>,
     ) -> Option<()> {
         let eg = self.eagle.as_ref()?;
-        let m = prompt_after.len();
+        let m = prompt_tokens.len();
         let rows = eg.tap_rows.get();
         if rows < chunk_tap_rows || chunk_tap_rows == 0 || m > chunk_tap_rows {
             return None;
         }
+        let shift = eagle_pos_shift();
         let h = eg.h;
-        let stream = self.matmul.stream();
         let tap_ptr = |li: usize, row: usize| -> u64 {
             eg.tap_prefill[li].device_pointer().cu_deviceptr() + (row * h * 4) as u64
         };
         let sources: Vec<[u64; 3]> = (0..m)
             .map(|r| [tap_ptr(0, r), tap_ptr(1, r), tap_ptr(2, r)])
             .collect();
-        let positions: Vec<u32> = (0..m).map(|r| (pos_base + r) as u32).collect();
-        let tr = self.eagle_teacher_rows(eg, prompt_after, &sources, &positions, kv);
-        if tr.is_none() {
-            eprintln!("[eagle] prefill_chunk: teacher_rows returned None (m={m})");
-        }
-        tr?;
-        // Carry = the chunk's LAST tap row (the target hidden at the last
-        // prefilled position -- for the final chunk, h_{L-1}).
-        for li in 0..3 {
-            unsafe {
-                cuda_core::memcpy_dtod_async::<f32>(
-                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
-                    tap_ptr(li, chunk_tap_rows - 1),
-                    h,
-                    stream,
-                )
-            }
-            .expect("eagle prefill carry refresh");
-        }
-        stream.synchronize().ok()?;
+        let positions: Vec<u32> = (0..m).map(|r| (pos_base + r + shift) as u32).collect();
+        self.eagle_teacher_rows(eg, prompt_tokens, &sources, &positions, kv, anchor)?;
+        self.matmul.stream().synchronize().ok()?;
         Some(())
     }
 
@@ -14582,40 +14545,50 @@ impl CutileGpuModel {
     pub fn eagle_resync_plain(
         &self,
         kv: &mut CutileKvCache,
-        carry: &Arc<Tensor<f32>>,
+        anchor: &Arc<Tensor<f32>>,
         token: u32,
         tap_row: usize,
         base: usize,
     ) -> Option<()> {
         let eg = self.eagle.as_ref()?;
         let rows = eg.tap_rows.get();
-        if rows <= tap_row || base == 0 {
+        if rows <= tap_row {
             return None;
         }
+        let shift = eagle_pos_shift();
         let h = eg.h;
-        let stream = self.matmul.stream();
         let tap_ptr = |li: usize| -> u64 {
             eg.tap_decode[li].device_pointer().cu_deviceptr() + (tap_row * h * 4) as u64
         };
         let sources: Vec<[u64; 3]> = vec![[tap_ptr(0), tap_ptr(1), tap_ptr(2)]];
-        if kv.seq_len() > base - 1 {
-            kv.rollback(base - 1);
+        // Head row base: input (token at position base, h at base) -- the
+        // plain step's tap row holds exactly that hidden.
+        if kv.seq_len() > base {
+            kv.rollback(base);
         }
-        self.eagle_teacher_rows(eg, &[token], &sources, &[(base - 1) as u32], kv)?;
-        for li in 0..3 {
-            unsafe {
-                cuda_core::memcpy_dtod_async::<f32>(
-                    carry.device_pointer().cu_deviceptr() + (li * h * 4) as u64,
-                    tap_ptr(li),
-                    h,
-                    stream,
-                )
-            }
-            .expect("eagle resync carry refresh");
-        }
-        stream.synchronize().ok()?;
+        self.eagle_teacher_rows(
+            eg,
+            &[token],
+            &sources,
+            &[(base + shift) as u32],
+            kv,
+            anchor,
+        )?;
+        self.matmul.stream().synchronize().ok()?;
         Some(())
     }
+}
+
+/// The speculators training code runs the head with `1 + arange`
+/// positions (a uniform +1 vs the official cnets `arange`); the RedHat
+/// checkpoint was trained with the speculators stack, so the absolute
+/// RoPE phases may be shifted.  Bisect knob (default 1 = speculators
+/// convention).
+fn eagle_pos_shift() -> usize {
+    std::env::var("TEMPURA_EAGLE_POS_SHIFT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Rank-2 reshape helpers (the head's staging buffers are rank-1; the
