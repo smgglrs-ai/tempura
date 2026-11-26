@@ -13961,6 +13961,26 @@ impl CutileGpuModel {
         }
 
         // RoPE (table-gather graph-stable path, like the decode inner).
+        // rope_rows_graph_ready gathers the cos/sin row for the position
+        // in d_positions (NOT the hint) -- upload the head's position
+        // first (every target graph replay re-uploads its own position,
+        // so clobbering the buffer between replays is stream-ordered
+        // safe).
+        {
+            let bits = f32::from_bits(pos);
+            let mut stage = self.kv_len_stage.borrow_mut();
+            stage.clear();
+            stage.push(bits);
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    self.d_positions.device_pointer().cu_deviceptr(),
+                    stage.as_ptr(),
+                    1,
+                    stream,
+                )
+            }
+            .expect("eagle d_positions H2D");
+        }
         let rope_graph = self.rope_rows_graph_ready(pos);
         let q_rot = if rope_graph {
             self.cutile_rope
