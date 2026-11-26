@@ -396,6 +396,8 @@ pub(crate) struct EagleGpuState {
     pub s_hidden: [Arc<Tensor<f32>>; 2],
     /// residual staging [h_pad]
     pub s_res: Arc<Tensor<f32>>,
+    /// gate-projection staging [inter] (shared-kpar-scratch discipline)
+    pub s_gate: Arc<Tensor<f32>>,
     /// fused fc input staging [3 * h]
     pub s_fc_in: Arc<Tensor<f32>>,
     /// teacher-row fused-hidden staging [h_pad]
@@ -13770,6 +13772,7 @@ impl CutileGpuModel {
             s_attn_out: alloc_f32(q_dim),
             s_hidden: [alloc_f32(h_pad), alloc_f32(h_pad)],
             s_res: alloc_f32(h_pad),
+            s_gate: alloc_f32(inter),
             s_fc_in: alloc_f32(3 * h),
             s_t_hidden_row: alloc_f32(h_pad),
             d_kv_len: alloc_f32(1),
@@ -13934,8 +13937,11 @@ impl CutileGpuModel {
             .expect("eagle cat reshape")
             .into();
 
-        // q / k / v GEMVs ([1, 2h] -> q_dim / kv_dim).
-        let q_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.q.weight", 1, SLOT_EAGLE_Q);
+        // q / k / v GEMVs ([1, 2h] -> q_dim / kv_dim).  The m=1 kpar GEMV
+        // returns the SHARED kpar output scratch -- each result must be
+        // copied into its stable row buffer BEFORE the next GEMV runs
+        // (running all three first handed every copy the LAST result:
+        // q == k == v, attention garbage -- found via the stage dump).
         let dump = std::env::var("TEMPURA_EAGLE_DUMP").is_ok() && eg.dump_row0.get();
         if dump {
             eg.dump_row0.set(false);
@@ -13949,11 +13955,8 @@ impl CutileGpuModel {
             dl("embeds_n", &embeds_n);
             dl("cat", &eg.s_cat);
         }
-        let k_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.k.weight", 1, SLOT_EAGLE_K);
-        let v_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.v.weight", 1, SLOT_EAGLE_V);
-        // Copy into the stable row buffers (q_pad/kv_pad strides; the pad
-        // tails stay zero from allocation).
         unsafe {
+            let q_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.q.weight", 1, SLOT_EAGLE_Q);
             cuda_core::memcpy_dtod_async::<f32>(
                 eg.s_q.device_pointer().cu_deviceptr(),
                 q_dev.device_pointer().cu_deviceptr(),
@@ -13961,6 +13964,7 @@ impl CutileGpuModel {
                 stream,
             )
             .expect("eagle q row copy");
+            let k_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.k.weight", 1, SLOT_EAGLE_K);
             cuda_core::memcpy_dtod_async::<f32>(
                 eg.s_k.device_pointer().cu_deviceptr(),
                 k_dev.device_pointer().cu_deviceptr(),
@@ -13968,6 +13972,7 @@ impl CutileGpuModel {
                 stream,
             )
             .expect("eagle k row copy");
+            let v_dev = self.gemm_any_d2d_slot(&cat_r2, "eagle.v.weight", 1, SLOT_EAGLE_V);
             cuda_core::memcpy_dtod_async::<f32>(
                 eg.s_v.device_pointer().cu_deviceptr(),
                 v_dev.device_pointer().cu_deviceptr(),
@@ -14177,12 +14182,23 @@ impl CutileGpuModel {
                 &mut self.post_attn_norm_scratch.borrow_mut(),
             )
             .expect("eagle post_attention_layernorm failed");
+        // Same shared-scratch discipline for gate/up: gate is staged out
+        // before the up GEMV overwrites the kpar output.
         let gate_dev = self.gemm_any_d2d_slot(&normed2, "eagle.gate.weight", 1, SLOT_EAGLE_GATE);
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(
+                eg.s_gate.device_pointer().cu_deviceptr(),
+                gate_dev.device_pointer().cu_deviceptr(),
+                eg.inter,
+                stream,
+            )
+        }
+        .expect("eagle gate staging copy");
         let up_dev = self.gemm_any_d2d_slot(&normed2, "eagle.up.weight", 1, SLOT_EAGLE_UP);
         let gs_dev = self
             .cutile_elementwise
             .silu_mul_device_scratch(
-                &gate_dev,
+                &eg.s_gate,
                 &up_dev,
                 1,
                 eg.inter,
