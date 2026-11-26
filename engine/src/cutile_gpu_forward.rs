@@ -13839,12 +13839,17 @@ impl CutileGpuModel {
 
         // hidden_norm(hidden_in) -- norm_before_residual: the residual IS
         // the normed hidden.
+        let hidden_w = self.norm_weights.get("eagle.hidden_norm.weight");
+        if hidden_w.is_none() {
+            eprintln!("[eagle] head_row: hidden_norm weight missing");
+        }
+        let hidden_w = hidden_w?;
         let hidden_n = self
             .cutile_rmsnorm
             .forward_device_fused_scratch(
                 stream,
                 hidden_in.clone(),
-                self.norm_weights.get("eagle.hidden_norm.weight")?,
+                hidden_w,
                 1,
                 h,
                 h_pad,
@@ -13863,12 +13868,17 @@ impl CutileGpuModel {
         }
 
         // embeds = input_layernorm(embed); cat = [embeds | hidden_n].
+        let input_ln_w = self.norm_weights.get("eagle.input_layernorm.weight");
+        if input_ln_w.is_none() {
+            eprintln!("[eagle] head_row: input_layernorm weight missing");
+        }
+        let input_ln_w = input_ln_w?;
         let embeds_n = self
             .cutile_rmsnorm
             .forward_device_fused_scratch(
                 stream,
                 eg.s_embed.clone(),
-                self.norm_weights.get("eagle.input_layernorm.weight")?,
+                input_ln_w,
                 1,
                 h,
                 h_pad,
@@ -13990,7 +14000,10 @@ impl CutileGpuModel {
         // KV append + attention (kpar over the head's own run).
         kv.append_device_gpu_only(0, &k_rot, &eg.s_v, 1)
             .expect("eagle KV append failed");
-        let oda = self.oxide_decode_attn.as_ref()?;
+        let Some(oda) = self.oxide_decode_attn.as_ref() else {
+            eprintln!("[eagle] head_row: no oxide_decode_attn");
+            return None;
+        };
         let kv_len = kv.seq_len();
         {
             // Model-owned staging slot for the pageable async H2D (the
