@@ -14352,10 +14352,39 @@ impl CutileGpuModel {
             }
             .expect("eagle t_hidden row stage");
             let hidden_row: Arc<Tensor<f32>> = eg.s_t_hidden_row.clone();
-            // head_row returns None when logits=false (by design -- the
-            // teacher rows never need logits); only a real failure breaks
-            // the chain, and head_row reports those via eprintln/panic.
-            let _ = self.eagle_head_row(eg, tokens[r], &hidden_row, positions[r], kv, 0, false);
+            // Teacher-forced accuracy probe (TEMPURA_EAGLE_TRACE): row r's
+            // logits should predict tokens[r+1] (the input token of row
+            // r+1).  Splits "head forward broken" from "draft chaining
+            // broken".
+            let logits = std::env::var("TEMPURA_EAGLE_TRACE").is_ok()
+                && r + 1 < m
+                && r < 24;
+            let got = self.eagle_head_row(
+                eg,
+                tokens[r],
+                &hidden_row,
+                positions[r],
+                kv,
+                0,
+                logits,
+            );
+            if let (Some(got), true) = (got, r + 1 < m) {
+                static MATCHES: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                static TOTAL: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let want = tokens[r + 1];
+                TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if got == want {
+                    MATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                eprintln!(
+                    "[eagle] tf row={r} pos={} got={got} want={want} acc={}/{}",
+                    positions[r],
+                    MATCHES.load(std::sync::atomic::Ordering::Relaxed),
+                    TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
         }
         kv.advance_host_seq_len(m);
         kv.mark_host_stale();
