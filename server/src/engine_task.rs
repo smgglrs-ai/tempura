@@ -1514,6 +1514,9 @@ impl EngineTask {
         };
         let verify_us = t_verify.elapsed().as_micros() as u64;
         self.spec_stats.add_timing(draft_us, verify_us);
+        if std::env::var("TEMPURA_EAGLE_TRACE").is_ok() && base < 50 {
+            eprintln!("[eagle] verify base={base}: argmaxes={:?} proposals={:?}", &argmaxes[..j.min(4)], &proposals[..j.min(4)]);
+        }
 
         // Accept the longest prefix; emit the target's argmax at the
         // first mismatch (no bonus token on full acceptance -- K proposals
