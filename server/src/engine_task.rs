@@ -680,13 +680,18 @@ impl EngineTask {
                         })
                         .unwrap()
                         .clone();
-                    if self
-                        .eagle_states
-                        .get(&id)
-                        .map(|e| e.prefilled && !e.failed)
-                        .unwrap_or(false)
-                    {
-                        eagle_id = Some(id);
+                    match self.eagle_states.get(&id) {
+                        Some(es) if es.prefilled && !es.failed => {
+                            eagle_id = Some(id);
+                        }
+                        other => {
+                            if std::env::var("TEMPURA_EAGLE_DEBUG").is_ok() {
+                                eprintln!(
+                                    "[eagle] solo session {id} not eligible: {:?}",
+                                    other.map(|e| (e.prefilled, e.failed, e.kv.seq_len()))
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1391,6 +1396,11 @@ impl EngineTask {
         ) {
             // Taps stale (CPU-fallback prefill, oversized chunk) -- the
             // head cannot be prefilled; this session never speculates.
+            eprintln!(
+                "[eagle] prefill hook FAILED for {id}: chunk_start={chunk_start} chunk_len={chunk_len} rows={} tap_rows={}",
+                prompt_after.len(),
+                self.model.eagle_tap_rows()
+            );
             es.failed = true;
             return;
         }
