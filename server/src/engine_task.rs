@@ -656,6 +656,21 @@ impl EngineTask {
         let mut eagle_id: Option<String> = None;
         #[cfg(feature = "cutile")]
         {
+            if std::env::var("TEMPURA_EAGLE_DEBUG").is_ok() {
+                let greedy = stepped
+                    .iter()
+                    .filter(|id| {
+                        sessions.get(*id).map(|e| e.params.is_greedy()).unwrap_or(false)
+                    })
+                    .count();
+                eprintln!(
+                    "[eagle-split] stepped={} greedy={} active={} draft={}",
+                    stepped.len(),
+                    greedy,
+                    self.model.eagle_active(),
+                    self.draft_model.is_some()
+                );
+            }
             if self.draft_model.is_none()
                 && self.model.eagle_active()
                 && std::env::var("TEMPURA_NO_EAGLE").as_deref() != Ok("1")
