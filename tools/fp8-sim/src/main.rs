@@ -18,6 +18,23 @@
 //                           (default "act+weight")
 //   TEMPURA_FP8_SIM_BAND_N  prompts with full-logit band reporting
 //                           (default 16)
+//
+// KV-compression sweep mode (TurboQuant go/no-go, 2026-11-23):
+//   TEMPURA_KV_SIM_SWEEP    comma list of bits:group configs, e.g.
+//                           "2:32,3:64,4:128". Replaces the fp8 mode
+//                           machinery: runs the reference (sim off) once,
+//                           then every config with the polar-quant KV
+//                           round-trip active at the storage boundary
+//                           (quantize-on-write serving semantics), and
+//                           prints the ladder table (accuracy / choice
+//                           agreement / logit band vs reference).
+//   TEMPURA_KV_SIM_PPL      optional corpus file (WikiText-2 raw): adds a
+//                           perplexity leg per config (CPU path, llama.cpp
+//                           scoring convention) with the ppl ratio vs the
+//                           reference run.
+//   TEMPURA_KV_SIM_PPL_CHUNKS  max ppl chunks (default 8, the pooled-gate
+//                           convention)
+//   TEMPURA_KV_SIM_PPL_CTX     ppl chunk size (default 512)
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -228,6 +245,12 @@ fn parse_mode(spec: &str) -> u8 {
 }
 
 fn main() {
+    // KV-compression sweep mode: structured early-return path.
+    if let Ok(sweep) = std::env::var("TEMPURA_KV_SIM_SWEEP") {
+        kv_sim_sweep_main(&sweep);
+        return;
+    }
+
     let mut args = std::env::args().skip(1);
     let model_path = resolve_model_path(args.next());
     let sample_path = resolve_corpus_path(args.next());
@@ -321,5 +344,181 @@ fn main() {
         .collect();
     if !flips.is_empty() {
         println!("    flipped questions: {flips:?}");
+    }
+}
+
+// -- KV-compression sweep (TurboQuant go/no-go) -------------------------------
+
+struct KvSimConfig {
+    bits: u8,
+    group: usize,
+}
+
+fn parse_sweep(spec: &str) -> Vec<KvSimConfig> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (b, g) = part
+            .split_once(':')
+            .unwrap_or_else(|| panic!("bad sweep config {part:?} (want bits:group)"));
+        let bits: u8 = b.trim().parse().expect("bits must be an integer");
+        let group: usize = g.trim().parse().expect("group must be an integer");
+        assert!((1..=8).contains(&bits), "bits out of range: {bits}");
+        assert!(group > 0, "group must be > 0");
+        out.push(KvSimConfig { bits, group });
+    }
+    assert!(!out.is_empty(), "empty TEMPURA_KV_SIM_SWEEP");
+    out
+}
+
+/// Bits/key per element of a config (payload + per-group min/max f32
+/// scales), and the resulting pool density in KiB/token for the
+/// 32-layer x 2 x 1024 GQA pool (e4m3 = 64 KiB/token, f16 = 128).
+fn density_kib_per_token(c: &KvSimConfig) -> (f64, f64) {
+    let payload = c.bits as f64 / 8.0;
+    let scales = 8.0 / c.group as f64; // 2 x f32 per group
+    let bytes_per_elem = payload + scales;
+    let density = bytes_per_elem * 1024.0 * 32.0 * 2.0 / 1024.0;
+    (bytes_per_elem, density)
+}
+
+fn kv_sim_sweep_main(sweep_spec: &str) {
+    use tempura_engine::eval::{perplexity, PplOptions};
+    use tempura_kernels::kv_quant_sim;
+
+    let configs = parse_sweep(sweep_spec);
+    let n = env_usize("TEMPURA_FP8_SIM_N", usize::MAX);
+    let band_n = env_usize("TEMPURA_FP8_SIM_BAND_N", 16);
+    let ppl_path = std::env::var("TEMPURA_KV_SIM_PPL").ok();
+    let ppl_chunks = env_usize("TEMPURA_KV_SIM_PPL_CHUNKS", 8);
+    let ppl_ctx = env_usize("TEMPURA_KV_SIM_PPL_CTX", 512);
+
+    let mut args = std::env::args().skip(1);
+    let model_path = resolve_model_path(args.next());
+    let sample_path = resolve_corpus_path(args.next());
+
+    println!("=== tempura fp8-sim (KV polar-quant sweep) ===\n");
+    println!("  Model:  {}", model_path.display());
+    println!("  Sample: {}", sample_path.display());
+    println!("  Sweep:  {sweep_spec}");
+    if let Some(ref p) = ppl_path {
+        println!("  Ppl:    {p} ({} chunks x {} ctx)", ppl_chunks, ppl_ctx);
+    }
+
+    let questions = load_questions(&sample_path, n);
+    println!("  Questions: {}", questions.len());
+    assert!(!questions.is_empty(), "empty MMLU sample");
+
+    println!("\nLoading GGUF...");
+    let t0 = Instant::now();
+    let loader = GgufLoader::from_file_quantized(&model_path).expect("failed to open GGUF file");
+    let config = loader.config.clone();
+    let metadata = loader.metadata.clone();
+    println!("  Parsed in {:.2}s", t0.elapsed().as_secs_f64());
+
+    let tokenizer =
+        Tokenizer::from_gguf_metadata(&metadata).expect("MMLU needs the real tokenizer");
+    let bos = tokenizer.bos_token_id();
+    let letters = letter_token_ids(&tokenizer, bos);
+
+    let prompts: Vec<Vec<u32>> = questions
+        .iter()
+        .map(|q| tokenizer.encode(&q.prompt).expect("prompt tokenization failed"))
+        .collect();
+    println!("  Prompts tokenized (avg {} tokens)", prompts.iter().map(|p| p.len()).sum::<usize>() / prompts.len());
+
+    let t1 = Instant::now();
+    let qw = loader.to_quantized_weights();
+    let mut model = TransformerModel::new(config.clone(), KernelPipeline::cpu_native());
+    model.quantized_weights = Some(qw);
+    println!("  Weights ready in {:.2}s", t1.elapsed().as_secs_f64());
+
+    let answers: Vec<usize> = questions.iter().map(|q| q.answer).collect();
+
+    // Corpus for the ppl leg (tokenized once, shared by every run).
+    let corpus_tokens = ppl_path.as_ref().map(|p| {
+        let text = std::fs::read_to_string(p)
+            .unwrap_or_else(|e| panic!("failed to read {p}: {e}"));
+        tokenizer.encode(&text).expect("corpus tokenization failed")
+    });
+
+    // Reference: sim off -- the stock CPU quantized path (f32 KV).
+    kv_quant_sim::kv_sim_off();
+    println!("\n--- reference (KV sim OFF) ---");
+    let reference = evaluate(&model, &config, &prompts, &letters, band_n, "ref");
+    let ref_acc = accuracy(&reference.picks, &answers);
+    println!("  accuracy {:.1}%", ref_acc * 100.0);
+    let ref_ppl = corpus_tokens.as_ref().map(|toks| {
+        let opts = PplOptions {
+            n_ctx: ppl_ctx,
+            max_chunks: Some(ppl_chunks),
+            bos,
+            progress: true,
+            collect_logprobs: false,
+        };
+        perplexity(&model, &config, toks, &opts).expect("corpus too short for one chunk")
+    });
+    if let Some(ref r) = ref_ppl {
+        println!("  ppl {:.4} ({} chunks, {} positions, {} NaN steps)", r.ppl, r.chunks, r.count, r.nan_steps);
+    }
+
+    println!("\n=== KV polar-quant ladder (gate: agreement >= 95%, ppl ratio <= 1.01) ===");
+    println!(
+        "{:>10} {:>10} {:>12} {:>12} {:>11} {:>11} {:>10}",
+        "bits", "group", "B/elem", "KiB/tok", "acc", "agreement", "ppl ratio"
+    );
+    let mut results: Vec<String> = Vec::new();
+    for c in &configs {
+        kv_quant_sim::kv_sim_set(c.bits, c.group);
+        let label = format!("b{}g{}", c.bits, c.group);
+        let sim = evaluate(&model, &config, &prompts, &letters, band_n, &label);
+        let sim_acc = accuracy(&sim.picks, &answers);
+        let agr = agreement(&reference.picks, &sim.picks);
+        let (max_abs, _mean_abs, max_rel) = logit_band(&reference.band_logits, &sim.band_logits);
+
+        let sim_ppl = corpus_tokens.as_ref().map(|toks| {
+            let opts = PplOptions {
+                n_ctx: ppl_ctx,
+                max_chunks: Some(ppl_chunks),
+                bos,
+                progress: false,
+                collect_logprobs: false,
+            };
+            perplexity(&model, &config, toks, &opts).expect("corpus too short for one chunk")
+        });
+        kv_quant_sim::kv_sim_off();
+
+        let (bpe, kib) = density_kib_per_token(c);
+        let ppl_ratio = match (&ref_ppl, &sim_ppl) {
+            (Some(r), Some(s)) => format!("{:.4}", s.ppl / r.ppl),
+            _ => "-".to_string(),
+        };
+        println!(
+            "{:>10} {:>10} {:>12.4} {:>12.1} {:>10.1}% {:>10.1}% {:>10}",
+            c.bits, c.group, bpe, kib, sim_acc * 100.0, agr * 100.0, ppl_ratio
+        );
+        println!(
+            "           logit band: max |d| {max_abs:.4}, max rel-to-peak {max_rel:.4}; ppl {}",
+            sim_ppl.as_ref().map(|r| format!("{:.4}", r.ppl)).unwrap_or_else(|| "-".into())
+        );
+        results.push(format!(
+            "bits={} group={} B/elem={:.4} KiB/tok={:.1} acc={:.1}% agr={:.1}% ppl={} ratio={}",
+            c.bits,
+            c.group,
+            bpe,
+            kib,
+            sim_acc * 100.0,
+            agr * 100.0,
+            sim_ppl.as_ref().map(|r| format!("{:.4}", r.ppl)).unwrap_or_else(|| "-".into()),
+            ppl_ratio
+        ));
+    }
+
+    println!("\n=== summary ===");
+    for r in &results {
+        println!("  {r}");
     }
 }

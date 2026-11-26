@@ -202,7 +202,18 @@ fn attention_layer_decode(
             .unwrap();
     }
 
-    session.cache.append_kv(cache_layer, &k[..kv_dim], v, 1);
+    // KV precision-class simulation hook (kv_quant_sim): quantize-on-write
+    // semantics -- the cache stores exactly what a polar-quant pool would
+    // serve. Single atomic load, zero cost when off.
+    let v_sim;
+    let v_ref: &[f32] = if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+        v_sim = tempura_kernels::kv_quant_sim::kv_sim_roundtrip_owned(v, head_dim);
+        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(&mut k[..kv_dim], head_dim);
+        &v_sim
+    } else {
+        v
+    };
+    session.cache.append_kv(cache_layer, &k[..kv_dim], v_ref, 1);
     let kv_len = session.cache.seq_len + 1;
     let k_cache = session.cache.k_data(cache_layer, kv_len);
     let v_cache = session.cache.v_data(cache_layer, kv_len);
@@ -1121,6 +1132,10 @@ where
                 let attn_scale = 1.0 / (head_dim as f32).sqrt();
                 let cl = cache_layer_map[layer].unwrap();
                 if let Some(ref mut paged) = session.paged_cache {
+                    if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(&mut k, head_dim);
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(&mut v, head_dim);
+                    }
                     paged.append_kv(cl, &k, &v, seq_len);
                     let kv_len = paged.seq_len + seq_len;
                     // Paged attention (p20): read the pool through the
@@ -1145,6 +1160,10 @@ where
                         )
                         .unwrap();
                 } else {
+                    if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(&mut k, head_dim);
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(&mut v, head_dim);
+                    }
                     session.cache.append_kv(cl, &k, &v, seq_len);
                     let kv_len = session.cache.seq_len + seq_len;
                     let k_cache = session.cache.k_data(cl, kv_len);
@@ -2625,7 +2644,22 @@ where
 
                             let cache =
                                 unsafe { &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache) };
-                            cache.append_kv(lw.cl_q, k_sl, v_sl, 1);
+                            let v_sl_sim;
+                            let v_sl_ref: &[f32] =
+                                if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+                                    tempura_kernels::kv_quant_sim::kv_sim_roundtrip(
+                                        k_sl,
+                                        head_dim_cap,
+                                    );
+                                    v_sl_sim = tempura_kernels::kv_quant_sim::kv_sim_roundtrip_owned(
+                                        v_sl,
+                                        head_dim_cap,
+                                    );
+                                    &v_sl_sim
+                                } else {
+                                    v_sl
+                                };
+                            cache.append_kv(lw.cl_q, k_sl, v_sl_ref, 1);
                             let attn_sl = unsafe {
                                 std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
                             };
@@ -3567,7 +3601,22 @@ where
                             };
                             let cache =
                                 unsafe { &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache) };
-                            cache.append_kv(lw.cl_q, k_sl, v_sl, m_cap);
+                            let v_sl_sim;
+                            let v_sl_ref: &[f32] =
+                                if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+                                    tempura_kernels::kv_quant_sim::kv_sim_roundtrip(
+                                        k_sl,
+                                        head_dim_cap,
+                                    );
+                                    v_sl_sim = tempura_kernels::kv_quant_sim::kv_sim_roundtrip_owned(
+                                        v_sl,
+                                        head_dim_cap,
+                                    );
+                                    &v_sl_sim
+                                } else {
+                                    v_sl
+                                };
+                            cache.append_kv(lw.cl_q, k_sl, v_sl_ref, m_cap);
                             // Store kv_len for the parallel attention node
                             unsafe {
                                 *(kv_len_pf_ptr as *mut usize).add(layer) = cache.seq_len + m_cap;
@@ -5179,6 +5228,16 @@ where
                     }
 
                     let cl_q = cache_layer_map_q[layer].unwrap();
+                    if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(
+                            &mut k[..seq_len * kv_dim],
+                            head_dim,
+                        );
+                        tempura_kernels::kv_quant_sim::kv_sim_roundtrip(
+                            &mut v[..seq_len * kv_dim],
+                            head_dim,
+                        );
+                    }
                     session.cache.append_kv(
                         cl_q,
                         &k[..seq_len * kv_dim],

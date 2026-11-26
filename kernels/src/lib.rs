@@ -66,6 +66,7 @@ pub mod deltanet;
 pub mod dispatch;
 pub mod e4m3;
 pub mod fp8_sim;
+pub mod kv_quant_sim;
 pub mod f16_gemv;
 pub mod fused;
 pub mod ggml;
