@@ -14290,6 +14290,11 @@ impl CutileGpuModel {
         if m == 0 {
             return Some(());
         }
+        // append_device_gpu_only does not touch the host seq_len counter
+        // (the decode callers advance it themselves) -- grow for the whole
+        // batch and advance below.
+        kv.ensure_capacity(kv.seq_len() + m)
+            .expect("eagle teacher_rows: head KV growth failed");
         let stream = self.matmul.stream();
         let h = eg.h;
         let h_pad = eg.h_pad;
@@ -14348,6 +14353,8 @@ impl CutileGpuModel {
             // the chain, and head_row reports those via eprintln/panic.
             let _ = self.eagle_head_row(eg, tokens[r], &hidden_row, positions[r], kv, 0, false);
         }
+        kv.advance_host_seq_len(m);
+        kv.mark_host_stale();
         Some(())
     }
 
@@ -14386,8 +14393,11 @@ impl CutileGpuModel {
             // Next step's hidden: this step's pre-norm output (ping-pong).
             hidden = eg.s_hidden[j & 1].clone();
         }
-        // The draft steps advanced the head KV by k; the caller rolls it
-        // back to base-1 before the resync rewrites the accepted prefix.
+        // The draft steps advanced the head KV by k (device-side); advance
+        // the host counter to match.  The caller rolls it back to base-1
+        // before the resync rewrites the accepted prefix.
+        kv.advance_host_seq_len(k);
+        kv.mark_host_stale();
         stream.synchronize().ok()?;
         Some(proposals)
     }
