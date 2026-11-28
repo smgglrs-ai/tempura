@@ -903,6 +903,11 @@ mod kernels {
         }
     }
 
+    // NOTE: the params are `&mut [u32]` (not DisjointSlice) so the derived
+    // write indices (q8_blk*8 + lane/4, q8_blk) can be safe indexed stores
+    // Lean reasons about -- DisjointSlice's safe accessor only accepts the
+    // thread's own 1D coordinate. Both lower to the same {ptr, len} ABI, so
+    // the tempura host wrapper's raw 7-param launch is unchanged.
     /// Quantize f32 activations to Q8_1 packed format on GPU.
     ///
     /// Each warp (32 lanes) handles one 32-element Q8_1 block:
@@ -933,8 +938,8 @@ mod kernels {
     #[verify(no_oob_idx(x, out_qs, out_ds), disjoint_writes(out_qs, out_ds))]
     #[kernel]
     pub fn quantize_q8_1(
-        mut out_qs: DisjointSlice<u32>,  // [K/4] packed i8 activations
-        mut out_ds: DisjointSlice<u32>,  // [K/32] f16 scale (u16 in low bits)
+        out_qs: &mut [u32],  // [K/4] packed i8 activations
+        out_ds: &mut [u32],  // [K/32] f16 scale (u16 in low bits)
         x: &[f32],
         k: u32,
     ) {
@@ -2019,7 +2024,10 @@ fn main() {
     let mut out_dev  = DeviceBuffer::<f32>::zeroed(&stream, n).expect("alloc out");
     let mut out_dev2 = DeviceBuffer::<f32>::zeroed(&stream, n).expect("alloc out2");
 
-    let module = kernels::load(&ctx).expect("load oxide q4k module");
+    // SAFETY: this binary embeds the crate's PTX module; the launch_contract
+    // requires on quantize_q8_1 are enforced by this crate's own test
+    // launches below (tempura's host wrapper checks them at its call sites).
+    let module = unsafe { kernels::load(&ctx) }.expect("load oxide q4k module");
 
     let wpb = WARPS_PER_BLOCK as usize;
     // v1 (fallback): ceil(N/WARPS_PER_BLOCK) blocks, no shared memory.
