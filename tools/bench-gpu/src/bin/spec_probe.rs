@@ -58,19 +58,17 @@ fn score(
     generated: &[u32],
 ) -> f64 {
     let mut sess = InferenceSession::new(config, TraceLevel::Off, 999);
-    let mut all = prompt_tokens.to_vec();
-    all.extend_from_slice(generated);
+    // forward() returns only the LAST position's logits: decode
+    // incrementally, reading logp of generated[i] from the logits that
+    // predicted it, then consuming the token.
+    let mut logits = model.forward(&mut sess, prompt_tokens);
     let mut logp_sum = 0.0f64;
-    // Forward over the whole sequence once; read logp of each generated
-    // position from the logits at the previous position.
-    let mut prev: Vec<u32> = all[..all.len() - 1].to_vec();
-    let logits = model.forward(&mut sess, &prev);
-    let v = logits.len() / prev.len();
-    for (i, &tok) in generated.iter().enumerate() {
-        let row = &logits[(prompt_tokens.len() - 1 + i) * v..][..v];
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let lse: f32 = row.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
-        logp_sum += (row[tok as usize] - max - lse) as f64;
+    for &tok in generated {
+        let v = logits.len();
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lse: f32 = logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+        logp_sum += (logits[tok as usize] - max - lse) as f64;
+        logits = model.forward(&mut sess, &[tok]);
     }
     logp_sum / generated.len() as f64
 }
