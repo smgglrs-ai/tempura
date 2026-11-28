@@ -135,6 +135,9 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
   (`pull`, `list`, `inspect` format/arch detection; consumed by the CLI).
   Model store at `~/.cache/tempura/models` (XDG cache via `dirs::cache_dir()`,
   `XDG_CACHE_HOME` respected — same root the gpu-remote workflow uses).
+  On fishtank, large/new model downloads go to **`/data/models`** (3.7TB
+  NVMe mount; it holds Bonsai-27B-gguf, BF16 conversions, mmproj files) —
+  reference its paths directly; the home cache stays valid for reads.
 
 - **server/** (`tempura-server`, ~4.2k lines, library) — Axum. OpenAI-compatible:
   `/v1/chat/completions` (SSE streaming, `stream_options.include_usage`,
@@ -584,10 +587,26 @@ Qwen3.6-27B weights** — see open work.
       q6k stack +0.9 ms/step; probe arm 4c bit-identical to the mirror).
       The epilogue restructures RE-MEASURED at J=128 (ffma/h2 entries
       q4k_mmq_batch_sm120_ffma_j128/_h2_j128): STILL washes -- the
-      kernel is bound by smem/load latency, not fp issue. Remaining
-      recorded deltas vs llama's per-step: quantize 0.79 vs 0.34 ms,
-      attention 1.39 vs 0.99, lm_head-last-row 0.43, rope 0.27 vs 0.18.
+      kernel is bound by smem/load latency, not fp issue.
       TEMPURA_Q6K_MMQ_J bisects the q6k J.
+      2026-11-28 (current-checkout differential round, all
+      byte-identical, fingerprint 170452491303490 unchanged): llama's
+      CURRENT tree (786da859) re-measured at 10077 +/- 260 tok/s pp128;
+      three deltas landed taking exact 7959 -> ~8400: (a) shared-quantize
+      groups (q/k/v and gate/up replay ONE Q8_1 quantize per group via
+      forward_mmq*_prequant entries; 7 -> 4 launches/layer), (b) the
+      quantize_q8_1 kernel rewritten to 8 lanes/block x 4 elements/lane
+      register packing (quantize 0.79 -> 0.28 ms/step -- now FASTER than
+      llama's 0.35; per-element arithmetic + ds rowsum layout unchanged),
+      (c) prefill paged flash attention BR=4 (sweep 4/8/16/32/64 = 8294/
+      8370/8100-8283/8187/7367; BR=4 is byte-identical to BR=16's
+      reduction order, BR=8 is +1% but a sum-order class change, opt-in
+      TEMPURA_PAGED_BR). MEASURED WASHES: lm_head via q6k mmq at m=1
+      (TEMPURA_LM_HEAD_MMQ=1) and the q6k kpar variant bisect
+      (TEMPURA_Q6K_KPAR=db|mbar|kpar -- db stays). Remaining gap vs the
+      current checkout (~0.83x): attention 0.63 ms (needs an mma FA
+      behind the paged interface), Q4K 0.55 (llama fuses GLU into the
+      mmq epilogue), lm_head 0.15, rope 0.09, host ~5%.
       2026-11-18 (kernel-efficiency pass, profile + llama.cpp mmq study in
       docs/status): quantize_q8_1 precomputes the Q8_1 block rowsum into
       the ds word's high bits (llama.cpp's Q8_1 ds layout; all other
