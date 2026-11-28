@@ -111,17 +111,6 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     (sign | ((exp16 as u32) << 10) | (mant >> 13)) as u16
 }
 
-/// Butterfly warp-reduce max over all 32 lanes (abs, for quantization scale).
-#[inline(always)]
-fn warp_reduce_max_f32(mut v: f32) -> f32 {
-    let t = warp::shuffle_xor_f32(v, 16); if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 8);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 4);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 2);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 1);  if t > v { v = t; }
-    v
-}
-
 /// Inline 6-bit scale unpack for raw GGUF Q4K format.
 /// ps0 = packed u32 of bytes ps[0..4], ps1 = ps[4..8], ps2 = ps[8..12].
 /// mw = j-group index (0..3).
@@ -901,6 +890,19 @@ mod kernels {
             }
         }
     }
+
+    #[inline(always)]
+/// Butterfly warp-reduce max over all 32 lanes (abs, for quantization scale).
+/// NOTE: must live INSIDE the #[cuda_module] mod and be #[inline(always)] --
+/// the Lean exporter fail-closes on un-inlined calls from #[verify] kernels.
+fn warp_reduce_max_f32(mut v: f32) -> f32 {
+    let t = warp::shuffle_xor_f32(v, 16); if t > v { v = t; }
+    let t = warp::shuffle_xor_f32(v, 8);  if t > v { v = t; }
+    let t = warp::shuffle_xor_f32(v, 4);  if t > v { v = t; }
+    let t = warp::shuffle_xor_f32(v, 2);  if t > v { v = t; }
+    let t = warp::shuffle_xor_f32(v, 1);  if t > v { v = t; }
+    v
+}
 
     // NOTE: the params are `&mut [u32]` (not DisjointSlice) so the derived
     // write indices (q8_blk*8 + lane/4, q8_blk) can be safe indexed stores
