@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use tempura_engine::gguf_loader::GgufLoader;
 use tempura_engine::model::TransformerModel;
 use tempura_engine::pipeline::KernelPipeline;
-use tempura_engine::session::{InferenceSession, TraceLevel};
+use tempura_engine::session::InferenceSession;
+use tempura_engine::trace::TraceLevel;
 
 use tempura_engine::tokenizer::Tokenizer;
 
@@ -63,12 +64,12 @@ fn main() {
         "logits[0..5]: {:?}  argmax={} piece={:?}",
         &logits[..5.min(logits.len())],
         argmax,
-        tokenizer.decode(&[argmax as u32])
+        tokenizer.decode(&[argmax as u32]).unwrap_or_default()
     );
 
     let mut generated = vec![argmax as u32];
     for _ in 1..n_tokens {
-        let logits = model.forward(&mut session, generated.last().unwrap());
+        let logits = model.forward(&mut session, &[*generated.last().unwrap()]);
         let argmax = logits
             .iter()
             .enumerate()
@@ -77,5 +78,5 @@ fn main() {
             .unwrap_or(0);
         generated.push(argmax as u32);
     }
-    println!("greedy continuation: {}", tokenizer.decode(&generated));
+    println!("greedy continuation: {}", tokenizer.decode(&generated).unwrap_or_default());
 }
