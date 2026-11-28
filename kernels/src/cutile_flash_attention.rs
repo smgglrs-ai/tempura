@@ -2251,7 +2251,19 @@ impl CutileFlashAttention {
             )));
         }
 
-        let seq_pad = seq_len.div_ceil(BR) * BR;
+        // BR (Q rows per CTA) sweep knob. MEASURED 2026-11-28 (pp128):
+        // BR=4 8294, BR=8 8365-8372, BR=16 8074-8283, BR=32 8187,
+        // BR=64 7367 tok/s. DEFAULT 4: at BR=4 the QK dot's f32 reduction
+        // order matches BR=16's -- the logits fingerprint is BYTE-IDENTICAL
+        // (170452491303490) -- while BR=8 (faster by ~1%) changes the
+        // sum-order class; the byte-identical option is the default and
+        // BR=8 stays opt-in via the env. TEMPURA_PAGED_BR=4|8|16|32|64.
+        let br: usize = std::env::var("TEMPURA_PAGED_BR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| matches!(v, 4 | 8 | 16 | 32 | 64))
+            .unwrap_or(4);
+        let seq_pad = seq_len.div_ceil(br) * br;
         let q_dim = n_heads * head_dim;
         let heads_per_group = n_heads / n_kv_heads;
         // KV tile width for the paged kernel: MUST equal the block size
@@ -2289,14 +2301,14 @@ impl CutileFlashAttention {
                 kv_len_dev.clone(),
                 scale,
                 seq_len as i32,
-                (seq_pad / BR) as i32,
+                (seq_pad / br) as i32,
                 n_heads as i32,
                 n_kv_heads as i32,
                 heads_per_group as i32,
                 self.softcap,
             )
-            .generics(vec![BR.to_string(), bc.to_string(), head_dim.to_string()])
-            .grid((((seq_pad / BR) * n_heads) as u32, 1, 1))
+            .generics(vec![br.to_string(), bc.to_string(), head_dim.to_string()])
+            .grid((((seq_pad / br) * n_heads) as u32, 1, 1))
             .async_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
