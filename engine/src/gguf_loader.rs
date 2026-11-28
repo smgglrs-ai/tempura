@@ -349,40 +349,40 @@ fn dequant_bf16(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 fn dequant_q4_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    // ggml split-half nibble order: the LOW nibble of qs[j] is element j
+    // and the HIGH nibble is element j+16 (ggml-quants.c
+    // dequantize_row_q4_0) -- NOT sequential 2j/2j+1. The kernels crate's
+    // ggml::dequantize has the correct layout; this private copy had it
+    // wrong (found via gemma-3-1b's legacy-quant tensors, 2026-11-28).
     let num_blocks = num_elements / 32;
     let block_size = 18;
-    let mut out = Vec::with_capacity(num_elements);
+    let mut out = vec![0.0f32; num_elements];
     for b in 0..num_blocks {
-        let block_start = b * block_size;
-        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
-        let scale = f16_to_f32(scale_bits);
-        for i in 0..16 {
-            let byte = data[block_start + 2 + i];
-            let lo = (byte & 0x0F) as i32 - 8;
-            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            out.push(lo as f32 * scale);
-            out.push(hi as f32 * scale);
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        for j in 0..16 {
+            let byte = data[bs + 2 + j];
+            out[b * 32 + j] = ((byte & 0x0F) as i32 - 8) as f32 * scale;
+            out[b * 32 + j + 16] = ((byte >> 4) as i32 - 8) as f32 * scale;
         }
     }
     out
 }
 
+
 fn dequant_q4_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    // Split-half nibble order (see dequant_q4_0).
     let num_blocks = num_elements / 32;
     let block_size = 20;
-    let mut out = Vec::with_capacity(num_elements);
+    let mut out = vec![0.0f32; num_elements];
     for b in 0..num_blocks {
-        let block_start = b * block_size;
-        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
-        let scale = f16_to_f32(scale_bits);
-        let min_bits = u16::from_le_bytes([data[block_start + 2], data[block_start + 3]]);
-        let min = f16_to_f32(min_bits);
-        for i in 0..16 {
-            let byte = data[block_start + 4 + i];
-            let lo = (byte & 0x0F) as f32;
-            let hi = ((byte >> 4) & 0x0F) as f32;
-            out.push(lo * scale + min);
-            out.push(hi * scale + min);
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        for j in 0..16 {
+            let byte = data[bs + 4 + j];
+            out[b * 32 + j] = (byte & 0x0F) as f32 * scale + min;
+            out[b * 32 + j + 16] = (byte >> 4) as f32 * scale + min;
         }
     }
     out
@@ -405,29 +405,28 @@ fn dequant_q8_0(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 fn dequant_q5_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    // Split-half nibble order (see dequant_q4_0) + the qh bit pairing:
+    // element j takes qh bit j, element j+16 takes qh bit j+16
+    // (ggml-quants.c: xh_1 = (qh >> (j + 12)) & 0x10 == bit j+16).
     let num_blocks = num_elements / 32;
     let block_size = 22; // 2 bytes scale + 4 bytes high-bits + 16 bytes low nibbles
-    let mut output = Vec::with_capacity(num_elements);
-
+    let mut out = vec![0.0f32; num_elements];
     for b in 0..num_blocks {
         let bs = b * block_size;
         let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
         let high_bits =
             u32::from_le_bytes([data[bs + 2], data[bs + 3], data[bs + 4], data[bs + 5]]);
-
-        for j in 0..32 {
-            let byte_idx = bs + 6 + j / 2;
-            let nibble = if j % 2 == 0 {
-                data[byte_idx] & 0x0F
-            } else {
-                data[byte_idx] >> 4
-            };
-            let high = ((high_bits >> j) & 1) as u8;
-            let q = (nibble | (high << 4)) as i32 - 16;
-            output.push(q as f32 * scale);
+        for j in 0..16 {
+            let byte = data[bs + 6 + j];
+            let lo = (((byte & 0x0F) as i32) | ((((high_bits >> j) & 1) as i32) << 4)) - 16;
+            let hi =
+                ((((byte >> 4) & 0x0F) as i32) | ((((high_bits >> (j + 16)) & 1) as i32) << 4))
+                    - 16;
+            out[b * 32 + j] = lo as f32 * scale;
+            out[b * 32 + j + 16] = hi as f32 * scale;
         }
     }
-    output
+    out
 }
 
 fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
@@ -473,9 +472,10 @@ fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 fn dequant_q5_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    // Split-half nibble order + qh pairing (see dequant_q5_0).
     let num_blocks = num_elements / 32;
     let block_size = 24; // 2 bytes scale + 2 bytes min + 4 bytes high-bits + 16 bytes low nibbles
-    let mut output = Vec::with_capacity(num_elements);
+    let mut output = vec![0.0f32; num_elements];
 
     for b in 0..num_blocks {
         let bs = b * block_size;
@@ -484,16 +484,12 @@ fn dequant_q5_1(data: &[u8], num_elements: usize) -> Vec<f32> {
         let high_bits =
             u32::from_le_bytes([data[bs + 4], data[bs + 5], data[bs + 6], data[bs + 7]]);
 
-        for j in 0..32 {
-            let byte_idx = bs + 8 + j / 2;
-            let nibble = if j % 2 == 0 {
-                data[byte_idx] & 0x0F
-            } else {
-                data[byte_idx] >> 4
-            };
-            let high = ((high_bits >> j) & 1) as u8;
-            let q = (nibble | (high << 4)) as f32;
-            output.push(q * scale + min);
+        for j in 0..16 {
+            let byte = data[bs + 8 + j];
+            let lo = ((byte & 0x0F) as i32) | ((((high_bits >> j) & 1) as i32) << 4);
+            let hi = (((byte >> 4) & 0x0F) as i32) | ((((high_bits >> (j + 16)) & 1) as i32) << 4);
+            output[b * 32 + j] = lo as f32 * scale + min;
+            output[b * 32 + j + 16] = hi as f32 * scale + min;
         }
     }
     output
@@ -2463,6 +2459,86 @@ mod tests {
     use super::*;
 
     const GGUF_ALIGNMENT: usize = 32;
+
+    /// The loader's private legacy-quant dequants must match the
+    /// kernels crate's ggml reference EXACTLY (the split-half nibble
+    /// layout: qs[j] low nibble -> element j, high nibble -> j+16; qh
+    /// bit i -> element i). The sequential 2j/2j+1 reading silently
+    /// permutes weights within every 32-element block (found via
+    /// gemma-3-1b's Q5_0 tensors, 2026-11-28).
+    #[test]
+    fn test_legacy_dequants_match_ggml_reference() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use tempura_kernels::ggml::blocks::{
+            BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1,
+        };
+        let mut rng = StdRng::seed_from_u64(20261128);
+        // Finite f16 only: NaN scales would make assert_eq fail on
+        // NaN != NaN even when both sides match.
+        let mut fin = |rng: &mut StdRng| rng.random::<u16>() & 0x3FFF;
+        const BLOCKS: usize = 7;
+
+        let mut blocks4_0: Vec<BlockQ4_0> = Vec::new();
+        let mut bytes4_0: Vec<u8> = Vec::new();
+        for _ in 0..BLOCKS {
+            let d = fin(&mut rng);
+            let qs: [u8; 16] = rng.random();
+            bytes4_0.extend_from_slice(&d.to_le_bytes());
+            bytes4_0.extend_from_slice(&qs);
+            blocks4_0.push(BlockQ4_0 { d, qs });
+        }
+        let mut ref4_0 = vec![0.0f32; BLOCKS * 32];
+        tempura_kernels::ggml::dequantize::dequantize_row_q4_0(&blocks4_0, &mut ref4_0);
+        assert_eq!(dequant_q4_0(&bytes4_0, BLOCKS * 32), ref4_0);
+
+        let mut blocks4_1: Vec<BlockQ4_1> = Vec::new();
+        let mut bytes4_1: Vec<u8> = Vec::new();
+        for _ in 0..BLOCKS {
+            let d = fin(&mut rng);
+            let m = fin(&mut rng);
+            let qs: [u8; 16] = rng.random();
+            bytes4_1.extend_from_slice(&d.to_le_bytes());
+            bytes4_1.extend_from_slice(&m.to_le_bytes());
+            bytes4_1.extend_from_slice(&qs);
+            blocks4_1.push(BlockQ4_1 { d, m, qs });
+        }
+        let mut ref4_1 = vec![0.0f32; BLOCKS * 32];
+        tempura_kernels::ggml::dequantize::dequantize_row_q4_1(&blocks4_1, &mut ref4_1);
+        assert_eq!(dequant_q4_1(&bytes4_1, BLOCKS * 32), ref4_1);
+
+        let mut blocks5_0: Vec<BlockQ5_0> = Vec::new();
+        let mut bytes5_0: Vec<u8> = Vec::new();
+        for _ in 0..BLOCKS {
+            let d = fin(&mut rng);
+            let qh: [u8; 4] = rng.random();
+            let qs: [u8; 16] = rng.random();
+            bytes5_0.extend_from_slice(&d.to_le_bytes());
+            bytes5_0.extend_from_slice(&qh);
+            bytes5_0.extend_from_slice(&qs);
+            blocks5_0.push(BlockQ5_0 { d, qh, qs });
+        }
+        let mut ref5_0 = vec![0.0f32; BLOCKS * 32];
+        tempura_kernels::ggml::dequantize::dequantize_row_q5_0(&blocks5_0, &mut ref5_0);
+        assert_eq!(dequant_q5_0(&bytes5_0, BLOCKS * 32), ref5_0);
+
+        let mut blocks5_1: Vec<BlockQ5_1> = Vec::new();
+        let mut bytes5_1: Vec<u8> = Vec::new();
+        for _ in 0..BLOCKS {
+            let d = fin(&mut rng);
+            let m = fin(&mut rng);
+            let qh: [u8; 4] = rng.random();
+            let qs: [u8; 16] = rng.random();
+            bytes5_1.extend_from_slice(&d.to_le_bytes());
+            bytes5_1.extend_from_slice(&m.to_le_bytes());
+            bytes5_1.extend_from_slice(&qh);
+            bytes5_1.extend_from_slice(&qs);
+            blocks5_1.push(BlockQ5_1 { d, m, qh, qs });
+        }
+        let mut ref5_1 = vec![0.0f32; BLOCKS * 32];
+        tempura_kernels::ggml::dequantize::dequantize_row_q5_1(&blocks5_1, &mut ref5_1);
+        assert_eq!(dequant_q5_1(&bytes5_1, BLOCKS * 32), ref5_1);
+    }
 
     #[test]
     fn test_map_gguf_name() {
