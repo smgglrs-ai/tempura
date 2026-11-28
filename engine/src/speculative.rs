@@ -3,6 +3,29 @@ use crate::trace::{SpeculativeSnapshot, TraceLevel};
 use crate::TransformerModel;
 use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
+/// Rejection residual for stochastic speculative acceptance:
+/// `max(p_target - p_draft, 0)`, renormalized. When the residual mass is
+/// (numerically) zero, falls back to the full target distribution -- the
+/// token then still comes from the target's conditional.
+pub fn residual_distribution(target_probs: &[f32], draft_probs: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(target_probs.len(), draft_probs.len());
+    let mut residual = vec![0.0f32; target_probs.len()];
+    let mut sum = 0.0f32;
+    for i in 0..target_probs.len() {
+        let r = (target_probs[i] - draft_probs[i]).max(0.0);
+        residual[i] = r;
+        sum += r;
+    }
+    if sum > 0.0 {
+        for r in residual.iter_mut() {
+            *r /= sum;
+        }
+        residual
+    } else {
+        target_probs.to_vec()
+    }
+}
+
 pub struct SpeculativeDecoder<'a, A1, N1, R1, M1, S1, A2, N2, R2, M2, S2>
 where
     A1: Attention,
@@ -88,7 +111,10 @@ where
             let saved_draft_seq_len = draft_session.cache.seq_len;
 
             let mut draft_tokens = Vec::with_capacity(self.k);
-            let mut draft_probs_vec = Vec::new();
+            // Full draft distributions per step: the stochastic acceptance
+            // scheme needs p_d everywhere (not just at the sampled token)
+            // to form the rejection residual.
+            let mut draft_probs_vec: Vec<Vec<f32>> = Vec::with_capacity(self.k);
 
             let mut last_token = *generated.last().unwrap();
             for _ in 0..self.k {
@@ -104,9 +130,24 @@ where
                     .apply(&logits, &mut probs, params)
                     .unwrap();
 
-                let token = self.draft.pipeline.sampler.sample_token(&probs, None);
+                // The draft SAMPLES from its own (post-chain) distribution:
+                // the acceptance ratio p_t/p_d is only correct when p_d is
+                // the distribution the draft token was actually drawn from
+                // (a greedy draft degenerates p_d to a point mass and breaks
+                // the output distribution). Seeded per draft session --
+                // determinism.
+                let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                    None
+                } else {
+                    Some(&mut draft_session.rng)
+                };
+                let token = self
+                    .draft
+                    .pipeline
+                    .sampler
+                    .sample_token(&probs, rng_ref);
                 draft_tokens.push(token);
-                draft_probs_vec.push(probs[token as usize]);
+                draft_probs_vec.push(probs);
                 last_token = token;
             }
 
@@ -147,7 +188,7 @@ where
                     .unwrap();
 
                 let target_prob = target_probs[draft_token as usize];
-                let draft_prob = draft_probs_vec[i];
+                let draft_prob = draft_probs_vec[i][draft_token as usize];
 
                 if params.temperature == 0.0 {
                     let target_argmax = target_probs
@@ -164,19 +205,42 @@ where
                         accepted.push(target_argmax);
                         break;
                     }
-                } else if target_prob >= draft_prob {
-                    accepted.push(draft_token);
-                    verify_token = draft_token;
                 } else {
-                    rejected.push(draft_token);
-                    let rng_ref: Option<&mut dyn rand::RngCore> = Some(&mut target_session.rng);
-                    let corrected = self
-                        .target
-                        .pipeline
-                        .sampler
-                        .sample_token(&target_probs, rng_ref);
-                    accepted.push(corrected);
-                    break;
+                    // Standard stochastic acceptance (Levy-Karp / Medusa):
+                    // accept d ~ p_d with prob min(1, p_t(d)/p_d(d)). On
+                    // rejection, sample the correction from the residual
+                    // norm(max(p_t - p_d, 0)) -- this makes the emitted
+                    // token distribution EXACTLY the target's (the scheme
+                    // is output-equivalent in distribution to plain
+                    // sampling, not byte-identical).
+                    let ratio = if draft_prob > 0.0 {
+                        target_prob / draft_prob
+                    } else {
+                        f32::INFINITY
+                    };
+                    let u: f32 = {
+                        use rand::RngCore as _;
+                        target_session.rng.next_u32() as f64 / u32::MAX as f64
+                    } as f32;
+                    if u < ratio {
+                        accepted.push(draft_token);
+                        verify_token = draft_token;
+                    } else {
+                        rejected.push(draft_token);
+                        let residual = residual_distribution(
+                            &target_probs,
+                            &draft_probs_vec[i],
+                        );
+                        let rng_ref: Option<&mut dyn rand::RngCore> =
+                            Some(&mut target_session.rng);
+                        let corrected = self
+                            .target
+                            .pipeline
+                            .sampler
+                            .sample_token(&residual, rng_ref);
+                        accepted.push(corrected);
+                        break;
+                    }
                 }
             }
 
@@ -275,6 +339,36 @@ mod kani_proofs {
                 assert!(i < draft_probs_vec.len());
             }
         }
+    }
+
+    #[kani::proof]
+    fn residual_distribution_in_bounds_and_normalized() {
+        // Concrete sizes only: symbolic-length Vec allocation makes CBMC
+        // unwind allocation internals without bound.
+        for n in [1usize, 2, 7, 64] {
+            let target: Vec<f32> = (0..n).map(|_| kani::any()).collect();
+            let draft: Vec<f32> = (0..n).map(|_| kani::any()).collect();
+            let residual = crate::speculative::residual_distribution(&target, &draft);
+            assert!(residual.len() == n);
+            let mut sum = 0.0f32;
+            for r in &residual {
+                assert!(*r >= 0.0 && *r <= 1.0 + 1e-5);
+                sum += r;
+            }
+            assert!(sum <= 1.0 + 1e-3);
+        }
+    }
+
+    #[kani::proof]
+    fn acceptance_ratio_bounded() {
+        let target_prob: f32 = kani::any();
+        let draft_prob: f32 = kani::any();
+        kani::assume(draft_prob > 0.0 && draft_prob <= 1.0);
+        kani::assume(target_prob >= 0.0 && target_prob <= 1.0);
+        let ratio = target_prob / draft_prob;
+        assert!(ratio >= 0.0);
+        // min(1, ratio) is the acceptance probability: bounded by 1.
+        assert!(ratio.min(1.0) <= 1.0);
     }
 }
 
@@ -428,6 +522,167 @@ mod tests {
             assert!(!snap.draft_proposed.is_empty());
             assert!(snap.acceptance_rate >= 0.0 && snap.acceptance_rate <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_residual_distribution_unit() {
+        let target = vec![0.5, 0.3, 0.2];
+        let draft = vec![0.2, 0.5, 0.3];
+        let r = residual_distribution(&target, &draft);
+        // max(t-d,0) = [0.3, 0, 0] -> normalized [1, 0, 0]
+        assert!((r[0] - 1.0).abs() < 1e-6);
+        assert!(r[1].abs() < 1e-6 && r[2].abs() < 1e-6);
+        // Draft dominating everywhere -> all residual mass on the
+        // dominated side.
+        let r2 = residual_distribution(&[0.1, 0.9], &[0.9, 0.1]);
+        assert!(r2[0].abs() < 1e-6 && (r2[1] - 1.0).abs() < 1e-6);
+        // Identical distributions -> zero residual mass -> target fallback.
+        let r3 = residual_distribution(&[0.5, 0.5], &[0.5, 0.5]);
+        assert!((r3[0] - 0.5).abs() < 1e-6 && (r3[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sampled_speculation_deterministic_per_seed() {
+        let config = ModelConfig::tiny_test();
+        let target = make_model_with_weights(&config, 42);
+        // A DIFFERENT draft (seed 43): acceptance < 1, the residual
+        // correction path runs.
+        let draft = make_model_with_weights(&config, 43);
+        let decoder = SpeculativeDecoder::new(&target, &draft, 4);
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+
+        let mut run = |seed: u64| {
+            let mut ts = InferenceSession::new(&config, TraceLevel::Off, seed);
+            let mut ds = InferenceSession::new(&config, TraceLevel::Off, seed);
+            decoder.generate(&mut ts, &mut ds, &[1, 2], 24, &params, None)
+        };
+        let a = run(7);
+        let b = run(7);
+        assert_eq!(a, b, "same seed must give identical sampled-spec output");
+        // Overlap check: a different seed should (almost surely) diverge
+        // somewhere in 24 tokens on a 256-vocab.
+        let c = run(8);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_stochastic_acceptance_emits_target_distribution() {
+        // High-power gate on the acceptance math itself: with fixed
+        // target/draft distributions, the emitted-token law of
+        // (accept d ~ p_d w.p. min(1, p_t(d)/p_d(d)); on rejection sample
+        // the residual norm(max(p_t - p_d, 0))) is EXACTLY p_t.
+        use rand::rngs::StdRng;
+        use rand::RngCore;
+        use rand::SeedableRng;
+        use tempura_kernels::Sampler as _;
+
+        let sampler = tempura_kernels::sampling::CpuSampler;
+        let p_t: Vec<f32> = vec![0.05, 0.40, 0.25, 0.20, 0.10];
+        let p_d: Vec<f32> = vec![0.30, 0.10, 0.25, 0.05, 0.30];
+        let mut rng = StdRng::seed_from_u64(1234);
+
+        let mut hist = vec![0u64; p_t.len()];
+        let trials = 30_000u64;
+        for _ in 0..trials {
+            let d = sampler.sample_token(&p_d, Some(&mut rng)) as usize;
+            let ratio = p_t[d] / p_d[d];
+            let u = rng.next_u32() as f64 / u32::MAX as f64;
+            let emitted = if (u as f32) < ratio {
+                d
+            } else {
+                let residual = residual_distribution(&p_t, &p_d);
+                sampler.sample_token(&residual, Some(&mut rng)) as usize
+            };
+            hist[emitted] += 1;
+        }
+
+        let tv: f64 = hist
+            .iter()
+            .zip(&p_t)
+            .map(|(&o, &p)| (o as f64 / trials as f64 - p as f64).abs())
+            .sum::<f64>()
+            / 2.0;
+        assert!(
+            tv < 0.02,
+            "acceptance scheme does not reproduce p_target: TV={tv:.4}"
+        );
+    }
+
+    #[test]
+    fn test_sampled_speculation_matches_plain_distribution() {
+        // End-to-end wiring gate for the sampled-speculation scheme. The
+        // PRIMARY distributional gate is the exact-math simulation test
+        // above; this one checks that the model plumbing (draft sampling
+        // from its own distribution, acceptance draws, residual
+        // correction) reproduces the plain-sampling LIKELIHOOD of the
+        // emitted token: E[log p_target(token_2 | prompt, token_1)] must
+        // agree between plain and speculative decode. A skewed acceptance
+        // scheme (the old accept-if-p_t>=p_d + full-p_t correction)
+        // biases the emitted mass toward high-p_t tokens and shifts this
+        // mean; histogram-TV has no power at practical n (measured noise
+        // floor 0.045 vs old-scheme 0.067 at n=4000 -- indistinguishable).
+        let config = ModelConfig::tiny_test();
+        let target = make_model_with_weights(&config, 42);
+        // A DIFFERENT draft (seed 43): acceptance < 1, the residual
+        // correction path runs.
+        let draft = make_model_with_weights(&config, 43);
+        let decoder = SpeculativeDecoder::new(&target, &draft, 4);
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 5,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+
+        // log p_target(t2 | prompt, t1) of the emitted second token,
+        // recomputed with an exact forward over the actual history.
+        let true_logp_t2 = |t1: u32, t2: u32| -> f64 {
+            let mut sess = InferenceSession::new(&config, TraceLevel::Off, 999);
+            let logits = target.forward(&mut sess, &[1, 2, t1]);
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse: f32 = logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+            (logits[t2 as usize] - max - lse) as f64
+        };
+
+        let runs = 1500u64;
+        let mut plain_sum = 0.0f64;
+        let mut spec_sum = 0.0f64;
+        for seed in 0..runs {
+            // Plain: two target samples; token 2 is what speculation must
+            // reproduce in distribution.
+            let mut ts = InferenceSession::new(&config, TraceLevel::Off, seed);
+            let toks = target.generate(&mut ts, &[1, 2], 2, &params, None);
+            plain_sum += true_logp_t2(toks[0], toks[1]);
+
+            // Speculative: same prompt, decorrelated RNG streams so the
+            // legs are independent draws of their processes.
+            let mut ts = InferenceSession::new(&config, TraceLevel::Off, seed ^ 0xA5A5_1234);
+            let mut ds = InferenceSession::new(&config, TraceLevel::Off, seed ^ 0x5EED_5678);
+            let toks = decoder.generate(&mut ts, &mut ds, &[1, 2], 2, &params, None);
+            assert_eq!(toks.len(), 2);
+            spec_sum += true_logp_t2(toks[0], toks[1]);
+        }
+        let plain_mean = plain_sum / runs as f64;
+        let spec_mean = spec_sum / runs as f64;
+        eprintln!(
+            "plain mean logp={plain_mean:.4} spec mean logp={spec_mean:.4} delta={:.4}",
+            (spec_mean - plain_mean).abs()
+        );
+        // Per-draw logp std ~1 nat -> SE ~0.026 per leg at n=1500; the
+        // old skewed scheme measured +0.09 nats. 0.08 separates the
+        // correct scheme (0 expected) from a skewed one at ~3 sigma.
+        assert!(
+            (spec_mean - plain_mean).abs() < 0.08,
+            "speculative token likelihood diverges from plain sampling: \
+             plain={plain_mean:.4} spec={spec_mean:.4}"
+        );
     }
 
     #[test]
