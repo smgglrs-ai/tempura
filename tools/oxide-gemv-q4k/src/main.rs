@@ -971,14 +971,16 @@ mod kernels {
         let packed_qi = qi0 | (qi1 << 8) | (qi2 << 16) | (qi3 << 24);
 
         // Lane 0 of each 4-group writes one packed u32 to out_qs.
-        // The guard/index math is u64: the Lean VC discharge is over u32
-        // modular arithmetic otherwise, where `q8_blk*32 < k` does NOT imply
+        // The write index is expressed as gid/4 (== q8_blk*8 + lane/4 for the
+        // lane%4==0 writers, since block=128 is a multiple of 4) and the guard
+        // math is u64: the Lean VC discharge is over u32 modular arithmetic
+        // otherwise, where `q8_blk*32 < k` does NOT imply
         // `q8_blk < out_ds.len()` (wraparound) and the no_oob proof fails.
         if lane % 4 == 0 {
-            let out_word_idx = (q8_blk as u64) * 8 + (lane as u64) / 4;
+            let gid = (bid as u64) * 128 + tid as u64;
             // Guard: only write if the first element of this word is in range.
             if (q8_blk as u64) * 32 + ((lane as u64) / 4) * 4 < k as u64 {
-                out_qs[out_word_idx as usize] = packed_qi;
+                out_qs[(gid / 4) as usize] = packed_qi;
             }
         }
         // Exact integer warp sum of the block's q8 values (|sum| <= 32*127
@@ -1002,6 +1004,7 @@ mod kernels {
         // Body is a byte-for-byte copy of the shared helper (including the
         // f16-subnormal normalization -- the 2026-10-28 bug fix).
         if lane == 0 && (q8_blk as u64) * 32 < k as u64 {
+            let gid = (bid as u64) * 128 + tid as u64;
             let bits = d.to_bits();
             let sign = (bits >> 16) & 0x8000;
             let exp = (bits >> 23) & 0xFF;
@@ -1019,7 +1022,8 @@ mod kernels {
             } else {
                 sign | (((exp - 127 + 15) as u32) << 10) | (mant >> 13)
             };
-            out_ds[q8_blk as usize] = h | ((sumqi & 0xFFFF) << 16);
+            // q8_blk == gid/32 exactly for the lane==0 writer (block=128).
+            out_ds[(gid / 32) as usize] = h | ((sumqi & 0xFFFF) << 16);
         }
     }
 
