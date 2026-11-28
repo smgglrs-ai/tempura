@@ -113,7 +113,6 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 
 /// Butterfly warp-reduce max over all 32 lanes (abs, for quantization scale).
 #[inline(always)]
-#[inline(always)]
 fn warp_reduce_max_f32(mut v: f32) -> f32 {
     let t = warp::shuffle_xor_f32(v, 16); if t > v { v = t; }
     let t = warp::shuffle_xor_f32(v, 8);  if t > v { v = t; }
