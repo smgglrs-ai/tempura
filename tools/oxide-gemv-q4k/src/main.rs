@@ -912,9 +912,12 @@ mod kernels {
     ///   violation class shipped the 2026-11-17 dual_block OOB reads (that
     ///   kernel is hand-written PTX, outside #[verify]'s reach; see
     ///   docs/status + kernels/AGENTS.md boundary report).
-    /// - `disjoint_writes(out_qs, out_ds)`: distinct 1D threads never write
-    ///   the same slot (lane%4==0 qs writers, lane==0 ds writer, one warp
-    ///   per Q8 block).
+    /// - `disjoint_writes` is NOT claimed: the write indices are derived
+    ///   packing positions (q8_blk*8 + lane/4), and MirDisjointWrites's
+    ///   witness automation only handles global-index-shaped maps
+    ///   (identity / len-1-idx). The 8-writers-per-warp packing pattern is
+    ///   outside the current grammar -- recorded in the boundary report
+    ///   (docs/status, 2026-11-28). Writes stay safe-indexed regardless.
     /// The previously-`unsafe` get_unchecked_mut writes are now safe indexed
     /// stores whose mir.assert bounds checks Lean proves redundant (and the
     /// backend erases before PTX lowering).
@@ -923,7 +926,7 @@ mod kernels {
         block = (128, 1, 1),
         requires = (x.len() >= k, out_ds.len() * 32 >= k, out_qs.len() >= out_ds.len() * 8),
     )]
-    #[verify(no_oob_idx(x, out_qs, out_ds), disjoint_writes(out_qs, out_ds))]
+    #[verify(no_oob_idx(x, out_qs, out_ds))]
     #[kernel]
     pub fn quantize_q8_1(
         out_qs: &mut [u32],  // [K/4] packed i8 activations
