@@ -19,10 +19,13 @@ gemma3/llama4 in from_gguf_name); what was missing is the QUIRKS:
      fallback (HF configs of MoE models carry no plain
      intermediate_size). No bias, SiLU, NEOX pairing — all inherited.
      REAL-MODEL VALIDATED: Qwen3-0.6B-Q8_0 (pulled to the fishtank
-     cache) loads + runs GPU and CPU; ppl vs llama.cpp 418f905 —
-     see the numbers + gate verdict in the run log
-     (/tmp/longtail-logs/ppl-qwen3.log on fishtank; the 1.10-ratio
-     pattern).
+     cache) loads + runs GPU and CPU; ppl vs llama.cpp 418f905:
+     tempura CPU 19.0673 vs llama 18.8857 = ratio 1.0096 PASS
+     (the 1.10-ratio pattern; 32x512-token wikitext-2 chunks,
+     8160 tokens, 0 NaN steps). GPU-side note: the cutile leg
+     PANICS on this model (gemm_d2d_slot rank error, tied-embed
+     lm_head shape -- cutile_gpu_forward.rs:4598, recorded
+     follow-up, /tmp/longtail-logs/ppl-qwen3.log on fishtank).
    * **Gemma-3** — the 5:1 sliding/global interleave (GGUF
      {arch}.attention.sliding_window_pattern + {arch}.rope.
      freq_base_swa; HF sliding_window_pattern + rope_local_base_freq)
@@ -57,10 +60,34 @@ gemma3/llama4 in from_gguf_name); what was missing is the QUIRKS:
      layer_sliding_window, layer_rope_theta, layer_attn_scale,
      layer_uses_rope) + 4 new fields (sliding_window_pattern,
      rope_theta_swa, attn_scale_denominator, no_rope_layer_step).
+   * **Gemma-3 REAL-MODEL VALIDATED**: gemma-3-1b-it Q4_K_M
+     (unsloth mix: q/k/gate/up Q5_0, v Q8_0, attn_output Q4_K,
+     ffn_down Q6_K/Q4_K) — tempura CPU ppl 27.0098 vs llama
+     26.9085 = ratio 1.0038 PASS (same corpus/chunking), greedy
+     generation coherent ("The capital of France is Paris. The
+     largest city..."). This flushed out TWO real bugs:
+     (a) the GGUF loader's private legacy-quant dequants
+     (Q4_0/Q4_1/Q5_0/Q5_1) read the 32-value blocks SEQUENTIALLY
+     (2j/2j+1) instead of ggml's SPLIT-HALF layout (qs[j] low
+     nibble = element j, high nibble = element j+16; qh bit i =
+     element i) -- every Q5_0 tensor in the model was silently
+     weight-permuted within each 32-element block (nll/token ~17,
+     garbage). FIXED to the split-half layout + pinned bit-exact
+     to the kernels crate's ggml reference by a random-block unit
+     test. NOTE: this bug affected ANY GGUF model with legacy-
+     quant tensors loaded through the f32-dequant route (Q4_0,
+     Q4_1, Q5_0, Q5_1, mixed-quant files) -- not gemma-specific.
+     The kernels crate's own dequant was always correct; the
+     C cross-validation only exercises that path.
+     (b) llama.cpp's rope_freq_base_train_swa DEFAULTS to 10000
+     when the GGUF omits {arch}.rope.freq_base_swa (the official
+     gemma-3 GGUFs do) -- fixed + the interleave-pattern defaults
+     (6/4) when attention.sliding_window_pattern is absent.
    * CPU gates: 6 new config tests + 2 forward tests (the interleave
      changes output vs full attention with identical weights AND is
      bit-deterministic; rope_theta_swa reaches the forward path).
-     Workspace suite (excl. bench-gpu, laptop): all green.
+     Workspace suite (excl. bench-gpu, laptop): all green (24 test
+     binaries, 0 failures).
 (2) SAMPLED SPECULATION (engine/src/speculative.rs) — the recorded
 follow-up "greedy-only leaves temperature>0 on plain decode" is
 CLOSED on the standalone-draft (SpeculativeDecoder) path: the standard

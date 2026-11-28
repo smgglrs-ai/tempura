@@ -318,16 +318,23 @@ Qwen3.6-27B weights** — see open work.
 
 **Models & loading**
 - [x] GGUF v3 (all ggml quant types incl. IQ2*/IQ3*/IQ4*, TQ1_0/TQ2_0, I2S,
-      PrismML Q1_0/Q2_0, BF16; mmap zero-copy I2S/F16 access)
+      PrismML Q1_0/Q2_0, BF16; mmap zero-copy I2S/F16 access);
+      2026-11-28 (longtail): the loader's private legacy-quant
+      dequants (Q4_0/Q4_1/Q5_0/Q5_1) FIXED to ggml's split-half
+      nibble layout (were sequential 2j/2j+1 -- silent per-block
+      weight permutation on every legacy-quant tensor; found via
+      gemma-3-1b's Q5_0 mix, pinned bit-exact to the kernels
+      reference by test)
 - [x] Safetensors (F32/BF16→MXFP4 tiling), HF config.json auto-detection
 - [x] Tokenizer: HF tokenizer.json, GGUF-metadata extraction, chat templates
       (Jinja2/HF), special-token registration
 - [x] 6 architecture families, 29 model_types mapped (see config.rs);
       2026-11-28 (branch longtail): Qwen3 dense+MoE (qk_norm, MoE keys,
-      real-model ppl-validated on Qwen3-0.6B) + Gemma-3 (5:1 sliding/
-      global interleave with per-layer rope base + query scale; f32 path
-      wired, quantized-decode SWA + paged-attention window = recorded
-      gaps) + Llama-4 config-level only (rope pairing/patterns parsed;
+      real-model ppl-validated on Qwen3-0.6B, CPU/llama ratio 1.0096)
+      + Gemma-3 (5:1 sliding/global interleave with per-layer rope base
+      + query scale, real-model ppl-validated on gemma-3-1b-it, ratio
+      1.0038; f32 prefill path wired, quantized-decode SWA +
+      paged-attention window = recorded gaps) + Llama-4 config-level only (rope pairing/patterns parsed;
       chunked attention + interleaved MoE NOT wired — do not claim
       support)
 - [x] Hybrid Attention/DeltaNet layers (gated delta rule, recurrent + chunk)
