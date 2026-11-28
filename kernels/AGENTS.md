@@ -161,6 +161,82 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from upstream and set `CUDA_OXIDE_BACKEND`.
 
+## Lean 4 kernel verification (`#[verify]`, cuda-oxide preview) — the tempura recipe
+
+Upstream cuda-oxide (>= ab2b6738 "compile-time Lean 4 kernel verification
+(#1851)", hardened through b9e9c240c) can PROVE Rust-level oxide kernels at
+compile time: `no_oob_idx` (bounds), `disjoint_writes` (write-slot
+exclusivity), `no_data_race`/`uniform_barriers` (shared memory + barriers),
+`tmem_lifecycle`. Proven `mir.assert` bounds checks are ERASED before PTX
+lowering, so a verified kernel's PTX has zero trap branches. First tempura
+kernel verified this way: `quantize_q8_1` in tools/oxide-gemv-q4k (2026-11-28).
+
+Prerequisites (LAPTOP works for `cargo oxide lean-export`; full
+`cargo oxide build` needs the CUDA toolkit — run it on fishtank):
+
+```sh
+# 1. Lean 4.33.1 via elan (once per host):
+curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+~/.elan/bin/elan toolchain install leanprover/lean4:v4.33.1
+
+# 2. Build the CudaOxide Lean library (once, ~1 min; cached in .lake/):
+export PATH="$HOME/.elan/bin:$PATH"
+cd ~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/oxide-proofs-preview && lake build
+
+# 3. cargo-oxide >= 0.4.0 (the stock ~/.cargo/bin one may be older — install a
+#    private copy rather than disturbing the shared one):
+cd ~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide && \
+  cargo install --path crates/cargo-oxide --root ~/my-cargo-root --force
+
+# 4. Verify (fast loop, no GPU/toolkit needed — MIR + generated Lean only):
+cd tools/oxide-gemv-q4k && PATH=~/my-cargo-root/bin:$PATH:$HOME/.elan/bin:... \
+  CUDA_OXIDE_BACKEND=... RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 \
+  cargo oxide lean-export        # FAILS CLOSED on unsupported MIR / bad contracts
+
+# 5. The real gate (runs `lake env lean` inline, erases proven checks, emits
+#    PTX; needs the CUDA toolkit — fishtank):
+cd tools/oxide-gemv-q4k && cargo oxide build
+#    Success prints: "[lean-verifier] Verified kernel `...`" + the proved
+#    clauses + "bounds elided: N ...".
+```
+
+Authoring rules learned the hard way (each cost a debug round, 2026-11-28):
+
+1. **Signature**: outputs as `&mut [T]` (NOT `DisjointSlice`) when write
+   indices are derived — `DisjointSlice`'s safe accessor only accepts the
+   thread's own 1D coordinate, and `&mut [T]` keeps the identical {ptr, len}
+   ABI so the tempura host wrapper's raw launch is unchanged. `&mut [T]`
+   REQUIRES claiming `disjoint_writes` in the contract.
+2. **Helpers**: `#[inline(always)]` helpers are MIR-inlined only if SMALL
+   (a few statements; `f32_to_f16_bits` at ~25 stmts is NOT — expand such
+   bodies manually in the verified kernel). Helpers that call
+   `#[inline(never)]` intrinsics (the shuffle butterfly) are never inlined
+   — expand inline, or call the whitelisted `cuda_device` wrappers
+   (`warp::shuffle_xor_f32` etc.) directly.
+3. **Index math in u64**: u32 index arithmetic is verified MOD 2^32 —
+   `q8_blk*32 < k` does not imply `q8_blk < len` under wraparound and the
+   no_oob VC fails. Cast to u64 before the guard/index expressions.
+4. **Write indices for `disjoint_writes`**: express them as exact divisions
+   of the global thread index guarded by the matching mod condition
+   (e.g. `gid/4` written by `lane%4==0` threads, `gid/32` by `lane==0`;
+   block size must be a multiple). Arbitrary derived packing indices
+   (e.g. `q8_blk*8 + lane/4` chained from a differently-shaped guard) fail
+   the witness automation.
+5. **requires grammar**: `slice.len()`, u32 scalars, literals, `+ - *`,
+   all 6 comparisons (e.g. `out_qs.len() >= out_ds.len() * 8`). Division
+   is NOT supported.
+6. **Verification is additive**: the runtime gates (bench-decode-ops,
+   bench-probe-*, sanitizer-gate) must still pass with the verified PTX —
+   a kernel with a passing Lean contract AND green runtime probes is
+   strictly better. A/B the outputs against the old PTX when the
+   guards were reformulated (tempura's probes print exact values).
+
+Scope today: Rust-level `#[cuda_module]` kernels only. The hand-written
+PTX-string kernels (q4k_gemv_v4_ptx.rs, q4k_mmq_*, q6k_*, kv_scatter_write)
+and the raw-pointer oxide kernels (oxide-decode-attn's `*mut f32` +
+device-side run-base indirection) are OUTSIDE the grammar — see the boundary
+report in docs/status/current.md (2026-11-28).
+
 FIXED (2026-11-17): the hand-written q4k_mma_batch / q4k_streamk_batch PTX
 kernels were numerically WRONG from their introduction until 2026-11-16
 (misparse the Q4K sub-block nibble/scale layout AND used an invented

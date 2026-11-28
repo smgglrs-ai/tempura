@@ -248,7 +248,16 @@ locally.
      function names between source and Verus re-declarations
    - **Cross-validation** against llama.cpp itself via C-generated vectors
      (`tests-ggml/`)
-   - cuda-oxide and NVIDIA hardware are trusted infrastructure (like rustc/CPU)
+   - **Lean 4 (`#[verify]`, cuda-oxide preview)** proves Rust-level OXIDE
+     kernels at compile time — `no_oob_idx`, `disjoint_writes`,
+     `no_data_race`, `uniform_barriers` — and erases the proven bounds
+     checks before PTX lowering (first verified kernel: `quantize_q8_1`,
+     2026-11-28; recipe + boundary report in kernels/AGENTS.md and
+     docs/status). Hand-written PTX kernels and raw-pointer oxide kernels
+     remain trusted-infrastructure/beyond the grammar today.
+   - cuda-oxide's PTX codegen and NVIDIA hardware are trusted infrastructure
+     (like rustc/CPU); the Lean verification sits INSIDE the cuda-oxide
+     build, so its TCB adds only the lean-exporter + Lean kernel.
 
 4. **Inference traces are first-class.** Every forward pass produces a
    structured `InferenceTrace` at configurable granularity. The API exposes

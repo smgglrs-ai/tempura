@@ -5,6 +5,86 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-28 (cuda-oxide `#[verify]` ADOPTED: the PTX-layer
+verification gap is now PARTIALLY CLOSED — `quantize_q8_1`
+(tools/oxide-gemv-q4k) is tempura's first Lean-4-VERIFIED oxide kernel,
+`no_oob_idx(x, out_qs, out_ds)` + `disjoint_writes(out_qs, out_ds)`
+proved at compile time with 3 mir.assert bounds checks ERASED before PTX
+lowering, all runtime gates green + outputs A/B byte-identical vs the
+old PTX; the adoption recipe + the honest boundary report below).**
+Work: branch `verify-adoption`, worktree ../tempura-verify; upstream
+cuda-oxide at b9e9c240c (the #1851 `#[verify]` preview + the hardening
+chain through the full launch_contract requires grammar).
+
+1. **WHAT WAS PROVED.** `quantize_q8_1` quantizes f32 activations to the
+   Q8_1 packed format (the activation side of EVERY q4k/q6k GEMV and mmq
+   launch; its ds-word layout change was the 2026-11-18 follow-up; the
+   OOB class it guards against is the 2026-11-17 dual_block bug class).
+   The contract:
+   `#[launch_contract(domain=1, block=(128,1,1), requires=(x.len() >= k,
+   out_ds.len()*32 >= k, out_qs.len() >= out_ds.len()*8))]` +
+   `#[verify(no_oob_idx(x, out_qs, out_ds), disjoint_writes(out_qs,
+   out_ds))]`. Lean 4.33.1 (via elan, the CudaOxide library in
+   cuda-oxide/oxide-proofs-preview) discharged every VC with 0 sorryAx;
+   the backend erased the 3 proven bounds checks. The kernel's two
+   `unsafe get_unchecked_mut` stores became safe indexed stores —
+   the exact pattern the capability exists for.
+
+2. **RUNTIME GATES (fishtank, RTX 5090, all with the VERIFIED PTX
+   loaded).** bench-decode-ops: 97 PASS / 0 FAIL; bench-probe-q4k-batch:
+   PASS; compute-sanitizer memcheck over both: 0 errors; A/B vs the old
+   PTX (main tree binary): every q8/quantize-related printed value
+   byte-identical (only timing jitter differs). The PTX entry ABI is
+   unchanged (`&mut [u32]` and `DisjointSlice` both lower to {ptr, len};
+   only the pointer alignment attribute became more precise).
+
+3. **THE BOUNDARY REPORT (upstream-feedback document — what the current
+   grammar CANNOT express for tempura's kernels):**
+   - **Hand-written PTX-string kernels are outside entirely** —
+     `q4k_gemv_sm120_kpar8_dual_block` (the OOB-read bug),
+     `q4k_mmq_batch_sm120` + j64/j128 (bank-conflict padding, k-split),
+     `q6k_mmq_batch_sm120` (SWAR unpack), `kv_scatter_write*`. The
+     fragment-mapping invariants (the invented-mapping bug class) have
+     no contract clause at all today; these would need PTX-level
+     verification (a different layer than #1851's MIR-level).
+   - **Raw-pointer oxide kernels fail closed**: oxide-decode-attn's
+     `oxide_decode_attn*` take `*mut f32` / `*const u64` (per-request
+     device-resident run-base pointers + device-read kv_lens — the
+     frozen-position-RoPE fix design). Verifying them needs a
+     re-signature to slices with explicit length params (a real
+     refactor; the device indirection itself may never be expressible).
+   - **Helper-inlining budget**: `#[inline(always)]` helpers past a few
+     statements are NOT MIR-inlined at the PostMem2Reg pause
+     (`f32_to_f16_bits`, ~25 stmts, had to be expanded manually; helpers
+     calling `#[inline(never)]` shuffle intrinsics are never inlined).
+     Kernels with large dequant helpers (`q4k_gemv_decode`'s
+     `unpack_scales_6bit`) need manual expansion before they can be
+     verified — mechanical but invasive.
+   - **u32 index math is verified modulo 2^32**: guards like
+     `q8_blk*32 < k` cannot imply `q8_blk < len` (wraparound) — all
+     guard/index arithmetic must be lifted to u64.
+   - **`disjoint_writes` witness automation handles only
+     global-index-shaped write maps** (identity, len-1-idx, and —
+     discovered this round — exact guarded divisions like gid/4 by
+     lane%4==0 writers). Arbitrary derived packing indices fail.
+   - **`requires` grammar**: no division (`out_qs.len() >= k/4` is
+     inexpressible; used `out_ds.len()*32 >= k` instead).
+   - **Verdict**: the capability is genuinely useful TODAY for
+     slice-based Rust oxide kernels with simple write maps (the
+     quantizer, the elementwise/cast kernels), and every fail-closed
+     error message was precise and actionable. The bug-history
+     priority kernels mostly live past the boundary.
+
+4. **FOLLOW-UPS (recorded, not done):** (a) verify the remaining
+   slice-based kernels in oxide-gemv-q4k/q6k (each needs the helper
+   expansion + u64 index lift); (b) upstream conversation: PTX-level
+   contracts for the hand-written kernels, a `div` in requires, a
+   fragment-mapping clause; (c) authoring features (`#[device(export)]`,
+   256-input ptx_asm!) untouched this round — the host wrappers' manual
+   symbol export remains the candidate.
+
+## Latest session status
+
 **STATUS 2026-11-27 (EAGLE-3 verify-cost round — the wall DECOMPOSED and
 it is NOT what the recorded follow-ups assumed: the verify already
 replays a CUDA graph, the "~13+2m ms no-graph batch-path fixed cost"
