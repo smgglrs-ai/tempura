@@ -443,6 +443,50 @@ fn main() {
                 );
             }
 
+            // 1b) The ROWS-PARALLEL batch kpar8 kernel (grid (m, n)): MUST
+            //     also be bit-identical to the per-row reference (each CTA
+            //     runs the single-row kpar8 warp structure for its row).
+            //     This is the gate for the default no-graph batch dispatch.
+            {
+                let out = Arc::new(
+                    api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
+                );
+                let mut launch_err = None;
+                let mut row = 0usize;
+                while row < m {
+                    let rows = (m - row).min(16);
+                    let res = oxide.forward_sm120_kpar_batch_rp_d2d_rows(
+                        &x, row, &packed, &out, row, rows, n, k_blocks, &x_qs, &x_ds,
+                    );
+                    if let Err(e) = res {
+                        launch_err = Some(e);
+                        break;
+                    }
+                    row += rows;
+                }
+                if let Some(e) = launch_err {
+                    any_fail = true;
+                    println!("  {label} m={m} kpar8_batch_rp: FAIL (launch error: {e})");
+                } else {
+                    let got = out.to_host_vec().sync_on(&stream).expect("out download");
+                    let mut exact = true;
+                    for r in 0..m {
+                        for c in 0..n {
+                            if got[r * n + c].to_bits() != ref_rows[r][c].to_bits() {
+                                exact = false;
+                            }
+                        }
+                    }
+                    if !exact {
+                        any_fail = true;
+                    }
+                    println!(
+                        "  {label} m={m} kpar8_batch_rp: {} (bit-identical to per-row kpar8)",
+                        if exact { "OK" } else { "MISMATCH" }
+                    );
+                }
+            }
+
             // 2) mma_batch / streamk: tensor-core paths. The mma.sync int8
             //    products are exact; only the f32 sum ORDER may differ from
             //    the per-row reference (K-parallel warp partials vs the kpar

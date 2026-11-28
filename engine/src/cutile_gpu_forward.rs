@@ -5615,6 +5615,9 @@ impl CutileGpuModel {
                 // TEMPURA_Q4K_BATCH_KERNEL selects the batch kernel for the
                 // no-graph path (measurement/routing switch, 2026-11-17):
                 //   unset/"kpar" -> kpar8 batch (bit-identical per row; default)
+                //   "rp"         -> rows-parallel kpar8 batch, grid (m, n)
+                //                   (bit-identical per row; measured WASH at
+                //                   small m -- see the 2026-11-27 status entry)
                 //   "mma"        -> mma.sync tensor-core kernel (sum-order-only
                 //                   divergence, probe-gated at 1e-5)
                 //   "streamk"    -> stream-K persistent kernel (same gate)
@@ -5623,7 +5626,23 @@ impl CutileGpuModel {
                 // m=1 breaks batch-composition invariance (the 6-client A/B
                 // byte-identity gate). Measurement-only until that decision.
                 let sel = std::env::var("TEMPURA_Q4K_BATCH_KERNEL").unwrap_or_default();
-                let res = if sel == "mma" {
+                // Rows-parallel kpar8 batch (grid (m, n)): bit-identical per
+                // row to the m-loop kpar8 batch, rows spread across CTAs.
+                // MEASURED WASH at m=4 (2026-11-27, the EAGLE verify profile):
+                // gate/up 94.7 us vs the m-loop's 85 (the m sibling CTAs'
+                // weight re-reads do NOT L2-share), k/v 7.7 vs 9.6, q/o wash
+                // -- the m-loop kernel is per-thread COMPUTE-bound (m rows
+                // cost ~m x in any per-row-bit-identical organization), so
+                // parallelizing the rows only multiplies the weight traffic.
+                // Opt-in measurement switch, like the ffma/h2 epilogue
+                // washes; the m-loop kpar8 batch stays the default.
+                let use_rp = sel == "rp";
+                let res = if use_rp {
+                    oxide.forward_sm120_kpar_batch_rp_d2d_rows(
+                        &act, row_start, &dw.tensor, &out, row_start, rows, n, dw.k_blocks,
+                        &x_qs, &x_ds,
+                    )
+                } else if sel == "mma" {
                     oxide.forward_mma_batch_d2d_rows(
                         &act, row_start, &dw.tensor, &out, row_start, rows, n, dw.k_blocks,
                         &x_qs, &x_ds,

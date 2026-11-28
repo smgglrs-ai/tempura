@@ -131,6 +131,14 @@ pub struct OxideQ4kGemv {
     /// Q4K projection kernel).
     cu_sm120_kpar_batch_module: Option<CUmodule>,
     cu_sm120_kpar_batch:        Option<CUfunction>,
+    /// Rows-parallel variant of the M-row batch kpar8 GEMV (grid (m, n)):
+    /// each CTA runs the single-row kpar8 structure for its row; sibling
+    /// CTAs share the weight row through L2.  Per-row math bit-identical
+    /// to [`Self::cu_sm120_kpar_batch`] (and to the per-row kpar8 launch);
+    /// faster at small m where the m-loop kernel goes compute-bound
+    /// (the EAGLE spec-verify wall, 2026-11-27).
+    cu_sm120_kpar_batch_rp_module: Option<CUmodule>,
+    cu_sm120_kpar_batch_rp:        Option<CUfunction>,
     /// SM count stored at load time (from CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).
     sm_count:                   u32,
     /// Selected Q4K+Q8_1 kpar dispatch function: sm120 or dp4a_kpar8 (sm_80) fallback.
@@ -202,6 +210,11 @@ impl Drop for OxideQ4kGemv {
             }
         }
         if let Some(m) = self.cu_sm120_kpar_batch_module {
+            if !m.is_null() {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+        }
+        if let Some(m) = self.cu_sm120_kpar_batch_rp_module {
             if !m.is_null() {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
@@ -790,6 +803,42 @@ impl OxideQ4kGemv {
                 None
             };
 
+            // Rows-parallel variant of the batch kpar8 (grid (m, n)): same
+            // per-row numerics, rows spread across CTAs -- the m-loop
+            // kernel is compute-bound at small m (EAGLE verify, 2026-11-27).
+            let mut cu_kpar_batch_rp_mod: Option<CUmodule> = None;
+            let cu_sm120_kpar_batch_rp: Option<CUfunction> = if !sm120_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {
+                let ptx_cstr = CString::new(q4k_gemv_v4_ptx::PTX_BATCH_RP).unwrap_or_default();
+                let mut kb_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        kb_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let kb_mod = unsafe { kb_mod.assume_init() };
+                    let entry = CString::new(q4k_gemv_v4_ptx::ENTRY_BATCH_RP).unwrap_or_default();
+                    let mut kb_fn = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(kb_fn.as_mut_ptr(), kb_mod, entry.as_ptr())
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        cu_kpar_batch_rp_mod = Some(kb_mod);
+                        Some(unsafe { kb_fn.assume_init() })
+                    } else {
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(kb_mod) };
+                        eprintln!("oxide-gemv-q4k: cuModuleGetFunction(kpar8_batch_rp) failed (rc={rc2})");
+                        None
+                    }
+                } else {
+                    eprintln!("oxide-gemv-q4k: cuModuleLoadData(kpar8_batch_rp PTX) failed (rc={rc})");
+                    None
+                }
+            } else {
+                None
+            };
+
             // -- Build KernelVariant table and select best kpar dispatch ---------
             // (select_best = max min_cc; ties resolve to the LAST pushed entry,
             // so the dual-block unroll wins over single-block kpar8 on sm_120.)
@@ -848,7 +897,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_mmq_batch_j64, cu_mmq_batch_j128, cu_mmq_ffma_j128, cu_mmq_h2_j128, mmq_epilogue: if epilogue_sel == "ffma" { 1 } else if epilogue_sel == "h2" { 2 } else { 0 }, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_mma128_batch_module: cu_mma128_mod, cu_mma128_batch, cu_mma128w_batch_module: cu_mma128w_mod, cu_mma128w_batch, cu_mmq_batch_module: cu_mmq_mod, cu_mmq_batch, cu_mmq_reduce, cu_mmq_batch_j64, cu_mmq_batch_j128, cu_mmq_ffma_j128, cu_mmq_h2_j128, mmq_epilogue: if epilogue_sel == "ffma" { 1 } else if epilogue_sel == "h2" { 2 } else { 0 }, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, cu_sm120_kpar_batch_rp_module: cu_kpar_batch_rp_mod, cu_sm120_kpar_batch_rp, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -3008,6 +3057,130 @@ impl OxideQ4kGemv {
 
         // No stream.synchronize() -- caller owns the sync.
         Ok(())
+    }
+
+    /// Rows-parallel M-row batch Q4K GEMV (grid (m, n)): each CTA computes
+    /// ONE row's output neuron with the per-row kpar8 warp structure
+    /// (bit-identical per row to [`Self::forward_sm120_kpar_batch_d2d_rows`]
+    /// and to the per-row kpar8 launch).  Sibling CTAs (same neuron, the m
+    /// consecutive linear block ids) are co-resident and share the weight
+    /// row through L2 -- the m-loop batch kernel is compute-bound at small
+    /// m (~2.9x the per-row cost at m=4, the EAGLE verify wall), this
+    /// variant keeps the m=1 bandwidth-bound shape at any m.
+    pub fn forward_sm120_kpar_batch_rp_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 16 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_rp_d2d_rows: m must be in 1..=16; got {m}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_rp_d2d_rows: x slice [{x_row}, {}+{m}) x {k} exceeds \
+                 tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_rp_d2d_rows: out slice [{out_row}, {}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+        let batch_fn = match self.cu_sm120_kpar_batch_rp {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("sm120 kpar8 batch_rp not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+        let cu_stream = self.stream.cu_stream();
+
+        // Quantize the window's m*K activations in one call (async; the
+        // per-32-element blocks never cross a row boundary -- identical to
+        // per-row quantization, same as the m-loop batch path).
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr: u64 = x.device_pointer().cu_deviceptr() + x_row_bytes as u64;
+            let x_len: u64 = x.size() as u64 - (x_row_bytes / 4) as u64;
+            let k_u32: u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &x_len as *const _ as *mut c_void,
+                &k_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 kpar8_batch_rp: {e}")))?;
+        }
+
+        // Launch the rows-parallel batch kpar8 kernel: grid (m, n) --
+        // blockIdx.x = activation row, blockIdx.y = output neuron (the m
+        // sibling CTAs of one neuron are consecutive in linear block
+        // order, so they are co-resident and L2-share the weight row).
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let n_u32: u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 6] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32 as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel(
+                    batch_fn,
+                    (m as u32, n_u32, 1),
+                    (256, 1, 1),  // 8 warps (kpar8 structure)
+                    0,            // static smem in PTX (128 bytes)
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("kpar8_batch_rp q4k gemv: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
+        Ok(())
+    }
+
+    /// True when the rows-parallel batch kpar8 kernel is loaded.
+    pub fn has_sm120_kpar_batch_rp(&self) -> bool {
+        self.cu_sm120_kpar_batch_rp.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Returns true when ANY kpar dispatch kernel is available (sm120 or dp4a_kpar8 fallback).
