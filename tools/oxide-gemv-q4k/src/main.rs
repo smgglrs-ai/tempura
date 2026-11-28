@@ -32,7 +32,7 @@
  *   The 4 j-groups are fully unrolled, each processing 2 elements per lane.
  */
 
-use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, ptx_asm, thread, warp};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, launch_contract, ptx_asm, thread, verify, warp};
 // NOTE: dp4a_s32 requires the upstream oxide backend (cuda-oxide/crates/rustc-codegen-cuda)
 // which includes dp4a in its intrinsic catalog. The fork backend (crates/rustc-codegen-cuda)
 // does not. Build q4k_gemv_decode_q8 only when the upstream backend is available.
@@ -112,6 +112,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 }
 
 /// Butterfly warp-reduce max over all 32 lanes (abs, for quantization scale).
+#[inline(always)]
 #[inline(always)]
 fn warp_reduce_max_f32(mut v: f32) -> f32 {
     let t = warp::shuffle_xor_f32(v, 16); if t > v { v = t; }
@@ -910,6 +911,26 @@ mod kernels {
     ///
     /// Grid:  (ceil(K/32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK blocks
     /// Block: WARPS_PER_BLOCK * 32 threads
+    ///
+    /// Lean 4 verification (2026-11-28, cuda-oxide #[verify] preview):
+    /// - `no_oob_idx(x, out_qs, out_ds)`: every access stays in bounds given
+    ///   the launch requires (`x.len() >= k`, `out_ds.len() * 32 >= k`,
+    ///   `out_qs.len() >= out_ds.len() * 8`) -- the SAME invariant whose
+    ///   violation class shipped the 2026-11-17 dual_block OOB reads (that
+    ///   kernel is hand-written PTX, outside #[verify]'s reach; see
+    ///   docs/status + kernels/AGENTS.md boundary report).
+    /// - `disjoint_writes(out_qs, out_ds)`: distinct 1D threads never write
+    ///   the same slot (lane%4==0 qs writers, lane==0 ds writer, one warp
+    ///   per Q8 block).
+    /// The previously-`unsafe` get_unchecked_mut writes are now safe indexed
+    /// stores whose mir.assert bounds checks Lean proves redundant (and the
+    /// backend erases before PTX lowering).
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (x.len() >= k, out_ds.len() * 32 >= k, out_qs.len() >= out_ds.len() * 8),
+    )]
+    #[verify(no_oob_idx(x, out_qs, out_ds), disjoint_writes(out_qs, out_ds))]
     #[kernel]
     pub fn quantize_q8_1(
         mut out_qs: DisjointSlice<u32>,  // [K/4] packed i8 activations
@@ -948,7 +969,7 @@ mod kernels {
             let out_word_idx = q8_blk * 8 + lane / 4;
             // Guard: only write if the first element of this word is in range.
             if q8_blk * 32 + (lane / 4) * 4 < k {
-                unsafe { *out_qs.get_unchecked_mut(out_word_idx as usize) = packed_qi; }
+                out_qs[out_word_idx as usize] = packed_qi;
             }
         }
         // Exact integer warp sum of the block's q8 values (|sum| <= 32*127
@@ -966,11 +987,9 @@ mod kernels {
             delta /= 2;
         }
         // Lane 0 writes the f16 scale + the rowsum.
-        if lane == 0 {
-            unsafe {
-                *out_ds.get_unchecked_mut(q8_blk as usize) =
-                    (f32_to_f16_bits(d) as u32) | ((sumqi & 0xFFFF) << 16);
-            }
+        if lane == 0 && elem < k {
+            out_ds[q8_blk as usize] =
+                (f32_to_f16_bits(d) as u32) | ((sumqi & 0xFFFF) << 16);
         }
     }
 
