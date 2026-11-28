@@ -114,7 +114,19 @@ measured 0.006 vs 0.005 — so histogram/likelihood tests at practical
 n have NO power; the exact-math gate is the real one, the likelihood
 gate checks the wiring); (c) per-seed determinism (same seed ->
 identical output). Kani harnesses for the residual (in-bounds,
-normalized) and the acceptance ratio. (3) SCOPE of the sampled-spec
+normalized) and the acceptance ratio. (3) REAL-MODEL VALIDATION of the sampled-spec path
+(tools/bench-gpu/src/bin/spec_probe, fishtank): target
+Qwen3-0.6B-Q8_0 + draft Qwen2.5-0.5B-Instruct-Q8_0 (same 151936
+vocab; draft pulled to /data/models -- the new fishtank model
+store, 3.7TB NVMe; ~/.cache/tempura/models stays valid for
+reads), temp 0.8 / top-k 40 / top-p 0.95, K=4, 8 seeds x 48
+tokens: DETERMINISM PASS (same seed -> byte-identical 48-token
+run); LIKELIHOOD PASS (mean logp plain -1.3240 vs spec -1.2510,
+delta 0.073 < 0.25 gate -- within 1 SE at n=384/leg);
+acceptance 184/745 = 0.247 (a weak-draft pair by design: the
+rejection + residual-correction path is heavily exercised).
+Run log: /tmp/longtail-logs/spec-probe.log on fishtank.
+(3b) SCOPE of the sampled-spec
 work: the standalone-draft CPU path (v1 machinery). The SERVING batch
 spec path + EAGLE remain greedy-only — extending stochastic
 acceptance there needs the verify forward to expose per-row
