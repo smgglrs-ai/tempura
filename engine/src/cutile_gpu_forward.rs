@@ -893,6 +893,19 @@ pub struct CutileGpuModel {
     /// path allocated it per call with api::zeros.sync_on -- illegal during
     /// graph capture). Stable address; the D->D row copy writes into it.
     prefill_last_row: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Shared-quantize group flag: set by the prefill layer loop around the
+    /// q/k/v and gate/up projection groups (same input activation), so the
+    /// Q8_1 quantize inside the mmq GEMM wrappers can be computed ONCE per
+    /// group and reused by the sibling projections. Off everywhere else --
+    /// no other call site can consult the cache.
+    quant_share_active: Cell<bool>,
+    /// Quantized activations for the current shared-quantize group, keyed
+    /// (activation device ptr, row-window offset, k). Entries are only
+    /// valid while `quant_share_active` is true (the prefill loop clears
+    /// the map at every group boundary), so a reused norm scratch buffer
+    /// can never produce a stale hit.
+    quant_share_cache:
+        RefCell<HashMap<(usize, usize, usize), (Arc<Tensor<u32>>, Arc<Tensor<u32>>)>>,
 
     // -- Multi-stream QKV concurrency ------------------------------------------
     //
@@ -2909,6 +2922,8 @@ impl CutileGpuModel {
             cached_prefill_graph: RefCell::new(None),
             prefill_last_key: RefCell::new(None),
             prefill_last_row: RefCell::new(None),
+            quant_share_active: Cell::new(false),
+            quant_share_cache: RefCell::new(HashMap::new()),
             greedy_argmax,
             greedy_out,
             stream_kv,
@@ -3372,6 +3387,8 @@ impl CutileGpuModel {
             cached_prefill_graph: RefCell::new(None),
             prefill_last_key: RefCell::new(None),
             prefill_last_row: RefCell::new(None),
+            quant_share_active: Cell::new(false),
+            quant_share_cache: RefCell::new(HashMap::new()),
             greedy_argmax,
             greedy_out,
             stream_kv,
@@ -6625,21 +6642,45 @@ impl CutileGpuModel {
                         splits = 1;
                     }
                     splits = splits.min(dw.k_blocks);
-                    // 2026-11-21 grid-fill lever: small-n shapes leave the
-                    // machine idle (q/o_proj 128 CTAs = 75% of 170 SMs,
-                    // k_proj 32 CTAs = 19% -- it runs at the same latency as
-                    // n=4096). Split K across grid.z so the (x,y) tile count
-                    // times splits reaches >= 2 CTAs/SM; the fixed-order
-                    // reduce combines the partials (deterministic; sum-order
-                    // class change gated by the mmq probe's split arms).
-                    // TEMPURA_Q4K_MMQ_SPLIT=0 bisects off (S=1 everywhere).
-                    // S depends ONLY on n (never the runtime m/rows): a
-                    // smaller final chunk must not change the sum order of
-                    // the same token's row (composition invariance, the
-                    // bench-ab-repro composition gate). The pre-2026-11-22
-                    // rule (slots < 256 -> S = round(640/slots), else 3)
-                    // was calibrated at J=32; the (J, S) table above
-                    // replaces it.
+                    // 2026-11-28 shared-quantize groups: q/k/v and gate/up
+                    // project the SAME activation, so the Q8_1 quantize is
+                    // computed ONCE per (activation ptr, row window, k) and
+                    // the sibling GEMMs replay the cached qs/ds through the
+                    // _prequant entry points (same kernel, same operands --
+                    // byte-identical outputs). Scoped by
+                    // `quant_share_active`, set only around the two call
+                    // groups in the prefill layer loop; every other path
+                    // quantizes per call exactly as before.
+                    let share = self.quant_share_active.get();
+                    let key = (
+                        a.device_pointer().cu_deviceptr() as usize,
+                        row,
+                        k,
+                    );
+                    let cached = if share {
+                        self.quant_share_cache.borrow().get(&key).cloned()
+                    } else {
+                        None
+                    };
+                    let (qs_use, ds_use) = match cached {
+                        Some(pair) => pair,
+                        None => {
+                            oxide
+                                .quantize_q8_1_window(a, row, &x_qs, &x_ds, rows, k)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "q4k prefill quantize {weight_name} rows {row}..{}: {e}",
+                                        row + rows
+                                    )
+                                });
+                            if share {
+                                self.quant_share_cache
+                                    .borrow_mut()
+                                    .insert(key, (x_qs.clone(), x_ds.clone()));
+                            }
+                            (x_qs.clone(), x_ds.clone())
+                        }
+                    };
                     if splits > 1 {
                         let partials = {
                             let mut pool = self.nograph.borrow_mut();
@@ -6654,13 +6695,14 @@ impl CutileGpuModel {
                                 })
                                 .clone()
                         };
-                        oxide.forward_mmq_split_batch_d2d_rows(
-                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds,
+                        oxide.forward_mmq_split_batch_d2d_rows_prequant(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &qs_use, &ds_use,
                             splits, &partials, j,
                         )
                     } else {
-                        oxide.forward_mmq_batch_d2d_rows(
-                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &x_qs, &x_ds, j,
+                        oxide.forward_mmq_batch_d2d_rows_prequant(
+                            a, row, &dw.tensor, &out, row, rows, n, dw.k_blocks, &qs_use, &ds_use,
+                            j,
                         )
                     }
                 }
@@ -8716,9 +8758,16 @@ impl CutileGpuModel {
                 // For Q2_0 models: gemm_any_d2d_slot dequantizes on-GPU (m=1 only).
                 // For f32 models: same path as before, synchronous.
                 // For prefill (m>1): Q2_0 falls back to dequantized f32 GEMM.
+                // Shared-quantize group: q/k/v project the same normed
+                // activation -- the mmq wrappers quantize it ONCE (cache
+                // keyed by the activation pointer, cleared at the group
+                // boundary below; byte-identical outputs).
+                self.quant_share_active.set(true);
                 let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
                 let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
                 let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+                self.quant_share_active.set(false);
+                self.quant_share_cache.borrow_mut().clear();
                 // QKV biases (Qwen2/Phi) -- this prefill path bypasses
                 // dispatch_qkv_multistream, so apply here (before rope).
                 let bias_of =
@@ -9114,6 +9163,13 @@ impl CutileGpuModel {
                 // gemm+SiLU-epilogue variant (reads the gate projection's output
                 // in the store epilogue -- eliminates the separate silu_mul
                 // kernel's re-read of the up matrix); falls back wholesale.
+                // Shared-quantize group: gate/up project the same normed2
+                // activation (same cache discipline as the QKV group above).
+                // The flag stays ON through the up GEMM (nested in the
+                // silu-epilogue match below); nothing between the two GEMMs
+                // consults the cache. Cleared after the binding, before
+                // down_proj (whose silu output is a fresh activation).
+                self.quant_share_active.set(true);
                 let gate_dev =
                     self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
                 let (gate_silu_n_dev, up_dev_dbg) = if seq_len > 1
@@ -9181,6 +9237,8 @@ impl CutileGpuModel {
                     };
                     (act, Some(up_dev))
                 };
+                self.quant_share_active.set(false);
+                self.quant_share_cache.borrow_mut().clear();
                 if self.debug_nan_trace {
                     self.nan_report(&format!("L{layer} post-attn-hidden"), &hidden_dev);
                     self.nan_report(&format!("L{layer} post-attn-norm"), &normed2_dev);
@@ -9468,8 +9526,90 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: final RMSNorm failed")
         };
 
-        let logits_dev = self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS);
+        // Prefill lm_head over the LAST row only. MEASURED WASH
+        // (2026-11-28): the q6k mmq kernel at m=1 (n=128256 -> 1002 CTAs)
+        // matches the kpar GEMV's ~0.43 ms end-to-end -- the per-CTA
+        // cp.async staging + barrier chain does not amortize over a single
+        // token. OPT-IN via TEMPURA_LM_HEAD_MMQ=1 (kept for follow-up J/tile
+        // work at small m); default stays the decode-class kpar GEMV so the
+        // prefill logits keep byte-identity with the decode path's class.
+        let logits_dev = if seq_len > 1
+            && prefill_precision_exact()
+            && std::env::var("TEMPURA_LM_HEAD_MMQ").as_deref() == Ok("1")
+        {
+            match self.lm_head_mmq_last_row(&last_dev) {
+                Some(l) => l,
+                None => self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS),
+            }
+        } else {
+            self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS)
+        };
         self.download_logits(&logits_dev)
+    }
+
+    /// Prefill-only lm_head over one row through the q6k mmq kernel.
+    /// Returns None when the shape/kernel availability does not fit (the
+    /// caller falls back to the kpar GEMV).
+    fn lm_head_mmq_last_row(&self, a: &Arc<Tensor<f32>>) -> Option<Arc<Tensor<f32>>> {
+        let oxide6 = self.oxide_q6k_gemv.as_ref()?;
+        if !oxide6.has_mmq_batch() {
+            return None;
+        }
+        let oxide4 = self.oxide_q4k_gemv.as_ref()?;
+        let dw = self.device_weights_q6k.get("lm_head.weight")?;
+        let k = dw.k_blocks * 256;
+        let n = dw.n;
+        // Exact [k] activation only: h == h_pad == k (the mmq x-slice
+        // reads x[0..k]; a padded tail would silently quantize padding).
+        if n % 128 != 0 || a.size() != k {
+            return None;
+        }
+        let stream = self.matmul.stream();
+        let out = {
+            let mut pool = self.prefill_scratch.borrow_mut();
+            if pool[SLOT_LOGITS].as_ref().is_none_or(|t| t.size() < n) {
+                pool[SLOT_LOGITS] = Some(Arc::new(
+                    api::zeros::<f32>(&[n])
+                        .sync_on(stream)
+                        .expect("lm_head mmq: logits buffer alloc"),
+                ));
+            }
+            pool[SLOT_LOGITS].as_ref().unwrap().clone()
+        };
+        // Q8_1 scratch for one row (shared pool, keyed (k, 1)).
+        let (x_qs, x_ds) = {
+            let mut pool = self.nograph.borrow_mut();
+            let qs = pool
+                .q4k_batch_qs
+                .entry((k, 1))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[k / 4])
+                            .sync_on(stream)
+                            .expect("lm_head mmq: qs alloc"),
+                    )
+                })
+                .clone();
+            let ds = pool
+                .q4k_batch_ds
+                .entry((k, 1))
+                .or_insert_with(|| {
+                    Arc::new(
+                        api::zeros::<u32>(&[k.div_ceil(32)])
+                            .sync_on(stream)
+                            .expect("lm_head mmq: ds alloc"),
+                    )
+                })
+                .clone();
+            (qs, ds)
+        };
+        oxide4
+            .quantize_q8_1_window(a, 0, &x_qs, &x_ds, 1, k)
+            .expect("lm_head mmq: Q8_1 quantize failed");
+        oxide6
+            .forward_mmq_batch_d2d_rows(a, 0, &dw.tensor, &out, 0, 1, n, dw.k_blocks, &x_qs, &x_ds, 64)
+            .expect("lm_head mmq: kernel launch failed");
+        Some(out)
     }
 
     // -- Batch decode CUDA graph ----------------------------------------------

@@ -2232,7 +2232,9 @@ impl OxideQ4kGemv {
             &x_len as *const _ as *mut c_void,
             &k_u32 as *const _ as *mut c_void,
         ];
-        let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+        // 2026-11-28: each warp owns 4 Q8_1 blocks (8 lanes per block, 4
+        // elements per lane) -- see the quantize_q8_1 kernel doc comment.
+        let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize * 4) as u32;
         unsafe {
             launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
         }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1_window: {e}")))?;
@@ -2478,6 +2480,50 @@ impl OxideQ4kGemv {
         x_ds: &Arc<Tensor<u32>>,
         j: usize,
     ) -> Result<()> {
+        self.forward_mmq_batch_d2d_rows_inner(
+            x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j, true,
+        )
+    }
+
+    /// Same as [`forward_mmq_batch_d2d_rows`] but SKIPS the internal Q8_1
+    /// quantize -- the caller guarantees `x_qs`/`x_ds` already hold the
+    /// quantized window for `(x, x_row, m, k)` (shared-quantize groups:
+    /// q/k/v and gate/up consume the same activation). Byte-identical to
+    /// the quantizing variant by construction (same kernel, same operands).
+    pub fn forward_mmq_batch_d2d_rows_prequant(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+        j: usize,
+    ) -> Result<()> {
+        self.forward_mmq_batch_d2d_rows_inner(
+            x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j, false,
+        )
+    }
+
+    fn forward_mmq_batch_d2d_rows_inner(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+        j: usize,
+        quantize: bool,
+    ) -> Result<()> {
         let mma_fn = self.mmq_fn_for_j(j)?;
         if m == 0 || m > 128 {
             return Err(KernelError::InvalidConfig(format!(
@@ -2510,7 +2556,9 @@ impl OxideQ4kGemv {
             )));
         }
         let cu_stream = self.stream.cu_stream();
-        self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
+        if quantize {
+            self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
+        }
 
         // Launch MMQ kernel: grid (n/128, ceil(m/J), 1), block (256, 1, 1).
         {
@@ -2585,9 +2633,54 @@ impl OxideQ4kGemv {
         partials: &Arc<Tensor<f32>>,
         j: usize,
     ) -> Result<()> {
+        self.forward_mmq_split_batch_d2d_rows_inner(
+            x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, splits, partials, j, true,
+        )
+    }
+
+    /// Same as [`forward_mmq_split_batch_d2d_rows`] but SKIPS the internal
+    /// Q8_1 quantize (see [`forward_mmq_batch_d2d_rows_prequant`]).
+    pub fn forward_mmq_split_batch_d2d_rows_prequant(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+        splits: usize,
+        partials: &Arc<Tensor<f32>>,
+        j: usize,
+    ) -> Result<()> {
+        self.forward_mmq_split_batch_d2d_rows_inner(
+            x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, splits, partials, j, false,
+        )
+    }
+
+    fn forward_mmq_split_batch_d2d_rows_inner(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+        splits: usize,
+        partials: &Arc<Tensor<f32>>,
+        j: usize,
+        quantize: bool,
+    ) -> Result<()> {
         if splits <= 1 {
-            return self.forward_mmq_batch_d2d_rows(
-                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j,
+            return self.forward_mmq_batch_d2d_rows_inner(
+                x, x_row, packed, out, out_row, m, n, k_blocks, x_qs, x_ds, j, quantize,
             );
         }
         if m == 0 || m > 128 {
@@ -2641,7 +2734,9 @@ impl OxideQ4kGemv {
             )));
         }
         let cu_stream = self.stream.cu_stream();
-        self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
+        if quantize {
+            self.quantize_q8_1_window(x, x_row, x_qs, x_ds, m, k)?;
+        }
         let splits_u32: u32 = splits as u32;
         {
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();

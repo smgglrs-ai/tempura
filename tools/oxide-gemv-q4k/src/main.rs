@@ -122,6 +122,16 @@ fn warp_reduce_max_f32(mut v: f32) -> f32 {
     v
 }
 
+/// One Q8_1 element quantize: round-to-nearest via trunc(qf +/- 0.5),
+/// clamp to [-127, 127]. Identical arithmetic to the pre-2026-11-28
+/// quantize_q8_1 kernel (byte-identity requirement).
+#[inline(always)]
+fn quantize_q8_1_elem(xi: f32, d: f32) -> i32 {
+    let qf = xi / d;
+    let rounded = (qf + if qf >= 0.0 { 0.5 } else { -0.5 }) as i32;
+    if rounded > 127 { 127 } else if rounded < -127 { -127 } else { rounded }
+}
+
 /// Inline 6-bit scale unpack for raw GGUF Q4K format.
 /// ps0 = packed u32 of bytes ps[0..4], ps1 = ps[4..8], ps2 = ps[8..12].
 /// mw = j-group index (0..3).
@@ -904,11 +914,22 @@ mod kernels {
 
     /// Quantize f32 activations to Q8_1 packed format on GPU.
     ///
-    /// Each warp (32 lanes) handles one 32-element Q8_1 block:
-    ///   out_qs[blk * 8 .. blk * 8 + 8] = 8 u32s of packed i8 (4 per u32)
-    ///   out_ds[blk]                      = f16 scale d as u16 in low 16 bits
+    /// 2026-11-28 layout (the 0.79-vs-0.34 ms differential lever): 8 lanes
+    /// per 32-element Q8_1 block, each lane owning 4 CONSECUTIVE elements
+    /// and building its packed u32 entirely in registers -- the old
+    /// 1-element-per-lane layout spent 3 cross-lane pack shuffles + a
+    /// 32-lane rowsum butterfly per block. A warp covers 4 blocks; the
+    /// 8-lane max/sum butterflies use XOR deltas 1/2/4, which stay inside
+    /// the aligned 8-lane group owning the block. Per-element arithmetic
+    /// (amax -> d = amax/127 -> trunc-rounded q -> clamp) and the qs/ds
+    /// layouts are UNCHANGED, so the emitted bytes are IDENTICAL to the
+    /// previous kernel (max and integer-sum reductions are exact
+    /// regardless of tree shape).
     ///
-    /// Grid:  (ceil(K/32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK blocks
+    ///   out_qs[blk * 8 + s] = lane s's packed i8 quartet
+    ///   out_ds[blk]         = f16 scale d (low u16) | exact q8 rowsum (high u16)
+    ///
+    /// Grid:  ceil(n_blocks / (WARPS_PER_BLOCK * 4)) blocks
     /// Block: WARPS_PER_BLOCK * 32 threads
     #[kernel]
     pub fn quantize_q8_1(
@@ -921,54 +942,66 @@ mod kernels {
         let bid     = thread::blockIdx_x();
         let warp_id = tid / 32;
         let lane    = tid % 32;
-        let q8_blk  = bid * WARPS_PER_BLOCK + warp_id;  // Q8_1 block index
-        let elem    = q8_blk * 32 + lane;
+        let n_blocks = (k + 31) / 32;
+        let gw  = bid * WARPS_PER_BLOCK + warp_id;  // global warp id
+        let blk = gw * 4 + lane / 8;                // this lane's Q8_1 block
+        if blk >= n_blocks {
+            return;
+        }
+        let s    = lane % 8;
+        let base = blk * 32 + s * 4;
 
-        let xi  = if elem < k { x[elem as usize] } else { 0.0_f32 };
-        let axi = if xi < 0.0 { -xi } else { xi };
+        // Load this lane's 4 elements (per-element range guard: identical
+        // zero-fill semantics to the previous kernel for any k).
+        let x0 = if base     < k { unsafe { *x.get_unchecked(base as usize) } } else { 0.0_f32 };
+        let x1 = if base + 1 < k { unsafe { *x.get_unchecked((base + 1) as usize) } } else { 0.0_f32 };
+        let x2 = if base + 2 < k { unsafe { *x.get_unchecked((base + 2) as usize) } } else { 0.0_f32 };
+        let x3 = if base + 3 < k { unsafe { *x.get_unchecked((base + 3) as usize) } } else { 0.0_f32 };
 
-        let amax = warp_reduce_max_f32(axi);
+        let a0 = if x0 < 0.0 { -x0 } else { x0 };
+        let a1 = if x1 < 0.0 { -x1 } else { x1 };
+        let a2 = if x2 < 0.0 { -x2 } else { x2 };
+        let a3 = if x3 < 0.0 { -x3 } else { x3 };
+        let mut m = a0;
+        if a1 > m { m = a1; }
+        if a2 > m { m = a2; }
+        if a3 > m { m = a3; }
+        let mut amax = m;
+        let t = warp::shuffle_xor_f32(amax, 1); if t > amax { amax = t; }
+        let t = warp::shuffle_xor_f32(amax, 2); if t > amax { amax = t; }
+        let t = warp::shuffle_xor_f32(amax, 4); if t > amax { amax = t; }
+
         let d = if amax == 0.0 { 1.0_f32 } else { amax / 127.0_f32 };
 
-        // Quantize: round to nearest, clamp to [-127, 127]
-        let qf = xi / d;
-        let rounded = (qf + if qf >= 0.0 { 0.5 } else { -0.5 }) as i32;
-        let qi = if rounded > 127 { 127 } else if rounded < -127 { -127 } else { rounded };
-        let qi_u8 = (qi as u32) & 0xFF;
+        // Quantize: round to nearest (trunc of qf +/- 0.5), clamp to [-127, 127]
+        let qi0 = quantize_q8_1_elem(x0, d);
+        let qi1 = quantize_q8_1_elem(x1, d);
+        let qi2 = quantize_q8_1_elem(x2, d);
+        let qi3 = quantize_q8_1_elem(x3, d);
 
-        // Pack 4 lanes per u32: lane l writes with 3 shuffles to collect neighbours.
-        let qi0 = warp::shuffle(qi_u8, (lane / 4) * 4 + 0);
-        let qi1 = warp::shuffle(qi_u8, (lane / 4) * 4 + 1);
-        let qi2 = warp::shuffle(qi_u8, (lane / 4) * 4 + 2);
-        let qi3 = warp::shuffle(qi_u8, (lane / 4) * 4 + 3);
-        let packed_qi = qi0 | (qi1 << 8) | (qi2 << 16) | (qi3 << 24);
+        let packed = ((qi0 as u32) & 0xFF)
+            | (((qi1 as u32) & 0xFF) << 8)
+            | (((qi2 as u32) & 0xFF) << 16)
+            | (((qi3 as u32) & 0xFF) << 24);
 
-        // Lane 0 of each 4-group writes one packed u32 to out_qs.
-        if lane % 4 == 0 {
-            let out_word_idx = q8_blk * 8 + lane / 4;
-            // Guard: only write if the first element of this word is in range.
-            if q8_blk * 32 + (lane / 4) * 4 < k {
-                unsafe { *out_qs.get_unchecked_mut(out_word_idx as usize) = packed_qi; }
-            }
+        // Word-write guard identical to the previous kernel (write only
+        // when the quartet's first element is in range).
+        if base < k {
+            unsafe { *out_qs.get_unchecked_mut((blk * 8 + s) as usize) = packed; }
         }
         // Exact integer warp sum of the block's q8 values (|sum| <= 32*127
-        // < 2^12, fits s16). Stashed in the HIGH 16 bits of the ds word for
-        // the mma128 prefill kernel's Q4K min-term: the rowsum is then one
-        // b16 load instead of ~38 scalar ops + 4 shuffles per (row,
-        // sub-block, m16 tile). All other consumers read only the low f16
-        // and ignore the high bits. The stored integer equals the sum the
-        // mma kernels computed inline (same addends), so per-row numerics
-        // are unchanged.
-        let mut sumqi = qi as u32;
-        let mut delta = 16u32;
-        while delta >= 1 {
-            sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, delta));
-            delta /= 2;
-        }
-        // Lane 0 writes the f16 scale + the rowsum.
-        if lane == 0 {
+        // < 2^12, fits s16; the 8-lane butterfly equals the old 32-lane
+        // one modulo 2^32, and only the low 16 bits are stored). Stashed
+        // in the HIGH 16 bits of the ds word for the mma128 prefill
+        // kernel's Q4K min-term; all other consumers read only the low
+        // f16 and ignore the high bits.
+        let mut sumqi = (qi0.wrapping_add(qi1).wrapping_add(qi2).wrapping_add(qi3)) as u32;
+        sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, 1));
+        sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, 2));
+        sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, 4));
+        if s == 0 {
             unsafe {
-                *out_ds.get_unchecked_mut(q8_blk as usize) =
+                *out_ds.get_unchecked_mut(blk as usize) =
                     (f32_to_f16_bits(d) as u32) | ((sumqi & 0xFFFF) << 16);
             }
         }
