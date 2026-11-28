@@ -977,8 +977,11 @@ mod kernels {
         // `q8_blk < out_ds.len()` (wraparound) and the no_oob proof fails.
         if lane % 4 == 0 {
             let gid = (bid as u64) * 128 + tid as u64;
-            // Guard: only write if the first element of this word is in range.
-            if (q8_blk as u64) * 32 + ((lane as u64) / 4) * 4 < k as u64 {
+            // Guard: the word's first element is in range. For the lane%4==0
+            // writers the word's first element index IS gid (word = gid/4 and
+            // gid%4==0), so the guard is exactly gid < k -- identical to the
+            // original q8_blk*32 + (lane/4)*4 < k.
+            if gid < k as u64 {
                 out_qs[(gid / 4) as usize] = packed_qi;
             }
         }
@@ -1002,8 +1005,8 @@ mod kernels {
         // PostMem2Reg pause and the Lean exporter fail-closes on the call.
         // Body is a byte-for-byte copy of the shared helper (including the
         // f16-subnormal normalization -- the 2026-10-28 bug fix).
-        if lane == 0 && (q8_blk as u64) * 32 < k as u64 {
-            let gid = (bid as u64) * 128 + tid as u64;
+        let gid = (bid as u64) * 128 + tid as u64;
+        if lane == 0 && gid < k as u64 {
             let bits = d.to_bits();
             let sign = (bits >> 16) & 0x8000;
             let exp = (bits >> 23) & 0xFF;
