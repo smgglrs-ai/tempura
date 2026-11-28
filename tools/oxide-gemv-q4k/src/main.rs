@@ -892,17 +892,33 @@ mod kernels {
     }
 
     #[inline(always)]
-/// Butterfly warp-reduce max over all 32 lanes (abs, for quantization scale).
-/// NOTE: must live INSIDE the #[cuda_module] mod and be #[inline(always)] --
-/// the Lean exporter fail-closes on un-inlined calls from #[verify] kernels.
-fn warp_reduce_max_f32(mut v: f32) -> f32 {
-    let t = warp::shuffle_xor_f32(v, 16); if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 8);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 4);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 2);  if t > v { v = t; }
-    let t = warp::shuffle_xor_f32(v, 1);  if t > v { v = t; }
-    v
-}
+    fn verify_inline_probe(x: u32) -> u32 {
+        x.wrapping_add(1)
+    }
+
+    #[inline(always)]
+    fn verify_inline_probe_big(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = (bits >> 16) & 0x8000;
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x7FFFFF;
+        if exp == 0 {
+            if mant == 0 { sign as u16 } else {
+                let s = mant.leading_zeros() - 11;
+                let m = mant << s;
+                (sign | (((113 - s) as u32) << 10) | ((m & 0x3FF) >> 1)) as u16
+            }
+        } else if exp == 255 {
+            (sign | 0x7C00 | ((mant >> 13) & 0x3FF)) as u16
+        } else {
+            (sign | ((exp - 127 + 15) as u32) << 10 | (mant >> 13)) as u16
+        }
+    }
+
+    #[inline(always)]
+    fn verify_inline_probe_f32(x: f32) -> f32 {
+        x + 1.0
+    }
 
     // NOTE: the params are `&mut [u32]` (not DisjointSlice) so the derived
     // write indices (q8_blk*8 + lane/4, q8_blk) can be safe indexed stores
@@ -954,9 +970,20 @@ fn warp_reduce_max_f32(mut v: f32) -> f32 {
         let xi  = if elem < k { x[elem as usize] } else { 0.0_f32 };
         let axi = if xi < 0.0 { -xi } else { xi };
 
-        let amax = warp_reduce_max_f32(axi);
+        // Butterfly warp-reduce max, expanded inline: the Lean exporter
+        // fail-closes on un-inlined helper calls, and helpers that call
+        // inline(never) shuffle intrinsics are not MIR-inlined before the
+        // PostMem2Reg pause. warp::shuffle_xor_f32 itself is a whitelisted
+        // cuda_device call.
+        let mut amax = axi;
+        let mut t = warp::shuffle_xor_f32(amax, 16); if t > amax { amax = t; }
+        t = warp::shuffle_xor_f32(amax, 8);  if t > amax { amax = t; }
+        t = warp::shuffle_xor_f32(amax, 4);  if t > amax { amax = t; }
+        t = warp::shuffle_xor_f32(amax, 2);  if t > amax { amax = t; }
+        t = warp::shuffle_xor_f32(amax, 1);  if t > amax { amax = t; }
         let d = if amax == 0.0 { 1.0_f32 } else { amax / 127.0_f32 };
 
+        let _probe = verify_inline_probe(q8_blk) as f32 + verify_inline_probe_f32(xi) + verify_inline_probe_big(xi) as f32;
         // Quantize: round to nearest, clamp to [-127, 127]
         let qf = xi / d;
         let rounded = (qf + if qf >= 0.0 { 0.5 } else { -0.5 }) as i32;
