@@ -704,12 +704,22 @@ impl EngineTask {
         }
         #[cfg(feature = "cutile")]
         if let Some(id) = eagle_id {
-            if self.eagle_step_gpu(sessions, &id) {
-                completed.push(id);
-            } else if self.plain_step_gpu(sessions, &id) {
-                // The cycle could not run (deferred/capacity); plain step
-                // + head resync keep the session alive and in sync.
-                completed.push(id);
+            // Some(done) = the cycle RAN (done = the request finished);
+            // None = it could not run (capacity/state) -- only then is a
+            // plain step the fallback.  The OLD shape treated "ran but the
+            // request continues" as failure and took a plain m=1 step after
+            // EVERY successful cycle -- a full extra forward (plus its
+            // logits download) per cycle, with ~40% of tokens emitted by
+            // plain steps instead of verified spec rows (found by nsys:
+            // one m=1 no-graph forward per verify cycle, 2026-11-27).
+            match self.eagle_step_gpu(sessions, &id) {
+                Some(true) => completed.push(id),
+                Some(false) => {}
+                None => {
+                    if self.plain_step_gpu(sessions, &id) {
+                        completed.push(id);
+                    }
+                }
             }
         }
         completed
@@ -1403,22 +1413,26 @@ impl EngineTask {
     /// acceptance, head resync + carry refresh.  By construction the
     /// emitted sequence is IDENTICAL to plain greedy decode (the
     /// spec-equivalence gate); the head's numerics only influence the
-    /// acceptance length.  Returns true when the request finished.
-    /// False = the cycle could not run (caller falls back to a plain
-    /// step) OR ran but the request continues.
+    /// acceptance length.  Returns Some(done) when the cycle RAN (done =
+    /// the request finished); None when it could not run (caller falls
+    /// back to a plain step).
     #[cfg(feature = "cutile")]
-    fn eagle_step_gpu(&mut self, sessions: &mut HashMap<String, ActiveSession>, id: &str) -> bool {
+    fn eagle_step_gpu(
+        &mut self,
+        sessions: &mut HashMap<String, ActiveSession>,
+        id: &str,
+    ) -> Option<bool> {
         let Some(base) = self.kv_caches.get(id).map(|kv| kv.seq_len()) else {
-            return false;
+            return None;
         };
         if base == 0 {
-            return false;
+            return None;
         }
         // Head-state invariant: head rows 0..base-1 (row p = (token_p,
         // h_p)); the anchor holds row base-1's output hidden.
         {
             let Some(es) = self.eagle_states.get(id) else {
-                return false;
+                return None;
             };
             if es.failed || !es.prefilled || es.kv.seq_len() != base {
                 if !es.failed && es.kv.seq_len() != base {
@@ -1426,7 +1440,7 @@ impl EngineTask {
                     // latch failed; plain decode for the rest.
                     self.eagle_states.get_mut(id).unwrap().failed = true;
                 }
-                return false;
+                return None;
             }
         }
         let last = {
@@ -1437,12 +1451,12 @@ impl EngineTask {
         // Pre-grow the target run for the whole verify block (eviction
         // protects this session) and the head run for K draft rows.
         if !self.ensure_capacity_with_eviction(id, base + k, &[id.to_string()]) {
-            return false;
+            return None;
         }
         {
             let es = self.eagle_states.get_mut(id).expect("eagle state");
             if es.kv.try_ensure_capacity(base + k).is_err() {
-                return false;
+                return None;
             }
         }
         let t_draft = std::time::Instant::now();
@@ -1455,14 +1469,14 @@ impl EngineTask {
                 Some(p) => p,
                 None => {
                     es.failed = true;
-                    return false;
+                    return None;
                 }
             }
         };
         let draft_us = t_draft.elapsed().as_micros() as u64;
         if proposals.len() < 2 {
             // Not enough proposals to be worth a verify -- plain step.
-            return false;
+            return None;
         }
         let j = proposals.len();
         let mut token_list = Vec::with_capacity(j);
@@ -1475,7 +1489,7 @@ impl EngineTask {
             Some(a) => a,
             None => {
                 self.kv_caches.insert(id.to_string(), kv);
-                return false;
+                return None;
             }
         };
         let verify_us = t_verify.elapsed().as_micros() as u64;
@@ -1529,7 +1543,7 @@ impl EngineTask {
             let tokens = self.kv_caches.get(id).map(|kv| kv.seq_len()).unwrap_or(0);
             sched.touch(id, tokens);
         }
-        done
+        Some(done)
     }
 
     pub fn run(mut self) {
