@@ -1182,6 +1182,20 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         .and_then(|v| v.as_f32())
         .unwrap_or(10000.0);
 
+    // Gemma-3: local (SWA-layer) rope base -- llama.cpp
+    // {arch}.rope.freq_base_swa (default 10000; global layers carry 1e6).
+    let rope_theta_swa = if arch == "gemma3" || arch == "llama4" {
+        metadata
+            .get(&format!("{arch}.rope.freq_base_swa"))
+            .and_then(|v| v.as_f32())
+    } else {
+        None
+    };
+
+    // Gemma-3 / Llama-4 interleaved attention pattern (GGUF
+    // {arch}.attention.sliding_window_pattern; gemma3: 6, llama4: 4).
+    let sliding_window_pattern = get_usize("attention.sliding_window_pattern");
+
     let layer_norm_eps = metadata
         .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
         .and_then(|v| v.as_f32())
@@ -1189,6 +1203,17 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 
     let head_dim = get_usize("attention.key_length").unwrap_or(hidden_size / num_attention_heads);
 
+    // Gemma-3 query pre-attention scale: llama.cpp derives 1/sqrt(hidden/
+    // heads) for the 27B (62 layers) and 1/sqrt(head_dim) otherwise.
+    let attn_scale_denominator = if arch == "gemma3" {
+        Some(if num_layers == 62 {
+            hidden_size as f32 / num_attention_heads as f32
+        } else {
+            head_dim as f32
+        })
+    } else {
+        None
+    };
     let is_bitnet = arch.contains("bitnet");
 
     let file_type = metadata.get("general.file_type").and_then(|v| v.as_u32());
@@ -1294,7 +1319,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
                 | crate::config::HiddenAct::GeluQuick
                 | crate::config::HiddenAct::GeGLU
         ),
-        sliding_window: None,
+        sliding_window: get_usize("attention.sliding_window"),
+        sliding_window_pattern,
+        rope_theta_swa,
+        attn_scale_denominator,
+        no_rope_layer_step: if arch == "llama4" { Some(4) } else { None },
         hidden_act,
         rope_type,
         architecture,

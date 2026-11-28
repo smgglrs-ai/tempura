@@ -50,6 +50,25 @@ pub struct ModelConfig {
     pub ssm_a: Option<f32>,
     pub dt_bias: Option<Vec<f32>>,
     pub rope_dim: Option<usize>,
+    /// Gemma-3 / Llama-4 interleaved attention pattern: layer `il` is
+    /// sliding-window iff `il % pattern < pattern - 1` (llama.cpp
+    /// `set_swa_pattern(n, dense_first=false)`; GGUF
+    /// {arch}.attention.sliding_window_pattern, HF sliding_window_pattern).
+    /// Gemma-3: 6 (5 SWA + 1 global). Llama-4: 4 (3 chunked + 1 full).
+    pub sliding_window_pattern: Option<usize>,
+    /// RoPE base for sliding-window layers (Gemma-3: 10000 local vs 1e6
+    /// global; GGUF {arch}.rope.freq_base_swa, HF rope_local_base_freq).
+    pub rope_theta_swa: Option<f32>,
+    /// Attention scale denominator: scale = 1/sqrt(this) instead of
+    /// 1/sqrt(head_dim). Gemma-3 query_pre_attn_scalar (12B/27B use 256
+    /// with head_dim 256/128... llama.cpp derives it by model type:
+    /// 27B -> 1/sqrt(hidden/heads), else 1/sqrt(head_dim)).
+    pub attn_scale_denominator: Option<f32>,
+    /// Llama-4 no-RoPE layer step: layer `il` skips RoPE iff
+    /// `(il + 1) % step == 0` (llama.cpp rope_pattern). Parsed but NOT yet
+    /// wired into the forward paths (recorded gap: Llama-4 also needs
+    /// chunked attention + interleaved MoE).
+    pub no_rope_layer_step: Option<usize>,
     /// RoPE mscale (llama.cpp rope_attn_factor / YaRN mscale): multiplies
     /// the rope cos/sin, scaling rotated Q and K. Read UNCONDITIONALLY from
     /// {arch}.rope.scaling.attn_factor -- Phi longrope applies 1.1902 even
@@ -213,6 +232,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             rope_attn_factor: 1.0,
             rope_scaling: None,
         }
@@ -254,6 +277,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             rope_attn_factor: 1.0,
             rope_scaling: None,
         }
@@ -295,6 +322,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             rope_attn_factor: 1.0,
             rope_scaling: None,
         }
@@ -336,6 +367,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             rope_attn_factor: 1.0,
             rope_scaling: None,
         }
@@ -377,6 +412,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             rope_attn_factor: 1.0,
             rope_scaling: None,
         }
@@ -407,6 +446,8 @@ impl ModelConfig {
             as usize;
         let intermediate_size = v["intermediate_size"]
             .as_u64()
+            // Qwen3-MoE carries only the per-expert size
+            .or_else(|| v["moe_intermediate_size"].as_u64())
             .ok_or(ConfigError::MissingField("intermediate_size"))?
             as usize;
         let vocab_size = v["vocab_size"]
@@ -448,7 +489,7 @@ impl ModelConfig {
         };
 
         let rope_type = match model_type {
-            Some("bitnet") => RopeType::Norm,
+            Some("bitnet") | Some("llama4") => RopeType::Norm,
             _ => RopeType::Neox,
         };
 
@@ -496,6 +537,74 @@ impl ModelConfig {
             })
         });
 
+        // Qwen3: per-head Q/K RMSNorm on every layer, no attention bias,
+        // SiLU FFN, NEOX rope pairing (same as qwen2). MoE variants carry
+        // their expert counts under moe-specific keys with a per-expert
+        // intermediate size.
+        let use_qk_norm = match model_type {
+            Some("qwen3") | Some("qwen3moe") => true,
+            _ => false,
+        };
+
+        let (n_experts, n_experts_used, intermediate_size) = match model_type {
+            Some("qwen3moe") => (
+                v.get("num_experts")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                v.get("num_experts_per_tok")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                v.get("moe_intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(intermediate_size),
+            ),
+            _ => (0, 0, intermediate_size),
+        };
+
+        // Gemma-3: interleaved 5:1 sliding/global layers with a separate
+        // local rope base, and the pre-attention query scale. llama.cpp
+        // derives the scale denominator by model type (27B:
+        // hidden/heads, else head_dim); HF carries it explicitly as
+        // query_pre_attn_scalar.
+        let sliding_window_pattern = match model_type {
+            Some("gemma3") => v
+                .get("sliding_window_pattern")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            Some("llama4") => Some(4),
+            _ => None,
+        };
+        let rope_theta_swa = match model_type {
+            Some("gemma3") => v
+                .get("rope_local_base_freq")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            _ => None,
+        };
+        let attn_scale_denominator = match model_type {
+            Some("gemma3") => {
+                let scalar = v
+                    .get("query_pre_attn_scalar")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as f32);
+                scalar.or({
+                    // llama.cpp rule when the HF key is absent (GGUF loads):
+                    // 27B -> hidden/heads, else head_dim.
+                    if num_layers == 62 {
+                        Some(hidden_size as f32 / num_attention_heads as f32)
+                    } else {
+                        Some(head_dim as f32)
+                    }
+                })
+            }
+            _ => None,
+        };
+        let no_rope_layer_step = match model_type {
+            Some("llama4") => Some(4),
+            _ => None,
+        };
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -509,7 +618,7 @@ impl ModelConfig {
             layer_norm_eps,
             tensor_parallel_size: 1,
             quantization,
-            use_qk_norm: false,
+            use_qk_norm,
             use_f16_kv: false,
             sliding_window: v
                 .get("sliding_window")
@@ -518,14 +627,8 @@ impl ModelConfig {
             hidden_act,
             rope_type,
             architecture,
-            n_experts: v
-                .get("num_local_experts")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize,
-            n_experts_used: v
-                .get("num_experts_per_tok")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize,
+            n_experts,
+            n_experts_used,
             use_layernorm: matches!(
                 architecture,
                 Architecture::Falcon | Architecture::Mpt | Architecture::Phi
@@ -559,6 +662,10 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            sliding_window_pattern,
+            rope_theta_swa,
+            attn_scale_denominator,
+            no_rope_layer_step,
             rope_attn_factor: 1.0,
             rope_scaling,
         })
@@ -581,6 +688,55 @@ impl ModelConfig {
                     })
                     .collect()
             }
+        }
+    }
+
+    /// Layer `il` uses a sliding attention window (Gemma-3/Llama-4
+    /// interleave). A plain `sliding_window` with no pattern applies to
+    /// every layer.
+    pub fn layer_is_sliding(&self, layer: usize) -> bool {
+        if self.sliding_window.is_none() {
+            return false;
+        }
+        match self.sliding_window_pattern {
+            None => true,
+            Some(n) if n > 0 => layer % n < n - 1,
+            Some(_) => true,
+        }
+    }
+
+    /// Effective sliding window for layer `il` (None = full attention).
+    pub fn layer_sliding_window(&self, layer: usize) -> Option<usize> {
+        if self.layer_is_sliding(layer) {
+            self.sliding_window
+        } else {
+            None
+        }
+    }
+
+    /// Effective RoPE base for layer `il` (SWA layers carry their own base
+    /// on Gemma-3: 10000 local vs 1e6 global).
+    pub fn layer_rope_theta(&self, layer: usize) -> f32 {
+        if self.layer_is_sliding(layer) {
+            self.rope_theta_swa.unwrap_or(self.rope_theta)
+        } else {
+            self.rope_theta
+        }
+    }
+
+    /// Effective attention scale for layer `il`.
+    pub fn layer_attn_scale(&self, head_dim: usize) -> f32 {
+        let denom = self
+            .attn_scale_denominator
+            .unwrap_or(head_dim as f32);
+        1.0 / denom.sqrt()
+    }
+
+    /// Layer `il` applies RoPE (Llama-4 skips every `step`-th layer).
+    pub fn layer_uses_rope(&self, layer: usize) -> bool {
+        match self.no_rope_layer_step {
+            Some(step) if step > 0 => (layer + 1) % step != 0,
+            _ => true,
         }
     }
 
@@ -889,6 +1045,155 @@ mod tests {
         assert_eq!(ModelConfig::llama2_7b().architecture, Architecture::Llama);
         assert_eq!(ModelConfig::micro_llama().architecture, Architecture::Llama);
         assert_eq!(ModelConfig::tiny_test().architecture, Architecture::Llama);
+    }
+
+    #[test]
+    fn test_from_hf_json_qwen3() {
+        let json = r#"{
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 28,
+            "vocab_size": 151936,
+            "head_dim": 128,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 40960
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, Architecture::Llama);
+        assert_eq!(c.rope_type, RopeType::Neox);
+        assert!(c.use_qk_norm, "Qwen3 must enable qk_norm");
+        assert_eq!(c.n_experts, 0);
+        assert_eq!(c.head_dim, 128);
+    }
+
+    #[test]
+    fn test_from_hf_json_qwen3moe() {
+        let json = r#"{
+            "model_type": "qwen3moe",
+            "hidden_size": 2048,
+            "moe_intermediate_size": 768,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 28,
+            "vocab_size": 151936,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": true
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, Architecture::Llama);
+        assert!(c.use_qk_norm);
+        assert_eq!(c.n_experts, 128);
+        assert_eq!(c.n_experts_used, 8);
+        assert_eq!(c.intermediate_size, 768, "moe_intermediate_size fallback");
+    }
+
+    #[test]
+    fn test_from_hf_json_gemma3_interleave() {
+        let json = r#"{
+            "model_type": "gemma3",
+            "hidden_size": 1152,
+            "intermediate_size": 6912,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 26,
+            "vocab_size": 262144,
+            "head_dim": 256,
+            "query_pre_attn_scalar": 256,
+            "hidden_act": "geglu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0,
+            "sliding_window": 1024,
+            "sliding_window_pattern": 6
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, Architecture::Gemma);
+        assert_eq!(c.sliding_window, Some(1024));
+        assert_eq!(c.sliding_window_pattern, Some(6));
+        assert_eq!(c.rope_theta_swa, Some(10000.0));
+        assert_eq!(c.attn_scale_denominator, Some(256.0));
+        assert_eq!(c.hidden_act, HiddenAct::GeGLU);
+        // 5:1 interleave: layers 0-4 SWA, layer 5 global (llama.cpp
+        // set_swa_pattern(n, dense_first=false): il % n < n - 1).
+        for il in 0..26 {
+            let expect_swa = il % 6 < 5;
+            assert_eq!(
+                c.layer_is_sliding(il),
+                expect_swa,
+                "layer {il} sliding={expect_swa}"
+            );
+            assert_eq!(c.layer_sliding_window(il), if expect_swa { Some(1024) } else { None });
+        }
+        assert_eq!(c.layer_rope_theta(0), 10000.0);
+        assert_eq!(c.layer_rope_theta(5), 1000000.0);
+        assert!((c.layer_attn_scale(256) - 1.0 / 256.0f32.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_from_hf_json_gemma3_27b_scale_rule() {
+        // Without query_pre_attn_scalar, the 62-layer (27B) model uses
+        // hidden/heads as the scale denominator (llama.cpp).
+        let json = r#"{
+            "model_type": "gemma3",
+            "hidden_size": 5376,
+            "intermediate_size": 28672,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+            "num_hidden_layers": 62,
+            "vocab_size": 262144,
+            "head_dim": 128,
+            "sliding_window": 1024,
+            "sliding_window_pattern": 6
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.attn_scale_denominator, Some(5376.0 / 32.0));
+    }
+
+    #[test]
+    fn test_from_hf_json_llama4_pattern() {
+        let json = r#"{
+            "model_type": "llama4",
+            "hidden_size": 5120,
+            "intermediate_size": 8192,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 48,
+            "vocab_size": 202048,
+            "head_dim": 128,
+            "interleave_moe_layer_step": 1,
+            "sliding_window": 8192
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, Architecture::Llama);
+        assert_eq!(c.rope_type, RopeType::Norm, "llama4 is a NORM-rope arch");
+        assert_eq!(c.no_rope_layer_step, Some(4));
+        // llama.cpp rope_pattern: (il + 1) % step != 0 -> layers 3, 7, 11...
+        // skip RoPE.
+        assert!(c.layer_uses_rope(0));
+        assert!(!c.layer_uses_rope(3));
+        assert!(c.layer_uses_rope(4));
+        assert!(!c.layer_uses_rope(7));
+        assert_eq!(c.sliding_window_pattern, Some(4));
+        assert!(c.layer_is_sliding(0));
+        assert!(!c.layer_is_sliding(3));
+    }
+
+    #[test]
+    fn test_sliding_window_without_pattern_applies_to_all_layers() {
+        let mut c = ModelConfig::tiny_test();
+        c.sliding_window = Some(64);
+        assert!(c.layer_is_sliding(0));
+        assert!(c.layer_is_sliding(1));
+        assert_eq!(c.layer_sliding_window(1), Some(64));
+        // No window configured at all.
+        let plain = ModelConfig::tiny_test();
+        assert!(!plain.layer_is_sliding(0));
+        assert_eq!(plain.layer_sliding_window(0), None);
     }
 
     #[test]

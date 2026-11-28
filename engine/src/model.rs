@@ -837,6 +837,7 @@ where
         let mut deltanet_layer_idx = 0usize;
 
         for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
             let layer_start = Instant::now();
             let prefix = format!("model.layers.{layer}");
 
@@ -1195,6 +1196,7 @@ where
                     );
                 }
 
+                let layer_theta = cfg.layer_rope_theta(layer);
                 self.pipeline
                     .rope(
                         &mut q,
@@ -1203,7 +1205,7 @@ where
                         n_heads,
                         head_dim,
                         &positions,
-                        cfg.rope_theta,
+                        layer_theta,
                                     cfg.rope_attn_factor,
                     )
                     .unwrap();
@@ -1215,13 +1217,13 @@ where
                         n_kv_heads,
                         head_dim,
                         &positions,
-                        cfg.rope_theta,
+                        layer_theta,
                                     cfg.rope_attn_factor,
                     )
                     .unwrap();
 
                 let mut attn_out = vec![0.0f32; seq_len * q_dim];
-                let attn_scale = 1.0 / (head_dim as f32).sqrt();
+                let attn_scale = cfg.layer_attn_scale(head_dim);
                 let cl = cache_layer_map[layer].unwrap();
                 if let Some(ref mut paged) = session.paged_cache {
                     if tempura_kernels::kv_quant_sim::kv_sim_enabled() {
@@ -1274,6 +1276,25 @@ where
                                 n_kv_heads,
                                 head_dim,
                                 attn_scale,
+                            )
+                            .unwrap();
+                    } else if let Some(w) = cfg.layer_sliding_window(layer) {
+                        // Interleaved-SWA layers (Gemma-3 5:1, Llama-4 3:1):
+                        // causal + window mask through the reference kernel.
+                        tempura_kernels::attention::CpuAttention
+                            .forward_windowed(
+                                &q,
+                                &k_cache,
+                                &v_cache,
+                                &mut attn_out,
+                                1,
+                                seq_len,
+                                kv_len,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                attn_scale,
+                                w,
                             )
                             .unwrap();
                     } else {
@@ -4173,6 +4194,7 @@ where
             }
 
             for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
                 let layer_kind = cfg
                     .layer_kinds
                     .as_ref()
@@ -5210,7 +5232,7 @@ where
                                         n_heads,
                                         rope_hd,
                                         &positions,
-                                        cfg.rope_theta,
+                                        layer_theta,
                                         cfg.rope_attn_factor,
                                     )
                                     .unwrap();
@@ -5222,7 +5244,7 @@ where
                                         n_kv_heads,
                                         rope_hd,
                                         &positions,
-                                        cfg.rope_theta,
+                                        layer_theta,
                                         cfg.rope_attn_factor,
                                     )
                                     .unwrap();
@@ -5235,7 +5257,7 @@ where
                                         n_heads,
                                         rope_hd,
                                         &positions,
-                                        cfg.rope_theta,
+                                        layer_theta,
                                     cfg.rope_attn_factor,
                                     )
                                     .unwrap();
@@ -5247,7 +5269,7 @@ where
                                         n_kv_heads,
                                         rope_hd,
                                         &positions,
-                                        cfg.rope_theta,
+                                        layer_theta,
                                     cfg.rope_attn_factor,
                                     )
                                     .unwrap();
@@ -5275,7 +5297,7 @@ where
                                     n_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                         cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -5287,7 +5309,7 @@ where
                                     n_kv_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                         cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -5300,7 +5322,7 @@ where
                                     n_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -5312,7 +5334,7 @@ where
                                     n_kv_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -6649,6 +6671,7 @@ where
             let mut dn_idx = 0usize;
 
             for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
                 let layer_kind = cfg
                     .layer_kinds
                     .as_ref()
@@ -7164,7 +7187,7 @@ where
                                     n_heads,
                                     rope_hd,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -7176,7 +7199,7 @@ where
                                     n_kv_heads,
                                     rope_hd,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -7197,7 +7220,7 @@ where
                                     n_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -7209,7 +7232,7 @@ where
                                     n_kv_heads,
                                     head_dim,
                                     &positions,
-                                    cfg.rope_theta,
+                                    layer_theta,
                                     cfg.rope_attn_factor,
                                 )
                                 .unwrap();
@@ -7690,6 +7713,7 @@ where
             }
 
             for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
                 let (
                     ref iln,
                     ref pln,
@@ -7856,7 +7880,7 @@ where
                         n_heads,
                         head_dim,
                         &positions,
-                        cfg.rope_theta,
+                        layer_theta,
                         cfg.rope_attn_factor,
                     )
                     .unwrap();
@@ -7867,7 +7891,7 @@ where
                         n_kv_heads,
                         head_dim,
                         &positions,
-                        cfg.rope_theta,
+                        layer_theta,
                         cfg.rope_attn_factor,
                     )
                     .unwrap();
@@ -8683,6 +8707,7 @@ where
                 let mut dn_idx = 0usize;
 
                 for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
                     let (ref iln, ref pln, ref qn, ref kn, ref vn, ref on,
                          ref _qnm, ref _knm, ref gn, ref un, ref dn,
                          ref asn, ref fsn, ref _apn, ref _fpn) = layer_names[layer];
@@ -8923,7 +8948,7 @@ where
                             fsm!(qp, actual_q_cols), fsm!(kp, kv_dim), fs!(vp, kv_dim),
                             fsm!(ap, q_dim), fsm!(qgbp, if has_q_gate { q_dim } else { 0 }),
                             sess, cl, n_heads, n_kv_heads, head_dim, q_dim, kv_dim, actual_q_cols,
-                            has_q_gate, rope_hd, cfg.rope_theta, &positions,
+                            has_q_gate, rope_hd, layer_theta, &positions,
                             qnw, knw, qweights.get_f32(asn), cfg.layer_norm_eps, ggml_compat,
                             cfg.sliding_window,
                         );
@@ -9306,6 +9331,7 @@ where
             };
 
             for layer in 0..cfg.num_layers {
+            let layer_theta = cfg.layer_rope_theta(layer);
                 let (
                     ref iln,
                     ref pln,
@@ -9472,7 +9498,7 @@ where
                             n_heads,
                             head_dim,
                             &positions[t_start..t_end],
-                            cfg.rope_theta,
+                            layer_theta,
                             cfg.rope_attn_factor,
                         )
                         .unwrap();
@@ -9483,7 +9509,7 @@ where
                             n_kv_heads,
                             head_dim,
                             &positions[t_start..t_end],
-                            cfg.rope_theta,
+                            layer_theta,
                             cfg.rope_attn_factor,
                         )
                         .unwrap();
@@ -11886,6 +11912,68 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_interleaved_swa_changes_output_and_is_deterministic() {
+        // Gemma-3-style 5:1 interleave (pattern 3 here: 2 SWA + 1 global)
+        // with a window smaller than the prompt: the SWA layers must mask
+        // distant positions, so the logits differ from a full-attention
+        // model with IDENTICAL weights, and the run is bit-deterministic.
+        let mut swa_cfg = ModelConfig::tiny_test();
+        swa_cfg.num_layers = 3;
+        swa_cfg.sliding_window = Some(2);
+        swa_cfg.sliding_window_pattern = Some(3);
+        let mut full_cfg = swa_cfg.clone();
+        full_cfg.sliding_window = None;
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let loader = RandomWeightLoader::from_config(&swa_cfg, 7);
+        let mut swa_model = TransformerModel::new(swa_cfg.clone(), KernelPipeline::cpu_verified());
+        swa_model.load_weights(&loader).unwrap();
+        let mut full_model = TransformerModel::new(full_cfg.clone(), KernelPipeline::cpu_verified());
+        full_model.load_weights(&loader).unwrap();
+
+        let prompt: Vec<u32> = (0..16).collect();
+        let mut s1 = InferenceSession::new(&swa_cfg, TraceLevel::Off, 42);
+        let mut s2 = InferenceSession::new(&swa_cfg, TraceLevel::Off, 42);
+        let l1 = swa_model.forward(&mut s1, &prompt);
+        let l2 = swa_model.forward(&mut s2, &prompt);
+        assert_eq!(l1, l2, "same input must give bit-identical logits");
+
+        let mut sf = InferenceSession::new(&full_cfg, TraceLevel::Off, 42);
+        let lf = full_model.forward(&mut sf, &prompt);
+        assert_ne!(
+            l1, lf,
+            "windowed layers must change the output vs full attention"
+        );
+    }
+
+    #[test]
+    fn test_layer_rope_theta_swa_layers() {
+        // The SWA-layer local rope base must reach the forward path: two
+        // models identical except rope_theta_swa produce different logits
+        // (the SWA layers rotate at a different frequency).
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 3;
+        cfg.sliding_window = Some(4);
+        cfg.sliding_window_pattern = Some(3);
+        let mut cfg2 = cfg.clone();
+        cfg2.rope_theta_swa = Some(1000.0);
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let loader = RandomWeightLoader::from_config(&cfg, 9);
+        let mut m1 = TransformerModel::new(cfg.clone(), KernelPipeline::cpu_verified());
+        m1.load_weights(&loader).unwrap();
+        let mut m2 = TransformerModel::new(cfg2.clone(), KernelPipeline::cpu_verified());
+        m2.load_weights(&loader).unwrap();
+
+        let prompt: Vec<u32> = (0..8).collect();
+        let mut s1 = InferenceSession::new(&cfg, TraceLevel::Off, 42);
+        let mut s2 = InferenceSession::new(&cfg2, TraceLevel::Off, 42);
+        let l1 = m1.forward(&mut s1, &prompt);
+        let l2 = m2.forward(&mut s2, &prompt);
+        assert_ne!(l1, l2, "rope_theta_swa must change SWA-layer rotation");
+    }
+
+    #[test]
     fn test_forward_shape_correctness() {
         let config = ModelConfig::tiny_test();
         let pipeline = KernelPipeline::cpu_verified();
@@ -12527,6 +12615,10 @@ mod tests {
             use_qk_norm: false,
             use_f16_kv: false,
             sliding_window: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             layer_kinds: None,
             deltanet_num_heads: None,
             deltanet_head_dim: None,
@@ -12677,6 +12769,10 @@ mod tests {
             use_qk_norm: false,
             use_f16_kv: false,
             sliding_window: None,
+            sliding_window_pattern: None,
+            rope_theta_swa: None,
+            attn_scale_denominator: None,
+            no_rope_layer_step: None,
             layer_kinds: None,
             deltanet_num_heads: None,
             deltanet_head_dim: None,
