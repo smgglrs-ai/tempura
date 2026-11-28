@@ -576,10 +576,11 @@ impl ModelConfig {
             _ => None,
         };
         let rope_theta_swa = match model_type {
-            Some("gemma3") => v
-                .get("rope_local_base_freq")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32),
+            Some("gemma3") => Some(
+                v.get("rope_local_base_freq")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(10000.0) as f32,
+            ),
             _ => None,
         };
         let attn_scale_denominator = match model_type {

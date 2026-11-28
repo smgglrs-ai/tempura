@@ -1183,18 +1183,29 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         .unwrap_or(10000.0);
 
     // Gemma-3: local (SWA-layer) rope base -- llama.cpp
-    // {arch}.rope.freq_base_swa (default 10000; global layers carry 1e6).
+    // {arch}.rope.freq_base_swa, DEFAULTING to 10000 when the key is
+    // absent (llama-hparams rope_freq_base_train_swa = 10000.0f; the
+    // official gemma-3 GGUFs do not carry the key).
     let rope_theta_swa = if arch == "gemma3" || arch == "llama4" {
-        metadata
-            .get(&format!("{arch}.rope.freq_base_swa"))
-            .and_then(|v| v.as_f32())
+        Some(
+            metadata
+                .get(&format!("{arch}.rope.freq_base_swa"))
+                .and_then(|v| v.as_f32())
+                .unwrap_or(10000.0),
+        )
     } else {
         None
     };
 
     // Gemma-3 / Llama-4 interleaved attention pattern (GGUF
-    // {arch}.attention.sliding_window_pattern; gemma3: 6, llama4: 4).
-    let sliding_window_pattern = get_usize("attention.sliding_window_pattern");
+    // {arch}.attention.sliding_window_pattern; gemma3: 6, llama4: 4 --
+    // llama.cpp's load_swa_pattern defaults when the key/array is
+    // absent).
+    let sliding_window_pattern = get_usize("attention.sliding_window_pattern").or(match arch {
+        "gemma3" => Some(6),
+        "llama4" => Some(4),
+        _ => None,
+    });
 
     let layer_norm_eps = metadata
         .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
