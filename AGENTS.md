@@ -703,11 +703,22 @@ under an eagle.* namespace riding the oxide kpar GEMVs, own 1-layer KV
 pool; drafts K tokens at ~0.4 ms/step (nearly-free drafting ACHIEVED),
 verifies through the v1 spec_row_views machinery, teacher-forced
 post-verify re-anchoring — gate `scripts/eagle-equivalence.sh`
-(byte-identical solo, PASS) + acceptance telemetry; measured solo
-0.87x (mean_emitted 1.88, K=4) — the verify's small-m batch-path fixed
-cost (~13+2m ms) and the linear-chain acceptance are the recorded
-walls; TEMPURA_NO_EAGLE bisects, multi-client batches keep plain
-decode), Medusa multi-token,
+(byte-identical solo, PASS) + acceptance telemetry; 2026-11-27 round:
+the per-cycle PLAIN-STEP LOGIC BUG fixed (the caller treated "cycle ran
+but request continues" as failure and took a full plain m=1 forward
+after EVERY cycle — ~40% of tokens were plain steps; eagle_step_gpu now
+returns Option<bool>), the verify cost DECOMPOSED by nsys (it already
+replays the m2p ragged graph; the wall is the kpar8-class batch GEMV's
+m-scaling: per-CTA compute-bound, ~2.9x at m=4 — a rows-parallel
+grid-(m,n) variant `q4k_gemv_sm120_kpar8_batch_rp` measured a WASH
+(weight re-reads do not L2-share; probe-gated, opt-in via
+TEMPURA_Q4K_BATCH_KERNEL=rp) and the tensor-core escape is barred by
+the verify's byte-identity contract), honest verdict 0.80x solo at K=4
+/ 0.88x at K=3 (best; pure spec cycles, mean_emitted 1.64-1.75) vs
+plain 74.4 tok/s — the remaining walls are the GEMM m-scaling and the
+linear-chain acceptance (55% first-token rejection; draft trees remain
+the recorded lever); TEMPURA_NO_EAGLE bisects, multi-client batches
+keep plain decode), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
 typical-p/repeat/presence/frequency; decode path uses the fused top-k-heap
 sampler -- O(n log k), token-identical to the full chain)

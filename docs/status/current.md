@@ -5,6 +5,107 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-27 (EAGLE-3 verify-cost round — the wall DECOMPOSED and
+it is NOT what the recorded follow-ups assumed: the verify already
+replays a CUDA graph, the "~13+2m ms no-graph batch-path fixed cost"
+theory is RETIRED, one real ENGINE BUG found and fixed (a plain m=1
+forward ran after EVERY spec cycle — 40% of "spec" tokens were plain
+steps), the true wall is the kpar8-class batch GEMV's m-scaling
+(per-CTA compute-bound, ~2.9x at m=4, structural under the verify's
+byte-identity contract), and the honest verdict is 0.80x solo at K=4 /
+0.88x at K=3 — all gates green, the profile table + the negative
+results recorded): (1) THE METHOD (differential nsys, the round's core
+deliverable).  The eagle gate's solo 400-token leg profiled ON (eagle)
+vs OFF (plain) with --cuda-graph-trace=node; kernel windows segmented
+by the verify's q4k_kpar8_batch signature.  THE FIRST FINDING killed
+the plan's premise: the serve log shows `[m2p_graph] captured m=4
+dtype=1` — the verify ALREADY routes through the (m,dtype)-keyed m>=2
+position-synced ragged CUDA graph (option (a) of the design space was
+already built; a dedicated verify graph was moot).  (2) THE PROFILE
+TABLE (fishtank, RTX 5090, Llama-3.1-8B Q4_K_M, ~290-token avg ctx,
+m=4 verify vs the plain m=1 graph step for the same weights):  Q4K
+GEMVs 8.66 ms vs 2.97 (gate/up 85 vs 28.1 us per launch, q/o 35.2 vs
+12.3, k/v 9.6 vs 3.9 — 2.5-3.0x);  Q6K GEMVs 2.61 vs 1.21 (down 98.8
+vs 45.7, lm_head 802 vs 388 — 2.1-2.2x);  attention 3.41 vs 3.44 ms
+(28-188 us per launch, ctx-proportional — the oxide batch attention
+amortizes m rows PERFECTLY, the one component that does);  small
+kernels ~1.0 vs ~0.9;  GPU total ~14.8 vs ~7.9 ms;  host-side ~5 vs
+~4.7.  CONCLUSION: no launch-overhead component at all — the delta is
+ENTIRELY the GEMV m-scaling.  (3) THE ENGINE BUG the profile flushed
+out: one FULL plain m=1 no-graph target forward (per-row GEMVs + 512KB
+logits download + argmax) per verify cycle, interleaved
+[draft][verify][plain-step] every tick.  Root cause: `eagle_step_gpu`
+returned `false` both for "could not run" AND "ran but the request
+continues", and the caller's `else if plain_step_gpu(...)` treated
+every successful cycle as a failure — taking a plain step (which also
+emitted a token + resynced the head, keeping the cycle arithmetic
+alive).  ~40% of the run's tokens came from plain steps.  FIXED:
+`eagle_step_gpu -> Option<bool>` (Some(done) = ran; None = could not
+run -> plain fallback).  Outputs byte-identical (the gate proves it —
+the plain step's token equals the next verify's row-0 argmax by
+construction).  NOTE the honest throughput accounting: the bug was
+accidentally HELPFUL on the wall-clock metric (the hybrid tick was
+cheaper per token than a pure spec cycle), so the fix moves the solo
+number 66.0 -> 59.7 tok/s at K=4 while making every measurement honest
+— pure-spec cycles are what EAGLE actually delivers.  (4) THE GEMM WALL
+ATTACKED and characterized: a ROWS-PARALLEL variant of the batch kpar8
+GEMV (`q4k_gemv_sm120_kpar8_batch_rp`, kernels/src/q4k_gemv_v4_ptx.rs —
+grid (m, n), each CTA runs the exact single-row kpar8 warp structure
+for its row, register accumulator, 128 B smem; bit-identical per row BY
+CONSTRUCTION, probe-gated bit-exact at every shape x m in
+bench-probe-q4k-batch arm 1b).  MEASURED WASH at m=4: gate/up 94.7 us
+vs the m-loop's 85 (the m sibling CTAs' weight re-reads do NOT
+L2-share — Blackwell CTA scheduling/L2 partitioning defeats the
+adjacency assumption), k/v 7.7 vs 9.6, q/o wash.  The LESSON: the
+m-loop kernel is per-thread COMPUTE-bound (the kpar8 GEMV at m=1 is
+already at ~1.04 TB/s effective with compute hidden under bandwidth;
+m rows multiply the per-thread dependent chain ~linearly in ANY
+per-row-bit-identical organization) — rows-across-CTAs just multiplies
+the HBM traffic instead.  The only structural escape is the
+tensor-core class (mma128/mmq), which is BARRED for the verify: its
+rows' argmaxes are the emitted tokens and must stay byte-identical to
+plain decode's per-row kpar8 numerics (the eagle-equivalence gate).
+The rp kernel stays in-tree opt-in via TEMPURA_Q4K_BATCH_KERNEL=rp
+(the ffma/h2-epilogue-wash precedent).  (5) THE NUMBERS (final tree,
+eagle-equivalence gate legs): OFF 74.4 tok/s solo; ON 59.7 at K=4
+(mean_emitted 1.75, hist [110,50,17,22]/199, draft 1.6 ms/cyc, verify
+17.8, post 0.37 — cycle 20.1 ms engine) = 0.80x;  K sweep (byte-
+identical at every K): K=3 65.6 tok/s (best: mean 1.64, verify 14.6,
+cycle 16.2 ms = 9.9 ms/tok engine vs plain's 9.05) = 0.88x, K=6 49.4.
+Steady-state per-token: plain 9.05 ms (attn 3.44 + GEMV 4.2 + small
+1.4) vs spec 11.5 at K=4 / 9.9 at K=3.  The 400-token leg also carries
+a ~1.7 s FIRST-PREFILL warmup spike (cuTile JIT, COMMON to OFF and ON;
+eagle adds ~0.26 s: the m2p captures) — 30% of the leg, so the
+leg-metric ratio understates steady-state slightly for both sides.
+(6) THE VERDICT: the 1.2x bar is NOT met and the wall is now precisely
+attributed — the verify pays the m-fold GEMV cost that plain decode
+spreads over m tokens, and at acceptance 1.64-1.75 (55% first-token
+rejection — the linear-chain head, unchanged from 2026-11-26b) the
+arithmetic cannot close: break-even needs mean_emitted >= ~2.2 at K=4
+GEMM costs, or the GEMM m-scaling broken without breaking
+bit-identity.  The recorded levers stand: DRAFT TREES (the EAGLE-3
+reference's acceptance lever — a 60-node tree verify at large m would
+ALSO change the GEMM calculus by amortizing into the compute-efficient
+large-m regime, but requires the same bit-identity answer per row), a
+higher-acceptance head conditioning, or relaxing the verify's numerics
+contract (a deliberate, gated decision — e.g. accepting the mma128
+class for BOTH the verify and a matched plain path — which trades
+byte-identity for speed and was not taken this round).  (7) WHAT
+LANDED: the Option<bool> cycle-contract fix (server/src/
+engine_task.rs), the rp kernel + host loader + probe arm (opt-in), the
+retired fixed-cost theory, this profile table.  (8) GATES ALL GREEN on
+the final tree: eagle-equivalence PASS (OFF vs ON solo byte-identical
+1686/1686); spec-equivalence PASS (solo + c1..c6 byte-identical, multi
+OFF 475.4 tok/s); bench-probe-q4k-batch PASS (all arms incl. the NEW
+1b rp arm, bit-identical at every shape x m); sanitizer-gate PASS
+(memcheck 3/3 + racecheck + initcheck over the probes incl. the rp
+kernel, 0 errors); local cargo test --workspace (exclude bench-gpu,
+CPU laptop) 936 passed / 0 failed.  NOT rerun (no default-path
+numerics change: the rp kernel is opt-in, the m-loop dispatch is
+untouched, the eagle fix changes only the eagle path): MMLU, pooled
+ppl, ab-repro, kv-swap A/B, smoke, restart-var — the 2026-11-22/26b
+batteries stand.**
+
 **STATUS 2026-11-26b (EAGLE-3 speculative decoding on the SOLO path — the
 recorded lever from the speculation arc's honest negative: stage-0
 availability GO, the head implemented end-to-end and GATE-GREEN
