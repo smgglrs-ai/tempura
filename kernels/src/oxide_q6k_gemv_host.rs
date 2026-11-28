@@ -1441,6 +1441,22 @@ impl OxideQ6kGemv {
     ///   hw -- see the kernel doc), which is only deadlock-free when all 8
     ///   warps run the same number of loop iterations.
     fn select_kpar_fn(&self, k_blocks: usize) -> Option<(CUfunction, bool)> {
+        // TEMPURA_Q6K_KPAR bisect (2026-11-28, the lm_head-last-row
+        // differential: 0.41 ms vs llama's 0.26 at the [128256, 4096]
+        // shape): db (default) | mbar | kpar. Cached OnceLock -- this
+        // fires per GEMV on the decode path.
+        static SEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let sel: &str = SEL.get_or_init(|| std::env::var("TEMPURA_Q6K_KPAR").unwrap_or_default());
+        if sel == "kpar" {
+            return self.cu_function_kpar.map(|f| (f, false));
+        }
+        if sel == "mbar" {
+            if let Some(f) = self.cu_function_sm120_mbar {
+                if k_blocks % 8 == 0 {
+                    return Some((f, true));
+                }
+            }
+        }
         if let Some(f) = self.cu_function_sm120_db {
             return Some((f, true));
         }

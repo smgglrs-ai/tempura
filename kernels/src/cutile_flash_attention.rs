@@ -2251,7 +2251,17 @@ impl CutileFlashAttention {
             )));
         }
 
-        let seq_pad = seq_len.div_ceil(BR) * BR;
+        // BR (Q rows per CTA) sweep knob: numerics-neutral (BR only
+        // partitions Q rows across CTAs; each output row's online-softmax
+        // accumulation over kv tiles is unchanged). Default 16.
+        // TEMPURA_PAGED_BR=8|16|32|64 overrides (2026-11-28 differential:
+        // our paged flash attn 1.39 ms/step vs llama's FA 0.66).
+        let br: usize = std::env::var("TEMPURA_PAGED_BR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| matches!(v, 8 | 16 | 32 | 64))
+            .unwrap_or(BR);
+        let seq_pad = seq_len.div_ceil(br) * br;
         let q_dim = n_heads * head_dim;
         let heads_per_group = n_heads / n_kv_heads;
         // KV tile width for the paged kernel: MUST equal the block size
@@ -2289,14 +2299,14 @@ impl CutileFlashAttention {
                 kv_len_dev.clone(),
                 scale,
                 seq_len as i32,
-                (seq_pad / BR) as i32,
+                (seq_pad / br) as i32,
                 n_heads as i32,
                 n_kv_heads as i32,
                 heads_per_group as i32,
                 self.softcap,
             )
-            .generics(vec![BR.to_string(), bc.to_string(), head_dim.to_string()])
-            .grid((((seq_pad / BR) * n_heads) as u32, 1, 1))
+            .generics(vec![br.to_string(), bc.to_string(), head_dim.to_string()])
+            .grid((((seq_pad / br) * n_heads) as u32, 1, 1))
             .async_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
