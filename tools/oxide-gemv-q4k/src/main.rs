@@ -968,10 +968,13 @@ mod kernels {
         let packed_qi = qi0 | (qi1 << 8) | (qi2 << 16) | (qi3 << 24);
 
         // Lane 0 of each 4-group writes one packed u32 to out_qs.
+        // The guard/index math is u64: the Lean VC discharge is over u32
+        // modular arithmetic otherwise, where `q8_blk*32 < k` does NOT imply
+        // `q8_blk < out_ds.len()` (wraparound) and the no_oob proof fails.
         if lane % 4 == 0 {
-            let out_word_idx = q8_blk * 8 + lane / 4;
+            let out_word_idx = (q8_blk as u64) * 8 + (lane as u64) / 4;
             // Guard: only write if the first element of this word is in range.
-            if q8_blk * 32 + (lane / 4) * 4 < k {
+            if (q8_blk as u64) * 32 + ((lane as u64) / 4) * 4 < k as u64 {
                 out_qs[out_word_idx as usize] = packed_qi;
             }
         }
@@ -995,7 +998,7 @@ mod kernels {
         // PostMem2Reg pause and the Lean exporter fail-closes on the call.
         // Body is a byte-for-byte copy of the shared helper (including the
         // f16-subnormal normalization -- the 2026-10-28 bug fix).
-        if lane == 0 && elem < k {
+        if lane == 0 && (q8_blk as u64) * 32 < k as u64 {
             let bits = d.to_bits();
             let sign = (bits >> 16) & 0x8000;
             let exp = (bits >> 23) & 0xFF;
