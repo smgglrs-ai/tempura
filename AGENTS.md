@@ -322,7 +322,14 @@ Qwen3.6-27B weights** — see open work.
 - [x] Safetensors (F32/BF16→MXFP4 tiling), HF config.json auto-detection
 - [x] Tokenizer: HF tokenizer.json, GGUF-metadata extraction, chat templates
       (Jinja2/HF), special-token registration
-- [x] 6 architecture families, 29 model_types mapped (see config.rs)
+- [x] 6 architecture families, 29 model_types mapped (see config.rs);
+      2026-11-28 (branch longtail): Qwen3 dense+MoE (qk_norm, MoE keys,
+      real-model ppl-validated on Qwen3-0.6B) + Gemma-3 (5:1 sliding/
+      global interleave with per-layer rope base + query scale; f32 path
+      wired, quantized-decode SWA + paged-attention window = recorded
+      gaps) + Llama-4 config-level only (rope pairing/patterns parsed;
+      chunked attention + interleaved MoE NOT wired — do not claim
+      support)
 - [x] Hybrid Attention/DeltaNet layers (gated delta rule, recurrent + chunk)
 - [x] MoE (top-k routing, Qwen-style weight naming)
 - [x] BitNet b1.58 validated end-to-end vs microsoft/bitnet-b1.58-2B-4T-gguf
@@ -659,7 +666,17 @@ Qwen3.6-27B weights** — see open work.
       (1,2,4,5,8,16) NaN-free with bitwise-identical fresh-cache replay;
       single-seq 134 tok/s.
 
-**Decoding strategies**: speculative (target+draft; SERVING: greedy
+**Decoding strategies**: speculative (target+draft; SAMPLED/stochastic
+acceptance landed 2026-11-28 (branch longtail) on the CPU
+SpeculativeDecoder path: the standard Levy-Karp scheme — the draft
+samples from its own seeded distribution, accept w.p. min(1, p_t/p_d),
+rejection correction from the residual norm(max(p_t - p_d, 0)) —
+output-equivalent IN DISTRIBUTION to plain sampling (exact-math gate:
+30k-draw TV<0.02; the old naive rule fails it at TV=0.18; greedy
+temperature=0 unchanged/byte-identical); the serving batch spec + EAGLE
+paths remain greedy-only — recorded follow-up, EAGLE is the cheaper
+extension since its head provides a draft distribution);
+SERVING: greedy
 speculative decoding via `--draft-model <draft.gguf>` — a second small
 GPU model (e.g. Llama-3.2-1B for Llama-3.1-8B, same tokenizer family)
 drafts K tokens (TEMPURA_SPEC_K, default 4... measured best K=3) and the

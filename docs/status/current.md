@@ -5,6 +5,103 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-28 (long-tail round, worktree `longtail` — architecture
+coverage: Qwen3 dense+MoE / Gemma-3 / Llama-4 config+forward mappings
+landed with CPU tests, REAL-MODEL VALIDATION on Qwen3-0.6B (ppl vs
+llama.cpp), and the sampled-speculation follow-up implemented with the
+standard stochastic-acceptance scheme + distributional gates): (1)
+ARCHITECTURE COVERAGE (engine/src/config.rs + gguf_loader.rs +
+model.rs). The name-level mapping already existed (qwen3/qwen3moe/
+gemma3/llama4 in from_gguf_name); what was missing is the QUIRKS:
+   * **Qwen3** — use_qk_norm now set for qwen3/qwen3moe HF configs
+     (GGUF path already detected it via q_norm tensors); qwen3moe MoE
+     keys (num_experts/num_experts_per_tok) + moe_intermediate_size
+     fallback (HF configs of MoE models carry no plain
+     intermediate_size). No bias, SiLU, NEOX pairing — all inherited.
+     REAL-MODEL VALIDATED: Qwen3-0.6B-Q8_0 (pulled to the fishtank
+     cache) loads + runs GPU and CPU; ppl vs llama.cpp 418f905 —
+     see the numbers + gate verdict in the run log
+     (/tmp/longtail-logs/ppl-qwen3.log on fishtank; the 1.10-ratio
+     pattern).
+   * **Gemma-3** — the 5:1 sliding/global interleave (GGUF
+     {arch}.attention.sliding_window_pattern + {arch}.rope.
+     freq_base_swa; HF sliding_window_pattern + rope_local_base_freq)
+     with llama.cpp's exact layer rule (set_swa_pattern(n,
+     dense_first=false): layer il is SWA iff il % n < n-1 — layers
+     0-4 SWA, 5 global, ...); per-layer rope base (10000 local vs 1e6
+     global) routed through layer_rope_theta at EVERY rope call site
+     in the layer loops (f32 + quantized prefill + decode paths);
+     windowed prefill attention in the f32 path (CpuAttention.
+     forward_windowed: causal+window, previously prefill had NO
+     window support at all); the query pre-attention scale
+     (attn_scale_denominator: HF query_pre_attn_scalar, or llama.cpp's
+     62-layer hidden/heads rule for GGUF 27B) routed through
+     layer_attn_scale; softcap keys already parsed (gemma-3 configs
+     carry null — the removal is the default). GGUF loader now reads
+     attention.sliding_window at all (was always None!). GAPS
+     (recorded, do not assume): the QUANTIZED decode path
+     (forward_quantized decode) has no per-layer window support
+     (only the f32 prefill path is wired — matters beyond ctx 512
+     for the 1B (window 512) / 1024 for 4B+); CpuPagedAttention has
+     no window parameter.
+   * **Llama-4** — config-level only, honestly partial: NORM rope
+     pairing fixed on the HF path (GGUF already had it), the 3:1
+     chunked/full interleave + no-rope-layer-step ((il+1)%4==0 skips
+     RoPE, llama.cpp rope_pattern) parsed with layer_uses_rope; the
+     forward wiring is NOT done — Llama-4 needs chunked attention
+     with attention temperature (attn_temp_floor_scale 8192, scale
+     0.1, offset 1.0), interleaved MoE every interleave_moe_layer_
+     step with shared experts, and per-layer no-RoPE routing. Do not
+     claim Llama-4 support.
+   * ModelConfig gained per-layer helpers (layer_is_sliding,
+     layer_sliding_window, layer_rope_theta, layer_attn_scale,
+     layer_uses_rope) + 4 new fields (sliding_window_pattern,
+     rope_theta_swa, attn_scale_denominator, no_rope_layer_step).
+   * CPU gates: 6 new config tests + 2 forward tests (the interleave
+     changes output vs full attention with identical weights AND is
+     bit-deterministic; rope_theta_swa reaches the forward path).
+     Workspace suite (excl. bench-gpu, laptop): all green.
+(2) SAMPLED SPECULATION (engine/src/speculative.rs) — the recorded
+follow-up "greedy-only leaves temperature>0 on plain decode" is
+CLOSED on the standalone-draft (SpeculativeDecoder) path: the standard
+Levy-Karp/Medusa stochastic acceptance replaces the old naive rule.
+The OLD rule was WRONG in two ways: the draft drafted GREEDILY
+(sample_token(.., None) = argmax — degenerates p_d to a point mass)
+and acceptance was deterministic (accept iff p_t >= p_d) with the
+rejection correction drawn from the FULL p_t — both skew the output
+distribution. The NEW scheme: the draft SAMPLES from its own
+post-chain distribution (draft session's seeded RNG); accept d with
+prob min(1, p_t(d)/p_d(d)) (draw from the target session's seeded
+RNG); on rejection the correction comes from the residual
+norm(max(p_t - p_d, 0)) — emitted tokens are then draws from EXACTLY
+the target's conditionals (output-equivalent IN DISTRIBUTION to plain
+sampling; deliberately NOT byte-identical). Greedy (temperature=0) is
+unchanged — byte-identity preserved. GATES, with the honest
+statistics recorded: (a) PRIMARY — an exact-math simulation test
+(30k draws, adversarial p_t/p_d, TV < 0.02) which the OLD scheme
+FAILS at TV=0.18 (the gate has teeth); (b) end-to-end likelihood
+gate — E[log p_target(token_2)] agrees between plain and spec decode
+(measured delta 0.005 nats, gate 0.08 at n=1500; the old scheme is
+statistically indistinguishable from correct at tiny-model scale —
+measured 0.006 vs 0.005 — so histogram/likelihood tests at practical
+n have NO power; the exact-math gate is the real one, the likelihood
+gate checks the wiring); (c) per-seed determinism (same seed ->
+identical output). Kani harnesses for the residual (in-bounds,
+normalized) and the acceptance ratio. (3) SCOPE of the sampled-spec
+work: the standalone-draft CPU path (v1 machinery). The SERVING batch
+spec path + EAGLE remain greedy-only — extending stochastic
+acceptance there needs the verify forward to expose per-row
+distributions (currently argmax-only on GPU) and per-session
+acceptance RNG plumbing through the batch scheduler; the EAGLE head
+does provide a draft distribution (its lm_head over the draft vocab +
+d2t mapping), so EAGLE is the cheaper of the two to extend —
+recorded as the follow-up, not done this round. (4) WORKTREE
+DISCIPLINE: all of this landed on branch `longtail` (worktree
+../tempura-longtail + the fishtank clone ~/Code/github.com/smgglrs-
+ai/tempura-longtail, tmux session longtail-gpu, logs /tmp/longtail-
+logs/) — NOT in the main tree (the parallel agent owns it). Merge to
+main pending the GPU validation being green + coordination.**
+
 **STATUS 2026-11-27 (EAGLE-3 verify-cost round — the wall DECOMPOSED and
 it is NOT what the recorded follow-ups assumed: the verify already
 replays a CUDA graph, the "~13+2m ms no-graph batch-path fixed cost"
