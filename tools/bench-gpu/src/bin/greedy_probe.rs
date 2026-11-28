@@ -45,9 +45,18 @@ fn main() {
     );
 
     let tokenizer = Tokenizer::from_gguf_metadata(&metadata).expect("tokenizer failed");
-    let qw = loader.to_quantized_weights();
-    let mut model = TransformerModel::new(config.clone(), KernelPipeline::cpu_native());
-    model.quantized_weights = Some(qw);
+    let use_f32 = std::env::var("TEMPURA_PROBE_F32").is_ok();
+    let mut model = if use_f32 {
+        #[allow(unused_mut)]
+        let mut m = TransformerModel::new(config.clone(), KernelPipeline::cpu_verified());
+        m.load_weights(&loader).expect("f32 weight load failed");
+        m
+    } else {
+        let qw = loader.to_quantized_weights();
+        let mut m = TransformerModel::new(config.clone(), KernelPipeline::cpu_native());
+        m.quantized_weights = Some(qw);
+        m
+    };
 
     let tokens = tokenizer.encode(&prompt).expect("encode failed");
     println!("prompt tokens ({}): {tokens:?}", tokens.len());
