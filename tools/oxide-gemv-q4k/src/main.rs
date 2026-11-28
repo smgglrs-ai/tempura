@@ -891,35 +891,6 @@ mod kernels {
         }
     }
 
-    #[inline(always)]
-    fn verify_inline_probe(x: u32) -> u32 {
-        x.wrapping_add(1)
-    }
-
-    #[inline(always)]
-    fn verify_inline_probe_big(v: f32) -> u16 {
-        let bits = v.to_bits();
-        let sign = (bits >> 16) & 0x8000;
-        let exp = (bits >> 23) & 0xFF;
-        let mant = bits & 0x7FFFFF;
-        if exp == 0 {
-            if mant == 0 { sign as u16 } else {
-                let s = mant.leading_zeros() - 11;
-                let m = mant << s;
-                (sign | (((113 - s) as u32) << 10) | ((m & 0x3FF) >> 1)) as u16
-            }
-        } else if exp == 255 {
-            (sign | 0x7C00 | ((mant >> 13) & 0x3FF)) as u16
-        } else {
-            (sign | ((exp - 127 + 15) as u32) << 10 | (mant >> 13)) as u16
-        }
-    }
-
-    #[inline(always)]
-    fn verify_inline_probe_f32(x: f32) -> f32 {
-        x + 1.0
-    }
-
     // NOTE: the params are `&mut [u32]` (not DisjointSlice) so the derived
     // write indices (q8_blk*8 + lane/4, q8_blk) can be safe indexed stores
     // Lean reasons about -- DisjointSlice's safe accessor only accepts the
@@ -983,7 +954,6 @@ mod kernels {
         t = warp::shuffle_xor_f32(amax, 1);  if t > amax { amax = t; }
         let d = if amax == 0.0 { 1.0_f32 } else { amax / 127.0_f32 };
 
-        let _probe = verify_inline_probe(q8_blk) as f32 + verify_inline_probe_f32(xi) + verify_inline_probe_big(xi) as f32;
         // Quantize: round to nearest, clamp to [-127, 127]
         let qf = xi / d;
         let rounded = (qf + if qf >= 0.0 { 0.5 } else { -0.5 }) as i32;
@@ -1019,10 +989,31 @@ mod kernels {
             sumqi = sumqi.wrapping_add(warp::shuffle_xor(sumqi, delta));
             delta /= 2;
         }
-        // Lane 0 writes the f16 scale + the rowsum.
+        // Lane 0 writes the f16 scale + the rowsum. f32_to_f16_bits is
+        // expanded inline: the #[verify] path cannot call it -- helpers past
+        // the MIR always-inline size budget stay un-inlined at the
+        // PostMem2Reg pause and the Lean exporter fail-closes on the call.
+        // Body is a byte-for-byte copy of the shared helper (including the
+        // f16-subnormal normalization -- the 2026-10-28 bug fix).
         if lane == 0 && elem < k {
-            out_ds[q8_blk as usize] =
-                (f32_to_f16_bits(d) as u32) | ((sumqi & 0xFFFF) << 16);
+            let bits = d.to_bits();
+            let sign = (bits >> 16) & 0x8000;
+            let exp = (bits >> 23) & 0xFF;
+            let mant = bits & 0x7FFFFF;
+            let h = if exp == 0 {
+                if mant == 0 {
+                    sign
+                } else {
+                    let s = mant.leading_zeros() - 11; // 0..=9
+                    let m = mant << s;
+                    sign | (((113 - s) as u32) << 10) | ((m & 0x3FF) >> 1)
+                }
+            } else if exp == 255 {
+                sign | 0x7C00 | (mant >> 13)
+            } else {
+                sign | (((exp - 127 + 15) as u32) << 10) | (mant >> 13)
+            };
+            out_ds[q8_blk as usize] = h | ((sumqi & 0xFFFF) << 16);
         }
     }
 
